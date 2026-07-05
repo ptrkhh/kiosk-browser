@@ -1,0 +1,23 @@
+# Rust
+target/
+Cargo.lock.orig
+
+# Real credentials must never be committed (placeholder lives in dist-template/)
+kiosk-credential.json
+!dist-template/kiosk-credential.json
+*.pem
+*.p12
+
+# Local device config & data
+kiosk.ini
+!dist-template/kiosk.ini
+*.log
+spool/
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
