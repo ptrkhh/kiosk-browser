@@ -1,0 +1,159 @@
+//! P0 feasibility gate (spec §9): can in-app code see and swallow keyboard
+//! and pointer input while the WebView2 window is focused?
+//! Diagnostic only — enabled by --spike-input, never in normal operation.
+//! Every observation is a SPIKE[vector] line on stderr; a human transcribes
+//! the outcome into docs/superpowers/plans/2026-07-06-p0-input-gate-report.md.
+
+#[cfg(not(windows))]
+pub fn install(_window: &tauri::WebviewWindow) {
+    eprintln!("SPIKE: only implemented on Windows; nothing to do");
+}
+
+#[cfg(windows)]
+pub fn install(window: &tauri::WebviewWindow) {
+    windows_impl::install(window);
+}
+
+#[cfg(windows)]
+mod windows_impl {
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use windows::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_F4, VK_LWIN, VK_RWIN, VK_TAB};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, DispatchMessageW, GetMessageW, SetWindowsHookExW, TranslateMessage,
+        KBDLLHOOKSTRUCT, LLKHF_ALTDOWN, MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL,
+        WM_KEYDOWN, WM_LBUTTONDOWN, WM_SYSKEYDOWN,
+    };
+
+    /// Vector A: WebView2 AcceleratorKeyPressed. Swallows Ctrl+W (0x57),
+    /// F5 (0x74), F11 (0x7A) and logs every accelerator seen.
+    fn install_accelerator_handler(window: &tauri::WebviewWindow) {
+        let result = window.with_webview(|platform_webview| unsafe {
+            use webview2_com::AcceleratorKeyPressedEventHandler;
+            use webview2_com::Microsoft::Web::WebView2::Win32::{
+                ICoreWebView2AcceleratorKeyPressedEventArgs, COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN,
+                COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN,
+            };
+            let controller = platform_webview.controller();
+            let handler = AcceleratorKeyPressedEventHandler::create(Box::new(
+                move |_controller,
+                      args: Option<ICoreWebView2AcceleratorKeyPressedEventArgs>|
+                      -> windows_core::Result<()> {
+                    let Some(args) = args else { return Ok(()) };
+                    let mut kind = COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN;
+                    args.KeyEventKind(&mut kind)?;
+                    if kind != COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN
+                        && kind != COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN
+                    {
+                        return Ok(());
+                    }
+                    let mut vk: u32 = 0;
+                    args.VirtualKey(&mut vk)?;
+                    let swallow = matches!(
+                        vk,
+                        0x57 /* W: with Ctrl */ | 0x74 /* F5 */ | 0x7A /* F11 */
+                    );
+                    if swallow {
+                        args.SetHandled(true)?;
+                    }
+                    eprintln!("SPIKE[A] accelerator vk=0x{vk:02X} swallowed={swallow}");
+                    Ok(())
+                },
+            ));
+            let mut token = windows::Win32::System::WinRT::EventRegistrationToken::default();
+            controller
+                .add_AcceleratorKeyPressed(&handler, &mut token)
+                .expect("add_AcceleratorKeyPressed failed");
+            eprintln!("SPIKE[A] handler installed");
+        });
+        if let Err(e) = result {
+            eprintln!("SPIKE[A] INSTALL FAILED: {e}");
+        }
+    }
+
+    static KB_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+    unsafe extern "system" fn kb_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if code >= 0 && (wparam.0 as u32 == WM_KEYDOWN || wparam.0 as u32 == WM_SYSKEYDOWN) {
+            let k = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+            let alt = (k.flags.0 & LLKHF_ALTDOWN.0) != 0;
+            KB_EVENTS.fetch_add(1, Ordering::Relaxed);
+            let swallow = (alt && k.vkCode == VK_F4.0 as u32)
+                || (alt && k.vkCode == VK_TAB.0 as u32)
+                || k.vkCode == VK_LWIN.0 as u32
+                || k.vkCode == VK_RWIN.0 as u32;
+            eprintln!(
+                "SPIKE[B] key vk=0x{:02X} alt={alt} swallowed={swallow}",
+                k.vkCode
+            );
+            if swallow {
+                return LRESULT(1); // non-zero = swallow (do not pass on)
+            }
+        }
+        CallNextHookEx(None, code, wparam, lparam)
+    }
+
+    static TAP_COUNT: AtomicU32 = AtomicU32::new(0);
+    static FIRST_TAP_MS: AtomicU64 = AtomicU64::new(0);
+    const TAP_REGION_PX: i32 = 200; // top-left corner, spec §3.5 exit gesture
+    const TAPS_REQUIRED: u32 = 7;
+    const WINDOW_MS: u64 = 3000;
+
+    unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if code >= 0 && wparam.0 as u32 == WM_LBUTTONDOWN {
+            let m = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+            let POINT { x, y } = m.pt;
+            let in_region = x >= 0 && x < TAP_REGION_PX && y >= 0 && y < TAP_REGION_PX;
+            eprintln!("SPIKE[C] tap at ({x},{y}) in_region={in_region}");
+            if in_region {
+                let now = m.time as u64;
+                let first = FIRST_TAP_MS.load(Ordering::Relaxed);
+                if first == 0 || now.saturating_sub(first) > WINDOW_MS {
+                    FIRST_TAP_MS.store(now, Ordering::Relaxed);
+                    TAP_COUNT.store(1, Ordering::Relaxed);
+                } else if TAP_COUNT.fetch_add(1, Ordering::Relaxed) + 1 >= TAPS_REQUIRED {
+                    eprintln!(
+                        "SPIKE[C] EXIT-GESTURE DETECTED ({TAPS_REQUIRED} taps < {WINDOW_MS} ms)"
+                    );
+                    TAP_COUNT.store(0, Ordering::Relaxed);
+                    FIRST_TAP_MS.store(0, Ordering::Relaxed);
+                }
+            }
+        }
+        CallNextHookEx(None, code, wparam, lparam)
+    }
+
+    /// Vectors B + C: low-level hooks on a dedicated thread with its own
+    /// message pump (spec §3.1 M2 — never on the webview UI thread).
+    fn install_ll_hooks() {
+        std::thread::Builder::new()
+            .name("spike-ll-hooks".into())
+            .spawn(|| unsafe {
+                let kb = SetWindowsHookExW(WH_KEYBOARD_LL, Some(kb_hook), None, 0);
+                let ms = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), None, 0);
+                eprintln!("SPIKE[B] WH_KEYBOARD_LL installed: {}", kb.is_ok());
+                eprintln!("SPIKE[C] WH_MOUSE_LL installed: {}", ms.is_ok());
+                let mut msg = MSG::default();
+                while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            })
+            .expect("failed to spawn hook thread");
+    }
+
+    pub fn install(window: &tauri::WebviewWindow) {
+        eprintln!("SPIKE starting — focus the webview, then exercise each vector");
+        install_accelerator_handler(window);
+        install_ll_hooks();
+        // Periodic proof-of-life so "no SPIKE[B] lines" is distinguishable
+        // from "stderr swallowed".
+        std::thread::spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            eprintln!(
+                "SPIKE[hb] alive; kb_events_total={}",
+                KB_EVENTS.load(Ordering::Relaxed)
+            );
+        });
+    }
+}
