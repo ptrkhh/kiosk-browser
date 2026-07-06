@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/kiosk-core", "crates/kiosk-launcher"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+repository = "https://github.com/ptrkhh/kiosk-browser"
+
+[workspace.dependencies]
+kiosk-core = { path = "crates/kiosk-core" }

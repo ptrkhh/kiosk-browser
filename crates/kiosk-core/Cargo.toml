@@ -1,0 +1,6 @@
+[package]
+name = "kiosk-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
