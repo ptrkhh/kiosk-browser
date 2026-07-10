@@ -4,7 +4,7 @@ Run: `cargo run -p kiosk-main -- --spike-input --url https://example.com 2> spik
 on physical Windows hardware (WebView2 evergreen), window fullscreen, webview focused
 (click the page first). Date/hardware/Windows build: **2026-07-11 — ARM64 (aarch64)
 Windows 11 Home Single Language, build 10.0.26200.8655; WebView2 evergreen (x64 runtime,
-rendered under x64 emulation).** Actual run used the built exe directly
+rendered under x64 emulation — the ARM64 machine is the **dev host**; the x64 build it runs is the actual fleet arch, since every kiosk is Intel/AMD x64).** Actual run used the built exe directly
 (`target/debug/kiosk-main.exe --spike-input --url https://example.com 2> spike.log`).
 
 > **Tester note — tap timing (row 7/8).** The `SPIKE[C]` tap window is anchored to the
@@ -45,7 +45,7 @@ rendered under x64 emulation).** Actual run used the built exe directly
 (it catches shell-intercepted hotkeys) yet *is* blind to keys the focused WebView2
 consumes — Ctrl/W/F5/F11 and any typed letters never reach it (Tauri #13919).
 
-Windows compile (`cargo check -p kiosk-main`, arch used): **CLEAN, but not native.** This
+Windows compile (`cargo check -p kiosk-main`, arch used): **CLEAN — built for x64, the sole Windows deployment target (every kiosk is Intel/AMD x64).** This
 host has no native ARM64 MSVC compiler/linker (`Hostarm64/arm64/` ships no `cl.exe`/
 `link.exe`), and VS 2026 ("18") + a non-functional bundled `vswhere` means rustc cannot
 auto-discover MSVC (it fell back to a bare `link.exe`, which Git Bash's coreutils `link`
@@ -53,8 +53,9 @@ shadowed). Resolved by building with the **x86_64 Rust toolchain (rustc 1.97.0) 
 emulation**, inside the `arm64_x64` VS dev environment (`vcvarsarm64_amd64.bat`). Build
 also required adding `crates/kiosk-main/icons/icon.ico` — `tauri-build` needs it for the
 Windows executable resource and the P0 skeleton never created one (committed separately as
-a P0 fix). Per the ARM64 note above, the gate result is arch-independent; WebView2 and the
-Win32 hooks behaved normally under emulation.
+a P0 fix). WebView2 and the Win32 hooks behaved normally; because x64 is the fleet arch,
+this gate exercised the **production architecture** — the ARM64 dev box merely runs the
+x64 build under emulation.
 
 ## Verdict (fills spec §12/OD-5 and shapes the P1 hardening plan)
 
@@ -86,6 +87,7 @@ Notes / anomalies:
   hardening; (b) touch **edge-swipes** bypass `WH_MOUSE_LL` entirely — right-edge opens the
   Action Center, bottom-edge opens Start — so OS-level edge-gesture lockdown is required in
   addition to the shortcut lockdown.
-- **Host caveat:** run on an x64-emulated build (native ARM64 MSVC tooling absent on this
-  box — see Windows compile line). Arch-independent per the ARM64 note; recorded for
-  reproducibility.
+- **Host note:** the gate exercised **x64 — the fleet's production arch**
+  (`x86_64-pc-windows-msvc`); it ran under emulation only because the dev *box* is ARM64
+  (no native arm64 MSVC tooling — see Windows compile line). aarch64 Windows is **not** a
+  deployment target.

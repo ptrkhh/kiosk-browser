@@ -28,6 +28,10 @@ cargo test --workspace
 Lint gates (CI + before every commit): `cargo fmt --check`,
 `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
 
+**Windows deployment target: x64 (Intel/AMD, `x86_64-pc-windows-msvc`) only** — aarch64
+Windows is not a target. The section below is a build tip for developers whose *workstation*
+is ARM64; the output is still an x64 binary.
+
 ### Building on an ARM64 Windows host
 
 There is **no native ARM64 MSVC toolchain** on some ARM64 dev boxes (the VS installer ships
