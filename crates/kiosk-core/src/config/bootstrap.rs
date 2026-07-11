@@ -32,15 +32,26 @@ pub struct BootstrapConfig {
     pub exit_gesture: Option<BootstrapExitGesture>,
 }
 
-/// Strip a trailing `;`/`#` comment and surrounding whitespace from a raw ini value.
-/// `rust-ini`'s behavior here is version-dependent, so we normalize explicitly —
-/// the spec's kiosk.ini puts comments after values (spec §5.1).
+/// Strip a trailing `;`/`#` inline comment and surrounding whitespace from a raw
+/// ini value. `rust-ini`'s inline-comment support is an off-by-default cargo
+/// feature, so the raw value we get back still carries any trailing comment —
+/// and the spec's kiosk.ini puts comments after values (spec §5.1). We therefore
+/// normalize explicitly, applying the standard ini rule:
+///
+/// A `;`/`#` opens a comment ONLY at the start of the value or when preceded by
+/// whitespace. One embedded mid-token is literal content — otherwise a URL
+/// fragment (`https://app.example.com/#/kiosk`) would be silently truncated, and
+/// `config_url`/`bootstrap_url` are exactly the values this parser exists to read.
 fn clean(raw: &str) -> String {
-    let cut = raw
-        .find([';', '#'])
-        .map(|i| &raw[..i])
-        .unwrap_or(raw);
-    cut.trim().to_string()
+    // Start-of-value behaves like "preceded by whitespace".
+    let mut prev_is_ws = true;
+    for (i, c) in raw.char_indices() {
+        if prev_is_ws && matches!(c, ';' | '#') {
+            return raw[..i].trim().to_string();
+        }
+        prev_is_ws = c.is_whitespace();
+    }
+    raw.trim().to_string()
 }
 
 fn required(v: Option<&str>, field: &str, errors: &mut Vec<FieldError>) -> Option<String> {
@@ -291,5 +302,49 @@ url = https://app.example.com/
             }
             other => panic!("expected Invalid, got {other:?}"),
         }
+    }
+
+    /// A minimal-but-valid ini parameterized on the two URL-typed fields.
+    fn ini_with_urls(config_url: &str, bootstrap_url: &str) -> String {
+        format!(
+            "[kiosk]\nconfig_url = {config_url}\nsite = s\nproject_id = p\ncredential = c.json\n\n[bootstrap]\nurl = {bootstrap_url}\n"
+        )
+    }
+
+    #[test]
+    fn url_fragment_is_not_mistaken_for_an_inline_comment() {
+        // No comment anywhere on either line: a `#` with no preceding whitespace is
+        // literal value content and must survive verbatim (SPA hash routes).
+        let ini = ini_with_urls("https://e/c.json#v2", "https://app.example.com/#/kiosk");
+        let c = BootstrapConfig::parse(&ini).expect("must parse");
+        assert_eq!(c.config_url, "https://e/c.json#v2");
+        assert_eq!(c.bootstrap_url, "https://app.example.com/#/kiosk");
+    }
+
+    #[test]
+    fn whitespace_preceded_comment_after_a_url_is_still_stripped() {
+        let ini = ini_with_urls("https://e/c.json", "https://app.example.com/k   ; home url");
+        let c = BootstrapConfig::parse(&ini).expect("must parse");
+        assert_eq!(c.bootstrap_url, "https://app.example.com/k");
+    }
+
+    #[test]
+    fn comment_opens_only_at_value_start_or_after_whitespace() {
+        // Preceded by whitespace => comment.
+        assert_eq!(clean("value ; trailing comment"), "value");
+        assert_eq!(clean("value\t# trailing comment"), "value");
+        // At the very start of the value => the whole value is a comment.
+        assert_eq!(clean("; empty -> auto"), "");
+        assert_eq!(clean("   # optional"), "");
+        // NOT preceded by whitespace => literal content, kept verbatim.
+        assert_eq!(
+            clean("https://app.example.com/#/kiosk"),
+            "https://app.example.com/#/kiosk"
+        );
+        assert_eq!(clean("a;b#c"), "a;b#c");
+        // Only the comment is removed; the value keeps its own inner punctuation.
+        assert_eq!(clean("a#b ; note"), "a#b");
+        // Surrounding whitespace is still trimmed (contract unchanged).
+        assert_eq!(clean("   spaced   "), "spaced");
     }
 }
