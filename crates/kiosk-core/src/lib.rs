@@ -2,6 +2,9 @@
 //! identity. This crate must never depend on Tauri or any per-OS API
 //! (spec §4 layering rule).
 
+pub mod config;
+pub mod error;
+
 /// The crate/product version, sourced from Cargo. Later plans extend this
 /// with the git sha for telemetry labels (spec §6 TEL-04).
 pub fn app_version() -> &'static str {
