@@ -46,35 +46,55 @@ pub struct ConfigManager {
 
 impl ConfigManager {
     /// BOOT (spec §5.2): apply `config-lastgood.json` if present — it is used directly
-    /// when the network is down — else fall back to the bootstrap url. Last-good is NOT
-    /// re-signature-checked (it was verified when first applied) but IS re-validated for
-    /// schema/ranges and clamped, so a legacy document can never disable polling.
+    /// when the network is down — else fall back to the bootstrap config.
+    ///
+    /// A stored last-good is adopted ONLY if it clears every gate it would have to clear
+    /// as a fetch, minus the network:
+    ///
+    /// * its signature re-verifies against the pinned key (when a key is compiled in).
+    ///   "It was verified when first applied" is a claim about provenance that a file on
+    ///   disk cannot prove — anyone who can write the file would otherwise get
+    ///   `content.inject_js` executed on the next boot with no cryptographic gate
+    ///   (spec §8/SEC-01). With NO pinned key we adopt it unverified: such a build
+    ///   already rejects every fetch, and refusing to boot would brick the device.
+    /// * it deserializes into this build's schema, and
+    /// * it still passes `validate()` — including the `version` gate, so a downgraded
+    ///   binary can never run a document it does not understand (cfg-03).
+    ///
+    /// Failing any gate falls back to the bootstrap config for the CONTENT, but the
+    /// stored revision is still retained as the in-memory anti-rollback floor: a
+    /// rejected or damaged store must never let an older signed config be replayed
+    /// (spec §8/SEC-11).
     pub fn boot(
         bootstrap: bootstrap::BootstrapConfig,
         device_id: String,
         store: store::ConfigStore,
         key: Option<VerifyingKey>,
     ) -> (ConfigManager, Applied) {
-        let (mut config, revision, mut warnings, source) = match store.load_last_good() {
-            Some(stored) => match serde_json::from_value::<RemoteConfig>(stored.raw) {
-                Ok(cfg) => {
-                    let warnings = validate::validate(&cfg).unwrap_or_else(|e| {
-                        vec![format!(
-                            "last-good failed re-validation, using it anyway: {e}"
-                        )]
-                    });
-                    (cfg, Some(stored.revision), warnings, Source::LastGood)
+        let (stored, corrupt_warning) = store.load_last_good_checked();
+        let mut warnings: Vec<String> = corrupt_warning.into_iter().collect();
+
+        // The floor survives independently of whether the CONTENT is adopted. It is read
+        // from the RAW json (`StoredConfig::revision`), never from the typed document, so
+        // a schema-shape mismatch this build cannot deserialize still cannot zero it.
+        let revision = stored.as_ref().map(|s| s.revision);
+
+        let (mut config, source) = match stored {
+            None => (RemoteConfig::default(), Source::Bootstrap),
+            Some(stored) => match Self::vet_last_good(&stored, key.as_ref()) {
+                Ok((cfg, w)) => {
+                    warnings.extend(w);
+                    (cfg, Source::LastGood)
                 }
-                Err(e) => (
-                    RemoteConfig::default(),
-                    None,
-                    vec![format!(
-                        "last-good is unreadable, falling back to bootstrap: {e}"
-                    )],
-                    Source::Bootstrap,
-                ),
+                Err(reason) => {
+                    warnings.push(format!(
+                        "last-good rejected, falling back to bootstrap ({reason}); \
+                         anti-rollback floor retained at revision {}",
+                        stored.revision
+                    ));
+                    (RemoteConfig::default(), Source::Bootstrap)
+                }
             },
-            None => (RemoteConfig::default(), None, Vec::new(), Source::Bootstrap),
         };
 
         validate::clamp_effective(&mut config);
@@ -97,6 +117,33 @@ impl ConfigManager {
         (m, applied)
     }
 
+    /// Gate a stored last-good document. `Ok(cfg)` ⇒ safe to adopt; `Err(reason)` ⇒ the
+    /// caller falls back to bootstrap content (but keeps the rollback floor).
+    fn vet_last_good(
+        stored: &store::StoredConfig,
+        key: Option<&VerifyingKey>,
+    ) -> Result<(RemoteConfig, Vec<String>), String> {
+        if let Some(key) = key {
+            // SEC-01: inject_js et al. are honoured only from a signature-verified config.
+            match signature::verify_signed(&stored.raw, key) {
+                Ok(rev) if rev != stored.revision => {
+                    return Err(format!(
+                        "signed revision {rev} disagrees with the stored revision {}",
+                        stored.revision
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) => return Err(format!("signature does not re-verify: {e}")),
+            }
+        }
+
+        let cfg: RemoteConfig = serde_json::from_value(stored.raw.clone())
+            .map_err(|e| format!("does not match this build's schema: {e}"))?;
+        let warnings =
+            validate::validate(&cfg).map_err(|e| format!("failed re-validation: {e}"))?;
+        Ok((cfg, warnings))
+    }
+
     /// REFETCH (spec §5.2): validate a downloaded body in strict order and, only if every
     /// step passes, persist it as the new last-good and adopt it. On ANY failure the
     /// currently-running config is untouched.
@@ -113,8 +160,15 @@ impl ConfigManager {
         })?;
         let revision = signature::verify_signed(&raw, key)?;
 
-        // 2. anti-rollback
-        let last = self.store.last_applied_revision();
+        // 2. anti-rollback. The floor is the MAXIMUM of what is on disk and what this
+        // process has already applied. Reading it from disk alone would let an attacker
+        // who can delete or corrupt `config-lastgood.json` (store reads a missing/corrupt
+        // file as revision 0) replay a genuinely-signed OLD revision at a device that is
+        // running a much newer one — no forged signature required (spec §8/SEC-11).
+        let last = self
+            .store
+            .last_applied_revision()
+            .max(self.revision.unwrap_or(0));
         if revision <= last {
             return Err(ConfigError::Rollback {
                 got: revision,
@@ -414,25 +468,312 @@ mod manager_tests {
         );
     }
 
+    /// Store a document verbatim as if it had been applied, without going through
+    /// `apply_fetched` (which is what an attacker with write access to the data dir does).
+    fn plant(dir: &std::path::Path, doc: &Value, revision: i64) {
+        store::ConfigStore::new(dir)
+            .save_last_good(doc, revision)
+            .expect("planting the fixture must succeed");
+    }
+
+    fn signed_value(doc: &Value, sk: &SigningKey) -> Value {
+        serde_json::from_slice(&sign(doc, sk)).unwrap()
+    }
+
     #[test]
-    fn a_legacy_last_good_with_a_bad_poll_interval_is_clamped_not_fatal() {
+    fn an_adopted_last_good_is_still_clamped_so_polling_can_never_be_disabled() {
         let dir = tempfile::tempdir().unwrap();
-        // Simulate a stored doc from an older build carrying an out-of-range value.
+        // Valid (validate() only warns about an over-reserved spool) but in need of a clamp.
         let stored = serde_json::json!({
             "revision": 3,
             "sig": "ed25519:AAAA",
-            "network": { "config_poll_s": 1 }
+            "logging": { "spool_max_mb": 20, "spool_reserve_high_mb": 500 }
         });
-        store::ConfigStore::new(dir.path())
-            .save_last_good(&stored, 3)
-            .unwrap();
+        plant(dir.path(), &stored, 3);
 
         let (m, applied) = manager(dir.path(), None);
         assert_eq!(applied.source, Source::LastGood);
+        assert_eq!(m.current().logging.spool_reserve_high_mb, 20, "clamped");
         assert_eq!(
             m.current().network.config_poll_s,
-            30,
-            "clamped so polling can never be disabled (cfg-01)"
+            300,
+            "polling can never be disabled (cfg-01)"
         );
+    }
+
+    // --- FIX 1: the anti-rollback floor must not depend on the store file surviving ---
+
+    #[test]
+    fn the_rollback_floor_survives_deletion_of_the_store_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sk, vk) = keys();
+        let (mut m, _) = manager(dir.path(), Some(vk));
+
+        m.apply_fetched(&sign(
+            &serde_json::json!({ "revision": 5, "content": {} }),
+            &sk,
+        ))
+        .expect("rev 5 applies");
+
+        // The attacker deletes the store. `last_applied_revision()` now reads 0.
+        std::fs::remove_file(dir.path().join(store::LAST_GOOD_FILE)).unwrap();
+        assert_eq!(
+            store::ConfigStore::new(dir.path()).last_applied_revision(),
+            0
+        );
+
+        // A genuinely-signed but OLD revision must still be refused: the running process
+        // remembers the floor. No forged signature is needed for this attack, only a
+        // stale object and the ability to remove a file.
+        for old in [3, 5] {
+            let body = sign(
+                &serde_json::json!({ "revision": old, "content": { "url": "https://evil/" } }),
+                &sk,
+            );
+            match m.apply_fetched(&body) {
+                Err(ConfigError::Rollback { got, last }) => {
+                    assert_eq!(got, old);
+                    assert_eq!(
+                        last, 5,
+                        "the floor must come from memory, not the deleted file"
+                    );
+                }
+                Err(other) => panic!("expected Rollback for rev {old}, got {other:?}"),
+                Ok(_) => panic!("rev {old} was APPLIED — the anti-rollback floor collapsed"),
+            }
+        }
+        assert_eq!(m.revision(), Some(5));
+        assert_eq!(m.current().content.url, None, "current must survive");
+    }
+
+    #[test]
+    fn a_corrupt_store_does_not_collapse_the_rollback_floor_of_a_running_manager() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sk, vk) = keys();
+        let (mut m, _) = manager(dir.path(), Some(vk));
+        m.apply_fetched(&sign(
+            &serde_json::json!({ "revision": 500, "content": {} }),
+            &sk,
+        ))
+        .expect("rev 500 applies");
+
+        // Truncate the store (a power cut, or an attacker).
+        std::fs::write(dir.path().join(store::LAST_GOOD_FILE), b"").unwrap();
+
+        let replay = sign(
+            &serde_json::json!({ "revision": 12, "content": { "url": "https://evil/" } }),
+            &sk,
+        );
+        let err = m
+            .apply_fetched(&replay)
+            .expect_err("replay must be refused");
+        match err {
+            ConfigError::Rollback { got, last } => {
+                assert_eq!(got, 12);
+                assert_eq!(last, 500, "the in-memory floor must hold");
+            }
+            other => panic!("expected Rollback, got {other:?}"),
+        }
+        assert_eq!(m.revision(), Some(500));
+        assert_eq!(m.current().content.url, None, "current must survive");
+    }
+
+    #[test]
+    fn a_corrupt_store_is_quarantined_and_boot_still_succeeds_with_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(store::LAST_GOOD_FILE), b"{ not json").unwrap();
+
+        let (m, applied) = manager(dir.path(), None);
+        assert_eq!(
+            applied.source,
+            Source::Bootstrap,
+            "the kiosk must still boot"
+        );
+        assert_eq!(m.home_url(), "https://boot.example.com/");
+        assert!(
+            applied.warnings.iter().any(|w| w.contains("corrupt")),
+            "a corrupt store must be surfaced, got {:?}",
+            applied.warnings
+        );
+        assert!(
+            dir.path().join(store::CORRUPT_FILE).exists(),
+            "the corrupt file must be quarantined, not re-read every boot"
+        );
+    }
+
+    #[test]
+    fn a_schema_shape_mismatch_in_the_store_still_preserves_the_floor_across_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        // Readable JSON with a revision, but a shape this build cannot deserialize.
+        let stored = serde_json::json!({ "revision": 77, "content": { "zoom": "not-a-number" } });
+        std::fs::write(
+            dir.path().join(store::LAST_GOOD_FILE),
+            serde_json::to_vec(&stored).unwrap(),
+        )
+        .unwrap();
+
+        let (m, applied) = manager(dir.path(), None);
+        assert_eq!(applied.source, Source::Bootstrap);
+        assert_eq!(
+            m.revision(),
+            Some(77),
+            "the floor must survive a shape mismatch"
+        );
+    }
+
+    // --- FIX 2 / FIX 4: a stored last-good must clear the same gates as a fetch ---
+
+    #[test]
+    fn a_tampered_last_good_is_not_adopted_when_a_key_is_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sk, vk) = keys();
+
+        // Legitimately signed, then edited on disk to inject JS — SEC-01.
+        let mut doc = signed_value(
+            &serde_json::json!({ "revision": 4, "content": { "url": "https://good/" } }),
+            &sk,
+        );
+        doc["content"]["inject_js"] = Value::String("exfiltrate()".into());
+        plant(dir.path(), &doc, 4);
+
+        let (m, applied) = manager(dir.path(), Some(vk));
+        assert_eq!(
+            applied.source,
+            Source::Bootstrap,
+            "a last-good whose signature does not re-verify must not be adopted"
+        );
+        assert_eq!(m.current().content.inject_js, "");
+        assert_eq!(m.home_url(), "https://boot.example.com/");
+        assert!(
+            applied.warnings.iter().any(|w| w.contains("signature")),
+            "got {:?}",
+            applied.warnings
+        );
+        assert_eq!(m.revision(), Some(4), "the floor is still retained");
+    }
+
+    #[test]
+    fn a_validly_signed_last_good_is_adopted_when_a_key_is_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sk, vk) = keys();
+        let doc = signed_value(
+            &serde_json::json!({ "revision": 4, "content": { "url": "https://good/" } }),
+            &sk,
+        );
+        plant(dir.path(), &doc, 4);
+
+        let (m, applied) = manager(dir.path(), Some(vk));
+        assert_eq!(applied.source, Source::LastGood);
+        assert_eq!(applied.revision, Some(4));
+        assert_eq!(m.home_url(), "https://good/");
+    }
+
+    #[test]
+    fn a_last_good_from_a_future_schema_version_is_not_adopted_cfg_03() {
+        let dir = tempfile::tempdir().unwrap();
+        // A downgraded binary must never run a v2 document it does not understand.
+        let stored = serde_json::json!({
+            "revision": 8, "version": 2, "content": { "url": "https://v2/" }
+        });
+        plant(dir.path(), &stored, 8);
+
+        let (m, applied) = manager(dir.path(), None);
+        assert_eq!(applied.source, Source::Bootstrap);
+        assert_eq!(m.home_url(), "https://boot.example.com/");
+        assert!(
+            applied.warnings.iter().any(|w| w.contains("re-validation")),
+            "got {:?}",
+            applied.warnings
+        );
+        assert_eq!(m.revision(), Some(8), "the floor is still retained");
+    }
+
+    #[test]
+    fn a_last_good_with_an_out_of_range_value_is_not_adopted() {
+        let dir = tempfile::tempdir().unwrap();
+        // Neither `logging.level` nor `config_poll_s` is healed by clamp_effective's set;
+        // an un-healed invalid document must not become the running config.
+        let stored = serde_json::json!({
+            "revision": 9,
+            "network": { "config_poll_s": 1 },
+            "logging": { "level": "OOPS" }
+        });
+        plant(dir.path(), &stored, 9);
+
+        let (m, applied) = manager(dir.path(), None);
+        assert_eq!(applied.source, Source::Bootstrap);
+        assert_eq!(m.current().logging.level, "info");
+        assert_eq!(m.current().network.config_poll_s, 300);
+        assert_eq!(m.revision(), Some(9), "the floor is still retained");
+    }
+
+    #[test]
+    fn a_keyless_build_still_adopts_last_good_rather_than_bricking() {
+        let dir = tempfile::tempdir().unwrap();
+        let stored = serde_json::json!({
+            "revision": 2, "sig": "ed25519:AAAA", "content": { "url": "https://kept/" }
+        });
+        plant(dir.path(), &stored, 2);
+        let (m, applied) = manager(dir.path(), None);
+        assert_eq!(applied.source, Source::LastGood);
+        assert_eq!(m.home_url(), "https://kept/");
+    }
+
+    // --- FIX 8: the remaining composed-path security properties ---
+
+    #[test]
+    fn a_byte_level_tampered_body_is_rejected_at_the_manager_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sk, vk) = keys();
+        let (mut m, _) = manager(dir.path(), Some(vk));
+
+        let mut doc = signed_value(
+            &serde_json::json!({ "revision": 6, "content": { "url": "https://good/" } }),
+            &sk,
+        );
+        // Keep the (valid) signature, swap the body it covers.
+        doc["content"]["url"] = Value::String("https://evil/".into());
+        let body = serde_json::to_vec(&doc).unwrap();
+
+        let err = m
+            .apply_fetched(&body)
+            .expect_err("a tampered body must be rejected");
+        assert!(matches!(err, ConfigError::Signature(_)), "got {err:?}");
+        assert_eq!(m.home_url(), "https://boot.example.com/");
+        assert_eq!(m.revision(), None);
+        assert!(!dir.path().join(store::LAST_GOOD_FILE).exists());
+    }
+
+    #[test]
+    fn a_failed_persist_does_not_adopt_the_config() {
+        let (sk, vk) = keys();
+        let dir = tempfile::tempdir().unwrap();
+        // Point the store at a path that cannot be a directory: a FILE stands where the
+        // store dir would go, so create_dir_all (and therefore the save) must fail.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"i am a file, not a directory").unwrap();
+        let store_dir = blocker.join("store");
+
+        let (mut m, _) = ConfigManager::boot(
+            boot_config(),
+            "lobby-01".to_string(),
+            store::ConfigStore::new(&store_dir),
+            Some(vk),
+        );
+
+        let body = sign(
+            &serde_json::json!({ "revision": 3, "content": { "url": "https://app/" } }),
+            &sk,
+        );
+        let err = m
+            .apply_fetched(&body)
+            .expect_err("persist must fail, so the apply must fail");
+        assert!(matches!(err, ConfigError::Io(_)), "got {err:?}");
+
+        // Persist-then-adopt: a config that could not be made durable must not be running,
+        // or a restart would silently revert it.
+        assert_eq!(m.revision(), None, "revision must be unchanged");
+        assert_eq!(m.current(), &RemoteConfig::default());
+        assert_eq!(m.home_url(), "https://boot.example.com/");
     }
 }
