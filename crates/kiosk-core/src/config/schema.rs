@@ -152,10 +152,23 @@ impl Default for Display {
     }
 }
 
+/// The screen corner (or centre) the exit-gesture taps must land in. Spec §5.2
+/// enumerates exactly these — a free string would let a signed-but-wrong value
+/// reach the platform layer with no field-level `config.error` for the operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GestureRegion {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+    Center,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExitGesture {
     pub taps: u8,
-    pub region: String,
+    pub region: GestureRegion,
     #[serde(default)]
     pub min_len: Option<u8>,
     #[serde(default)]
@@ -359,7 +372,7 @@ mod tests {
         assert_eq!(c.input.touch_keyboard, TouchKeyboard::Off);
         let g = c.input.exit_gesture.expect("gesture");
         assert_eq!(g.taps, 5);
-        assert_eq!(g.region, "top-right");
+        assert_eq!(g.region, GestureRegion::TopRight);
         assert_eq!(c.logging.url_detail, UrlDetail::Full);
         // Untouched sections still default.
         assert_eq!(c.network.config_poll_s, 300);
@@ -379,6 +392,33 @@ mod tests {
         // spec cfg-13: the on-device parser is strict JSON.
         let json = "{ /* nope */ \"version\": 1 }";
         assert!(serde_json::from_str::<RemoteConfig>(json).is_err());
+    }
+
+    #[test]
+    fn exit_gesture_region_is_an_enum_not_a_free_string() {
+        // Spec §5.2 enumerates exactly five regions. A signed-but-wrong value must be
+        // rejected at parse time, not passed through to the platform layer.
+        for region in [
+            "top-left",
+            "top-right",
+            "bottom-left",
+            "bottom-right",
+            "center",
+        ] {
+            let json = format!(
+                r#"{{"input":{{"exit_gesture":{{"taps":5,"region":"{region}","pin_hash":"$h"}}}}}}"#
+            );
+            serde_json::from_str::<RemoteConfig>(&json)
+                .unwrap_or_else(|e| panic!("{region} must parse: {e}"));
+        }
+        let bad = r#"{"input":{"exit_gesture":{"taps":5,"region":"middle-left","pin_hash":"$h"}}}"#;
+        assert!(
+            serde_json::from_str::<RemoteConfig>(bad).is_err(),
+            "an unenumerated region must be rejected"
+        );
+        // Snake_case is NOT the wire form — the spec writes kebab-case.
+        let snake = r#"{"input":{"exit_gesture":{"taps":5,"region":"top_left","pin_hash":"$h"}}}"#;
+        assert!(serde_json::from_str::<RemoteConfig>(snake).is_err());
     }
 
     #[test]

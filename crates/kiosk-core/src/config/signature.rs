@@ -111,15 +111,42 @@ mod tests {
         assert_eq!(rev, 42);
     }
 
+    /// The property that actually matters: the key order of the bytes we RECEIVE from
+    /// the bucket must not affect verification. A signer (or a CDN, or a proxy that
+    /// re-serializes) is free to emit the members in any order — JSON objects are
+    /// unordered — and the document must still verify against the same signature.
+    ///
+    /// This is exercised for real: the document below is hand-written with `sig` first
+    /// and `content` before `revision`, and nested members in reverse order — i.e. the
+    /// wire bytes are genuinely NOT in sorted order at the point they enter the verify
+    /// path. (Ordering is normalized on the way in — `serde_json::Map` is BTreeMap-backed
+    /// in this build — and JCS re-establishes it independently at canonicalization; the
+    /// end-to-end guarantee is what is pinned here.)
     #[test]
-    fn signature_survives_key_reordering_that_is_jcs_canonicalization_working() {
+    fn key_order_of_the_received_bytes_does_not_affect_verification() {
         let (sk, vk) = test_keys();
-        let doc = serde_json::json!({ "revision": 7, "content": { "url": "https://a/" } });
+        let doc = serde_json::json!({
+            "revision": 7,
+            "content": { "url": "https://a/", "zoom": 1.5 },
+        });
         let signed = sign(&doc, &sk);
-        // Re-serialize through a BTreeMap-ish round trip to shuffle key order.
-        let reordered: Value =
-            serde_json::from_str(&serde_json::to_string(&signed).unwrap()).unwrap();
-        assert_eq!(verify_signed(&reordered, &vk).unwrap(), 7);
+        let sig = signed["sig"].as_str().unwrap().to_string();
+
+        // Hand-written wire bytes: members deliberately out of sorted order.
+        let wire = format!(
+            r#"{{"sig":"{sig}","content":{{"zoom":1.5,"url":"https://a/"}},"revision":7}}"#
+        );
+        assert!(
+            wire.find("\"sig\"").unwrap() < wire.find("\"content\"").unwrap()
+                && wire.find("\"content\"").unwrap() < wire.find("\"revision\"").unwrap(),
+            "the fixture must genuinely be out of sorted order, or this test proves nothing"
+        );
+
+        let received: Value = serde_json::from_str(&wire).expect("wire bytes must parse");
+        assert_eq!(
+            verify_signed(&received, &vk).expect("reordered bytes must still verify"),
+            7
+        );
     }
 
     #[test]
