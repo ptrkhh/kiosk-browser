@@ -47,6 +47,16 @@ pub enum ConfigError {
         document: Option<i64>,
         verified: i64,
     },
+    /// The document is genuinely signed, but for a DIFFERENT device (or for none at all).
+    /// A signed config is bound to exactly one device: without this gate, any principal
+    /// who can read the bucket (SEC-04) or influence which object we fetch (SEC-08) could
+    /// replay kiosk B's genuinely-signed, higher-revision config — including its
+    /// `content.url` and `inject_js` — at kiosk A (spec §8/SEC-11).
+    #[error("device binding: config is for device {got:?}, this device is {expected}")]
+    DeviceMismatch {
+        expected: String,
+        got: Option<String>,
+    },
     #[error("io: {0}")]
     Io(String),
     #[error("parse: {0}")]

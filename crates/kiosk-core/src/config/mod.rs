@@ -1,7 +1,8 @@
 //! Configuration subsystem (spec §5, §8).
 //!
 //! Validation order for a fetched config is fixed and non-negotiable:
-//! parse (strict JSON) → signature → anti-rollback → schema/ranges → persist → adopt.
+//! parse (strict JSON) → signature → device binding → anti-rollback → schema/ranges →
+//! persist → adopt.
 //! A failure at any step leaves the currently-running config untouched.
 
 pub mod bootstrap;
@@ -57,6 +58,9 @@ impl ConfigManager {
     ///   `content.inject_js` executed on the next boot with no cryptographic gate
     ///   (spec §8/SEC-01). With NO pinned key we adopt it unverified: such a build
     ///   already rejects every fetch, and refusing to boot would brick the device.
+    /// * it is bound to THIS device (`device_id` inside the signed payload). Without this,
+    ///   the fetch-path device-binding gate would simply be side-stepped by planting
+    ///   another device's genuinely-signed config in the data dir (spec §8/SEC-11).
     /// * it deserializes into this build's schema, and
     /// * it still passes `validate()` — including the `version` gate, so a downgraded
     ///   binary can never run a document it does not understand (cfg-03).
@@ -81,7 +85,7 @@ impl ConfigManager {
 
         let (mut config, source) = match stored {
             None => (RemoteConfig::default(), Source::Bootstrap),
-            Some(stored) => match Self::vet_last_good(&stored, key.as_ref()) {
+            Some(stored) => match Self::vet_last_good(&stored, &device_id, key.as_ref()) {
                 Ok((cfg, w)) => {
                     warnings.extend(w);
                     (cfg, Source::LastGood)
@@ -121,6 +125,7 @@ impl ConfigManager {
     /// caller falls back to bootstrap content (but keeps the rollback floor).
     fn vet_last_good(
         stored: &store::StoredConfig,
+        device_id: &str,
         key: Option<&VerifyingKey>,
     ) -> Result<(RemoteConfig, Vec<String>), String> {
         if let Some(key) = key {
@@ -134,6 +139,17 @@ impl ConfigManager {
                 }
                 Ok(_) => {}
                 Err(e) => return Err(format!("signature does not re-verify: {e}")),
+            }
+
+            // Device binding, immediately after the signature — otherwise the fetch-path
+            // hole simply moves to the store: plant kiosk B's genuinely-signed config in
+            // kiosk A's data dir and it is adopted at the next boot (spec §8/SEC-11).
+            // Only meaningful under a pinned key; a keyless build already trusts the store.
+            let bound = Self::bound_device_id(&stored.raw);
+            if bound.as_deref() != Some(device_id) {
+                return Err(format!(
+                    "device binding: config is for device {bound:?}, this device is {device_id}"
+                ));
             }
         }
 
@@ -160,7 +176,21 @@ impl ConfigManager {
         })?;
         let revision = signature::verify_signed(&raw, key)?;
 
-        // 2. anti-rollback. The floor is the MAXIMUM of what is on disk and what this
+        // 2. device binding (spec §8/SEC-11). A signature proves the document is genuine,
+        // NOT that it was authored for THIS device. Bucket read alone (SEC-04) or control
+        // over which object we fetch (SEC-08) would otherwise let kiosk B's genuinely
+        // signed, higher-revision config — content.url and inject_js included — be
+        // replayed at kiosk A. Read from `raw` (the signature-covered bytes) so the value
+        // is inside the verified payload.
+        let bound = Self::bound_device_id(&raw);
+        if bound.as_deref() != Some(self.device_id.as_str()) {
+            return Err(ConfigError::DeviceMismatch {
+                expected: self.device_id.clone(),
+                got: bound,
+            });
+        }
+
+        // 3. anti-rollback. The floor is the MAXIMUM of what is on disk and what this
         // process has already applied. Reading it from disk alone would let an attacker
         // who can delete or corrupt `config-lastgood.json` (store reads a missing/corrupt
         // file as revision 0) replay a genuinely-signed OLD revision at a device that is
@@ -176,12 +206,12 @@ impl ConfigManager {
             });
         }
 
-        // 3. schema & ranges (whole-document)
+        // 4. schema & ranges (whole-document)
         let config: RemoteConfig = serde_json::from_value(raw.clone())
             .map_err(|e| ConfigError::Parse(format!("config does not match the schema: {e}")))?;
         let mut warnings = validate::validate(&config)?;
 
-        // 4. persist, then adopt
+        // 5. persist, then adopt
         self.store.save_last_good(&raw, revision)?;
 
         let mut effective = config;
@@ -222,6 +252,13 @@ impl ConfigManager {
 
     pub fn bootstrap(&self) -> &bootstrap::BootstrapConfig {
         &self.bootstrap
+    }
+
+    /// The `device_id` the signed document is bound to, read from the RAW (i.e.
+    /// signature-covered) json — never from anywhere the signature does not cover.
+    /// A non-string `device_id` reads as absent, so it can never match.
+    fn bound_device_id(raw: &serde_json::Value) -> Option<String> {
+        raw.get("device_id")?.as_str().map(str::to_string)
     }
 
     /// cfg-09: templating with an opaque machine GUID makes fleet triage painful.
@@ -314,6 +351,7 @@ mod manager_tests {
         let body = sign(
             &serde_json::json!({
                 "revision": 5,
+                "device_id": "lobby-01",
                 "content": { "url": "https://app.example.com/k?d={device_id}" }
             }),
             &sk,
@@ -357,10 +395,16 @@ mod manager_tests {
         let (sk, vk) = keys();
         let (mut m, _) = manager(dir.path(), Some(vk));
 
-        let good = sign(&serde_json::json!({ "revision": 5, "content": {} }), &sk);
+        let good = sign(
+            &serde_json::json!({ "revision": 5, "device_id": "lobby-01", "content": {} }),
+            &sk,
+        );
         m.apply_fetched(&good).expect("rev 5 applies");
 
-        let stale = sign(&serde_json::json!({ "revision": 5, "content": {} }), &sk);
+        let stale = sign(
+            &serde_json::json!({ "revision": 5, "device_id": "lobby-01", "content": {} }),
+            &sk,
+        );
         let err = m
             .apply_fetched(&stale)
             .expect_err("rev <= last must be rejected");
@@ -382,6 +426,7 @@ mod manager_tests {
         let body = sign(
             &serde_json::json!({
                 "revision": 9,
+                "device_id": "lobby-01",
                 "content": { "url": "https://app/", "zoom": 99.0 },
                 "network": { "config_poll_s": 0 }
             }),
@@ -414,7 +459,10 @@ mod manager_tests {
         let (sk, vk) = keys();
         let (mut m, _) = manager(dir.path(), Some(vk));
 
-        let body = sign(&serde_json::json!({ "revision": 1 }), &sk);
+        let body = sign(
+            &serde_json::json!({ "revision": 1, "device_id": "lobby-01" }),
+            &sk,
+        );
         let applied = m.apply_fetched(&body).expect("signed {} is schema-valid");
         assert_eq!(applied.revision, Some(1));
         assert_eq!(
@@ -457,7 +505,11 @@ mod manager_tests {
             Some(vk),
         );
         let body = sign(
-            &serde_json::json!({ "revision": 2, "content": { "url": "https://a/?d={device_id}" } }),
+            &serde_json::json!({
+                "revision": 2,
+                "device_id": "6f9619ff-8b86-d011-b42d-00c04fc964ff",
+                "content": { "url": "https://a/?d={device_id}" }
+            }),
             &sk,
         );
         let applied = m.apply_fetched(&body).expect("applies");
@@ -510,7 +562,7 @@ mod manager_tests {
         let (mut m, _) = manager(dir.path(), Some(vk));
 
         m.apply_fetched(&sign(
-            &serde_json::json!({ "revision": 5, "content": {} }),
+            &serde_json::json!({ "revision": 5, "device_id": "lobby-01", "content": {} }),
             &sk,
         ))
         .expect("rev 5 applies");
@@ -527,7 +579,11 @@ mod manager_tests {
         // stale object and the ability to remove a file.
         for old in [3, 5] {
             let body = sign(
-                &serde_json::json!({ "revision": old, "content": { "url": "https://evil/" } }),
+                &serde_json::json!({
+                    "revision": old,
+                    "device_id": "lobby-01",
+                    "content": { "url": "https://evil/" }
+                }),
                 &sk,
             );
             match m.apply_fetched(&body) {
@@ -552,7 +608,7 @@ mod manager_tests {
         let (sk, vk) = keys();
         let (mut m, _) = manager(dir.path(), Some(vk));
         m.apply_fetched(&sign(
-            &serde_json::json!({ "revision": 500, "content": {} }),
+            &serde_json::json!({ "revision": 500, "device_id": "lobby-01", "content": {} }),
             &sk,
         ))
         .expect("rev 500 applies");
@@ -561,7 +617,11 @@ mod manager_tests {
         std::fs::write(dir.path().join(store::LAST_GOOD_FILE), b"").unwrap();
 
         let replay = sign(
-            &serde_json::json!({ "revision": 12, "content": { "url": "https://evil/" } }),
+            &serde_json::json!({
+                "revision": 12,
+                "device_id": "lobby-01",
+                "content": { "url": "https://evil/" }
+            }),
             &sk,
         );
         let err = m
@@ -657,7 +717,9 @@ mod manager_tests {
         let dir = tempfile::tempdir().unwrap();
         let (sk, vk) = keys();
         let doc = signed_value(
-            &serde_json::json!({ "revision": 4, "content": { "url": "https://good/" } }),
+            &serde_json::json!({
+                "revision": 4, "device_id": "lobby-01", "content": { "url": "https://good/" }
+            }),
             &sk,
         );
         plant(dir.path(), &doc, 4);
@@ -744,6 +806,135 @@ mod manager_tests {
         assert!(!dir.path().join(store::LAST_GOOD_FILE).exists());
     }
 
+    // --- device binding: a signed config is bound to ONE device (spec §8/SEC-11) ---
+
+    #[test]
+    fn rejects_a_validly_signed_config_authored_for_another_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sk, vk) = keys();
+        let (mut m, _) = manager(dir.path(), Some(vk));
+
+        // Genuinely signed, higher revision, schema-valid — but authored for kiosk B.
+        let body = sign(
+            &serde_json::json!({
+                "revision": 99,
+                "device_id": "lobby-02",
+                "content": { "url": "https://other/", "inject_js": "exfiltrate()" }
+            }),
+            &sk,
+        );
+        let err = m
+            .apply_fetched(&body)
+            .expect_err("another device's config must be rejected");
+        match err {
+            ConfigError::DeviceMismatch { expected, got } => {
+                assert_eq!(expected, "lobby-01");
+                assert_eq!(got.as_deref(), Some("lobby-02"));
+            }
+            other => panic!("expected DeviceMismatch, got {other:?}"),
+        }
+        assert_eq!(m.home_url(), "https://boot.example.com/");
+        assert_eq!(m.current().content.inject_js, "");
+        assert_eq!(m.revision(), None);
+        assert!(!dir.path().join(store::LAST_GOOD_FILE).exists());
+    }
+
+    #[test]
+    fn rejects_a_fetched_config_with_no_device_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sk, vk) = keys();
+        let (mut m, _) = manager(dir.path(), Some(vk));
+
+        let body = sign(
+            &serde_json::json!({ "revision": 7, "content": { "url": "https://app/" } }),
+            &sk,
+        );
+        let err = m
+            .apply_fetched(&body)
+            .expect_err("device_id is REQUIRED on the fetched path");
+        match err {
+            ConfigError::DeviceMismatch { expected, got } => {
+                assert_eq!(expected, "lobby-01");
+                assert_eq!(got, None);
+            }
+            other => panic!("expected DeviceMismatch, got {other:?}"),
+        }
+        assert_eq!(m.home_url(), "https://boot.example.com/");
+    }
+
+    #[test]
+    fn accepts_a_signed_config_bound_to_this_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sk, vk) = keys();
+        let (mut m, _) = manager(dir.path(), Some(vk));
+
+        let body = sign(
+            &serde_json::json!({
+                "revision": 11,
+                "device_id": "lobby-01",
+                "content": { "url": "https://app/" }
+            }),
+            &sk,
+        );
+        let applied = m.apply_fetched(&body).expect("the bound config must apply");
+        assert_eq!(applied.revision, Some(11));
+        assert_eq!(m.home_url(), "https://app/");
+    }
+
+    #[test]
+    fn device_binding_is_checked_after_the_signature_not_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sk, vk) = keys();
+        let (mut m, _) = manager(dir.path(), Some(vk));
+
+        // Correct device_id, but the signed body was tampered with afterwards: an
+        // unverified document's device_id must never be trusted, so this is a SIGNATURE
+        // failure, not a device failure.
+        let mut doc = signed_value(
+            &serde_json::json!({
+                "revision": 6, "device_id": "lobby-01", "content": { "url": "https://good/" }
+            }),
+            &sk,
+        );
+        doc["content"]["url"] = Value::String("https://evil/".into());
+        let err = m
+            .apply_fetched(&serde_json::to_vec(&doc).unwrap())
+            .expect_err("a tampered body must be rejected");
+        assert!(matches!(err, ConfigError::Signature(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn a_last_good_planted_from_another_device_is_not_adopted_at_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sk, vk) = keys();
+
+        // kiosk B's genuinely-signed config, dropped into kiosk A's data dir.
+        let doc = signed_value(
+            &serde_json::json!({
+                "revision": 40,
+                "device_id": "lobby-02",
+                "content": { "url": "https://other/", "inject_js": "exfiltrate()" }
+            }),
+            &sk,
+        );
+        plant(dir.path(), &doc, 40);
+
+        let (m, applied) = manager(dir.path(), Some(vk));
+        assert_eq!(
+            applied.source,
+            Source::Bootstrap,
+            "a last-good bound to another device must not be adopted"
+        );
+        assert_eq!(m.current().content.inject_js, "");
+        assert_eq!(m.home_url(), "https://boot.example.com/");
+        assert!(
+            applied.warnings.iter().any(|w| w.contains("device")),
+            "got {:?}",
+            applied.warnings
+        );
+        assert_eq!(m.revision(), Some(40), "the floor is still retained");
+    }
+
     #[test]
     fn a_failed_persist_does_not_adopt_the_config() {
         let (sk, vk) = keys();
@@ -762,7 +953,9 @@ mod manager_tests {
         );
 
         let body = sign(
-            &serde_json::json!({ "revision": 3, "content": { "url": "https://app/" } }),
+            &serde_json::json!({
+                "revision": 3, "device_id": "lobby-01", "content": { "url": "https://app/" }
+            }),
             &sk,
         );
         let err = m

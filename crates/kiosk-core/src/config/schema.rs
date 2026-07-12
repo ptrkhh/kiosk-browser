@@ -276,6 +276,12 @@ pub struct RemoteConfig {
     /// locally-sourced config, which never passes through signature/rollback checks.
     #[serde(default)]
     pub revision: Option<i64>,
+    /// REQUIRED on every *fetched* config (spec §5.2/§8 SEC-11): it binds the signed
+    /// document to one device and must equal the effective device_id. `Option` on the
+    /// type only so `RemoteConfig::default()` and locally-sourced config still work —
+    /// the requirement is enforced on the fetched/last-good paths, not by the type.
+    #[serde(default)]
+    pub device_id: Option<String>,
     #[serde(default)]
     pub sig: Option<String>,
     #[serde(default)]
