@@ -49,13 +49,11 @@ pub fn validate(cfg: &RemoteConfig) -> Result<Vec<String>, ConfigError> {
         ));
     }
 
-    // display — monitor is device-local: warn and fall back to primary, never reject.
-    if cfg.display.monitor > 0 {
-        warnings.push(format!(
-            "display.monitor = {} — falls back to primary if that display is absent",
-            cfg.display.monitor
-        ));
-    }
+    // display — `display.monitor` is NOT range-validated here. Spec §5.2 says an index
+    // beyond the available displays falls back to primary WITH a warning, but that check
+    // needs the real display count, and enumerating displays is a per-OS API — forbidden
+    // in kiosk-core by the layering rule (spec §4). The platform layer (kiosk-main) knows
+    // the topology and performs the fallback + warning. Any index is accepted here.
     range_u64(
         cfg.display.cursor_autohide_seconds,
         0,
@@ -294,13 +292,19 @@ mod tests {
     }
 
     #[test]
-    fn out_of_range_monitor_warns_instead_of_rejecting() {
+    fn monitor_never_rejects_topology_is_device_local() {
+        // A high index must never reject: kiosk-core cannot know how many displays exist
+        // (enumeration is a per-OS API, spec §4), so the "beyond available displays ⇒
+        // primary + WARNING" check belongs to the platform layer, not here. Core emits
+        // no display.monitor warning at all — a legit dual-head `monitor: 1` must be silent.
         let warnings = validate(&cfg(r#"{"display":{"monitor":9}}"#))
-            .expect("monitor must warn, not reject — display topology is device-local");
+            .expect("monitor must never reject — display topology is device-local");
         assert!(
-            warnings.iter().any(|w| w.contains("display.monitor")),
-            "got {warnings:?}"
+            !warnings.iter().any(|w| w.contains("display.monitor")),
+            "core must not warn on display.monitor; got {warnings:?}"
         );
+        let warnings = validate(&cfg(r#"{"display":{"monitor":1}}"#)).expect("valid dual-head");
+        assert!(warnings.is_empty(), "got {warnings:?}");
     }
 
     #[test]
