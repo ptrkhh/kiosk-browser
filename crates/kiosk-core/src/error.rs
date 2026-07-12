@@ -39,6 +39,14 @@ pub enum ConfigError {
     Rollback { got: i64, last: i64 },
     #[error("unsupported_version: {0}")]
     UnsupportedVersion(u32),
+    /// A security-control rejection, NOT a disk problem: the revision the signature
+    /// authoritatively verified disagrees with (or is missing from) the document body.
+    /// Persisting such a document would collapse the anti-rollback floor (spec §8/SEC-11).
+    #[error("revision mismatch: document says {document:?}, signature verified {verified}")]
+    RevisionMismatch {
+        document: Option<i64>,
+        verified: i64,
+    },
     #[error("io: {0}")]
     Io(String),
     #[error("parse: {0}")]

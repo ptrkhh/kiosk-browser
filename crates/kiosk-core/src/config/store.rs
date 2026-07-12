@@ -5,9 +5,13 @@
 
 use crate::error::ConfigError;
 use serde_json::Value;
+use std::io::Write as _;
 use std::path::PathBuf;
 
 pub const LAST_GOOD_FILE: &str = "config-lastgood.json";
+/// A store file that exists but cannot be parsed is renamed here so the event is
+/// durable and the bad bytes are not re-read on every boot.
+pub const CORRUPT_FILE: &str = "config-lastgood.corrupt";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredConfig {
@@ -29,13 +33,49 @@ impl ConfigStore {
         self.dir.join(LAST_GOOD_FILE)
     }
 
+    fn corrupt_path(&self) -> PathBuf {
+        self.dir.join(CORRUPT_FILE)
+    }
+
     /// Load the last-known-good config. A missing OR corrupt file is treated as
     /// "none" — a kiosk must boot even with a damaged store.
     pub fn load_last_good(&self) -> Option<StoredConfig> {
-        let text = std::fs::read_to_string(self.path()).ok()?;
-        let raw: Value = serde_json::from_str(&text).ok()?;
-        let revision = raw.get("revision").and_then(Value::as_i64)?;
-        Some(StoredConfig { raw, revision })
+        self.load_last_good_checked().0
+    }
+
+    /// As `load_last_good`, plus a warning when the file existed but could not be
+    /// parsed. In that case the file is QUARANTINED (renamed to
+    /// `config-lastgood.corrupt`, best-effort) so it cannot be silently re-read on
+    /// every boot and so an operator can recover it. The caller MUST surface the
+    /// warning: a vanished store zeroes the on-disk anti-rollback floor.
+    pub fn load_last_good_checked(&self) -> (Option<StoredConfig>, Option<String>) {
+        let path = self.path();
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return (None, None); // absent (or unreadable) — the normal first-boot case
+        };
+        let parsed = serde_json::from_str::<Value>(&text).ok().and_then(|raw| {
+            let revision = raw.get("revision").and_then(Value::as_i64)?;
+            Some(StoredConfig { raw, revision })
+        });
+        match parsed {
+            Some(stored) => (Some(stored), None),
+            None => {
+                // best-effort quarantine; a rename failure must never stop the boot
+                let quarantined = std::fs::rename(&path, self.corrupt_path()).is_ok();
+                (
+                    None,
+                    Some(format!(
+                        "{} is corrupt (unparseable or missing an integer `revision`); {}",
+                        path.display(),
+                        if quarantined {
+                            format!("quarantined as {}", self.corrupt_path().display())
+                        } else {
+                            "quarantine rename failed, leaving it in place".to_string()
+                        }
+                    )),
+                )
+            }
+        }
     }
 
     /// The highest revision ever applied; `0` when nothing has been applied.
@@ -58,16 +98,16 @@ impl ConfigStore {
     pub fn save_last_good(&self, raw: &Value, revision: i64) -> Result<(), ConfigError> {
         match raw.get("revision").and_then(Value::as_i64) {
             None => {
-                return Err(ConfigError::Io(format!(
-                    "refusing to store config: document has no integer `revision` field \
-                     (applied revision {revision}); storing it would zero the anti-rollback floor"
-                )));
+                return Err(ConfigError::RevisionMismatch {
+                    document: None,
+                    verified: revision,
+                });
             }
             Some(r) if r != revision => {
-                return Err(ConfigError::Io(format!(
-                    "refusing to store config: document `revision` is {r} but the applied \
-                     (signature-verified) revision is {revision}"
-                )));
+                return Err(ConfigError::RevisionMismatch {
+                    document: Some(r),
+                    verified: revision,
+                });
             }
             Some(_) => {}
         }
@@ -78,11 +118,26 @@ impl ConfigStore {
         let text = serde_json::to_string_pretty(raw)
             .map_err(|e| ConfigError::Io(format!("serialize config: {e}")))?;
 
+        // Durable + atomic: write, fsync the FILE, then rename. Without the fsync the
+        // rename can land while the data blocks have not, leaving a zero-length or
+        // partial store after a power cut — and a kiosk gets its power yanked routinely.
         let tmp = self.dir.join(format!("{LAST_GOOD_FILE}.tmp"));
-        std::fs::write(&tmp, text.as_bytes())
-            .map_err(|e| ConfigError::Io(format!("write {}: {e}", tmp.display())))?;
+        {
+            let mut f = std::fs::File::create(&tmp)
+                .map_err(|e| ConfigError::Io(format!("create {}: {e}", tmp.display())))?;
+            f.write_all(text.as_bytes())
+                .map_err(|e| ConfigError::Io(format!("write {}: {e}", tmp.display())))?;
+            f.sync_all()
+                .map_err(|e| ConfigError::Io(format!("fsync {}: {e}", tmp.display())))?;
+        }
         std::fs::rename(&tmp, self.path())
             .map_err(|e| ConfigError::Io(format!("rename into {}: {e}", self.path().display())))?;
+
+        // Best-effort: fsync the directory so the rename itself is durable. Not
+        // meaningful on every platform (Windows returns an error for a directory
+        // handle opened this way), so the result is deliberately ignored — std::fs
+        // only, no per-OS dependency (layering rule, spec §4).
+        let _ = std::fs::File::open(&self.dir).and_then(|d| d.sync_all());
 
         Ok(())
     }
@@ -145,6 +200,50 @@ mod tests {
     }
 
     #[test]
+    fn a_corrupt_store_is_quarantined_and_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(LAST_GOOD_FILE), b"{ this is not json").unwrap();
+        let s = ConfigStore::new(dir.path());
+
+        let (stored, warning) = s.load_last_good_checked();
+        assert_eq!(stored, None);
+        let w = warning.expect("a corrupt store must be reported, never silently ignored");
+        assert!(w.contains("corrupt"), "got {w:?}");
+
+        assert!(
+            !dir.path().join(LAST_GOOD_FILE).exists(),
+            "the corrupt file must be moved aside"
+        );
+        assert!(
+            dir.path().join(CORRUPT_FILE).exists(),
+            "the corrupt file must be preserved for the operator"
+        );
+    }
+
+    #[test]
+    fn a_truncated_store_missing_a_revision_is_also_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        // Parses as JSON, but has no integer `revision` — equally unusable as a floor.
+        std::fs::write(dir.path().join(LAST_GOOD_FILE), br#"{"content":{}}"#).unwrap();
+        let s = ConfigStore::new(dir.path());
+        let (stored, warning) = s.load_last_good_checked();
+        assert_eq!(stored, None);
+        assert!(warning.is_some());
+        assert!(dir.path().join(CORRUPT_FILE).exists());
+    }
+
+    #[test]
+    fn a_healthy_store_is_not_quarantined_and_reports_no_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = ConfigStore::new(dir.path());
+        s.save_last_good(&doc(4), 4).unwrap();
+        let (stored, warning) = s.load_last_good_checked();
+        assert_eq!(stored.unwrap().revision, 4);
+        assert_eq!(warning, None);
+        assert!(!dir.path().join(CORRUPT_FILE).exists());
+    }
+
+    #[test]
     fn save_creates_the_directory_if_missing() {
         let dir = tempfile::tempdir().unwrap();
         let nested = dir.path().join("does").join("not").join("exist");
@@ -162,8 +261,14 @@ mod tests {
 
         let err = s.save_last_good(&no_rev, 7).unwrap_err();
         assert!(
-            matches!(err, ConfigError::Io(ref m) if m.contains("no integer `revision`")),
-            "unexpected error: {err:?}"
+            matches!(
+                err,
+                ConfigError::RevisionMismatch {
+                    document: None,
+                    verified: 7
+                }
+            ),
+            "a security-control rejection must not masquerade as io: {err:?}"
         );
         // A stored doc with no recoverable revision would report a floor of 0
         // while holding a config. It must never reach disk.
@@ -182,8 +287,14 @@ mod tests {
         // Document says 2, but signature verification authoritatively said 8.
         let err = s.save_last_good(&doc(2), 8).unwrap_err();
         assert!(
-            matches!(err, ConfigError::Io(ref m) if m.contains("is 2") && m.contains("is 8")),
-            "error must name both revisions: {err:?}"
+            matches!(
+                err,
+                ConfigError::RevisionMismatch {
+                    document: Some(2),
+                    verified: 8
+                }
+            ),
+            "error must name both revisions and not be an io error: {err:?}"
         );
         assert!(
             !dir.path().join(LAST_GOOD_FILE).exists(),
