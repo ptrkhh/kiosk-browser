@@ -5,7 +5,7 @@
 
 use crate::error::ConfigError;
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub const LAST_GOOD_FILE: &str = "config-lastgood.json";
 
@@ -46,7 +46,32 @@ impl ConfigStore {
 
     /// Persist verbatim, atomically (temp file + rename) so a power cut mid-write
     /// cannot leave a half-written config that bricks the next boot.
+    ///
+    /// `revision` is the revision that signature verification authoritatively
+    /// extracted from the signed payload. It is cross-checked against the
+    /// document's own `revision` field BEFORE anything is written, in ALL build
+    /// profiles: a document whose revision is absent, non-integer, or divergent
+    /// is rejected outright. Persisting one would make `load_last_good` unable to
+    /// recover a revision, so `last_applied_revision()` would report `0` while a
+    /// config was in fact stored — collapsing the anti-rollback floor and letting
+    /// an older, validly-signed config be replayed (spec §8/SEC-11).
     pub fn save_last_good(&self, raw: &Value, revision: i64) -> Result<(), ConfigError> {
+        match raw.get("revision").and_then(Value::as_i64) {
+            None => {
+                return Err(ConfigError::Io(format!(
+                    "refusing to store config: document has no integer `revision` field \
+                     (applied revision {revision}); storing it would zero the anti-rollback floor"
+                )));
+            }
+            Some(r) if r != revision => {
+                return Err(ConfigError::Io(format!(
+                    "refusing to store config: document `revision` is {r} but the applied \
+                     (signature-verified) revision is {revision}"
+                )));
+            }
+            Some(_) => {}
+        }
+
         std::fs::create_dir_all(&self.dir)
             .map_err(|e| ConfigError::Io(format!("create {}: {e}", self.dir.display())))?;
 
@@ -59,18 +84,8 @@ impl ConfigStore {
         std::fs::rename(&tmp, self.path())
             .map_err(|e| ConfigError::Io(format!("rename into {}: {e}", self.path().display())))?;
 
-        debug_assert_eq!(
-            raw.get("revision").and_then(Value::as_i64),
-            Some(revision),
-            "stored document's revision must match the applied revision"
-        );
         Ok(())
     }
-}
-
-/// Convenience for callers that hold a path rather than a store.
-pub fn last_good_path(dir: &Path) -> PathBuf {
-    dir.join(LAST_GOOD_FILE)
 }
 
 #[cfg(test)]
@@ -136,5 +151,62 @@ mod tests {
         let s = ConfigStore::new(&nested);
         s.save_last_good(&doc(3), 3).unwrap();
         assert_eq!(s.last_applied_revision(), 3);
+    }
+
+    #[test]
+    fn save_rejects_a_document_with_no_revision_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = ConfigStore::new(dir.path());
+        let no_rev =
+            serde_json::json!({ "sig": "ed25519:AAAA", "content": { "url": "https://a/" } });
+
+        let err = s.save_last_good(&no_rev, 7).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Io(ref m) if m.contains("no integer `revision`")),
+            "unexpected error: {err:?}"
+        );
+        // A stored doc with no recoverable revision would report a floor of 0
+        // while holding a config. It must never reach disk.
+        assert!(
+            !dir.path().join(LAST_GOOD_FILE).exists(),
+            "a rejected save must not write the store"
+        );
+        assert_eq!(s.last_applied_revision(), 0);
+    }
+
+    #[test]
+    fn save_rejects_a_revision_that_disagrees_with_the_document_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = ConfigStore::new(dir.path());
+
+        // Document says 2, but signature verification authoritatively said 8.
+        let err = s.save_last_good(&doc(2), 8).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Io(ref m) if m.contains("is 2") && m.contains("is 8")),
+            "error must name both revisions: {err:?}"
+        );
+        assert!(
+            !dir.path().join(LAST_GOOD_FILE).exists(),
+            "a rejected save must not write the store"
+        );
+        assert_eq!(s.last_applied_revision(), 0);
+    }
+
+    #[test]
+    fn a_rejected_save_does_not_clobber_the_existing_rollback_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = ConfigStore::new(dir.path());
+        s.save_last_good(&doc(5), 5).unwrap();
+
+        // Both rejection paths, against a store that already holds a good config.
+        let no_rev = serde_json::json!({ "sig": "ed25519:BBBB" });
+        assert!(s.save_last_good(&no_rev, 6).is_err());
+        assert!(s.save_last_good(&doc(2), 6).is_err());
+
+        // The rollback floor and the stored document must both be intact.
+        assert_eq!(s.last_applied_revision(), 5);
+        let got = s.load_last_good().expect("the good config must survive");
+        assert_eq!(got.revision, 5);
+        assert_eq!(got.raw["sig"], Value::String("ed25519:AAAA".into()));
     }
 }
