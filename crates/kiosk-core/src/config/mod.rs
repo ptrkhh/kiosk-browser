@@ -2,4 +2,5 @@
 
 pub mod bootstrap;
 pub mod schema;
+pub mod signature;
 pub mod validate;
