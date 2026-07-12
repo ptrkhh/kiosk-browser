@@ -3,4 +3,5 @@
 pub mod bootstrap;
 pub mod schema;
 pub mod signature;
+pub mod store;
 pub mod validate;
