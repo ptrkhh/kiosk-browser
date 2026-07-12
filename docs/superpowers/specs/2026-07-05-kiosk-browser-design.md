@@ -451,15 +451,24 @@ generation/metageneration as consistent across APIs while ETags are not; cfg-14)
 
 **Validation is whole-document and atomic (cfg-11; SEC-11).** A remotely-fetched config
 is validated in strict order: **(1) signature** — reject if `sig` is missing or does not
-verify against the pinned public key (§8/SEC-11); **(2) anti-rollback** — reject if
-`revision` is missing or ≤ the persisted last-applied revision; **(3) schema & ranges** —
-unknown fields **warn**, any invalid/out-of-range value **rejects the entire fetched
-config** (never applies partially). Any rejection keeps last-good. `sig` and `revision`
-are therefore **required on every fetched config**. Locally-sourced config is exempt from
-step (1)–(2): the `[bootstrap]` url has no remote body, and `config-lastgood.json` was
-signature-verified when it was first applied (persisted with its revision). The
-`config.error` payload names every offending field with a per-field reason and value,
-e.g. `{ errors: [{field, reason, value}], rejected_revision }`.
+verify against the pinned public key (§8/SEC-11); **(2) device binding** — reject if
+`device_id` (inside the signed payload) is missing or ≠ this device's **effective**
+device_id; **(3) anti-rollback** — reject if `revision` is missing or ≤ the persisted
+last-applied revision; **(4) schema & ranges** — unknown fields **warn**, any
+invalid/out-of-range value **rejects the entire fetched config** (never applies
+partially). Any rejection keeps last-good. `sig`, `device_id` and `revision` are
+therefore **required on every fetched config**. Device binding sits immediately after the
+signature because it is an *authenticity* concern, not a schema one: an unverified
+document's `device_id` must never be trusted, and a verified one that names another
+device must not reach the rollback or schema gates at all. Locally-sourced config is
+exempt from steps (1)–(3): the `[bootstrap]` url has no remote body. `config-lastgood.json`
+is NOT exempt — at boot it must re-clear (1) and (2) (a disk file cannot prove its own
+provenance; §8/SEC-11), and its stored revision is retained as the in-memory anti-rollback
+floor whether or not its content is adopted. The `config.error` payload names every
+offending field with a per-field reason and value, e.g.
+`{ errors: [{field, reason, value}], rejected_revision }`; a device-binding rejection is
+reported distinctly from a signature or rollback rejection, so an operator can tell that a
+config **for another device** was served.
 
 Applied config is persisted as **exactly one** valid artifact, `config-lastgood.json` =
 the most recent successfully-applied (hence valid) remote config (cfg-06). BOOT: apply
@@ -477,6 +486,7 @@ resolves to an opaque GUID (cfg-09).
 {
   "version": 1,                           // schema MAJOR version; optional (omitted ⇒ 1)
   "revision": 42,                         // REQUIRED on fetched config; monotonic integer inside the signed payload; device rejects ≤ last-applied
+  "device_id": "lobby-01",                // REQUIRED on fetched config; inside the signed payload; MUST equal the device's effective device_id (the same value used as the Cloud Logging `device_id` label). Mismatch or absent ⇒ the WHOLE document is rejected (§8/SEC-11)
   "sig": "ed25519:...",                   // REQUIRED; detached sig over RFC 8785 JCS canonical form of this object with `sig` removed; pinned key (§8)
   "content": {
     "url": "https://app.example.com/kiosk?device={device_id}",  // default = [bootstrap] url if omitted (cfg-05)
@@ -743,13 +753,40 @@ baseline is **not** a secure kiosk (§1 goal wording; RT-11/RT-12/RT-15).
   canonicalization** of the config object with the `sig` field removed) and verified
   on-device with a **pinned public key baked into the signed binary** (a key NOT
   co-located with the read credential). Every remotely-fetched config MUST carry `sig` +
-  `revision`; validation order is signature → anti-rollback → schema (§5.2), and
-  unsigned / invalid-signature / stale configs are rejected (keep last-good). `revision`
-  is a monotonically increasing integer inside the signed payload; the device persists
-  the last-applied revision and rejects any config with `revision ≤ last-applied`
-  (anti-rollback/replay). Locally-sourced config is exempt (the `[bootstrap]` url has no
-  remote body; `config-lastgood.json` was verified when first applied). This gates
-  `inject_js` (SEC-01) and `config_url` repointing (SEC-08). **Ships in P1.**
+  `device_id` + `revision`; validation order is signature → **device binding** →
+  anti-rollback → schema (§5.2), and unsigned / invalid-signature / wrong-device / stale
+  configs are rejected (keep last-good). `revision` is a monotonically increasing integer
+  inside the signed payload; the device persists the last-applied revision and rejects any
+  config with `revision ≤ last-applied` (anti-rollback/replay). Locally-sourced config is
+  exempt from signature/binding/rollback (the `[bootstrap]` url has no remote body);
+  `config-lastgood.json` is **not** — it re-clears signature + device binding at every boot.
+  This gates `inject_js` (SEC-01) and `config_url` repointing (SEC-08). **Ships in P1.**
+- **Device binding (SEC-11).** A signature proves a document is *genuine*; it does not
+  prove it was authored for *this* device. Every fetched config therefore carries
+  `device_id` **inside the signed payload**, and the device rejects the whole document
+  unless it equals its own effective device_id. Without this, a signature is a fleet-wide
+  bearer token: the read credential can enumerate **every** device's config object
+  (SEC-04), so anyone who can influence which object a device fetches — a repointed
+  `config_url` (SEC-08), a MITM, a stale/replayed object, a redirect — can serve kiosk A
+  the genuinely-signed, **higher-revision** config of kiosk B. It would pass signature
+  verification (it *is* validly signed), pass anti-rollback (B's revision is higher), pass
+  schema validation, and be **adopted** — handing kiosk A kiosk B's `content.url` and
+  `inject_js` (arbitrary code execution, SEC-01) with **no forgery and bucket READ alone**.
+  Binding is **required from day one** (fail closed — nothing is deployed, so there is no
+  fleet to migrate), and is enforced on the fetch path *and* on the boot/last-good path
+  (otherwise the hole simply moves to the store: plant another device's genuinely-signed
+  config in the data dir). A device-binding failure is reported as its own `config.error`
+  reason, distinct from a signature or rollback failure.
+- **Residual, known-open: the anti-rollback floor is disk-derived (SEC-11/SEC-09).** The
+  floor is seeded from `config-lastgood.json`. A running process holds it in memory (so
+  deleting/truncating the store cannot collapse the floor of a *running* kiosk), but an
+  attacker with **write access to the data dir** can truncate or delete that file and force
+  a reboot: the floor is then re-seeded as 0 and an **older, correctly-bound, correctly
+  signed** config can be replayed. This is inherent to a disk-only floor — no software
+  layer above the disk can fix it — and it is **not addressed by this design**; it is
+  recorded here rather than left implicit. Mitigation is OS-layer: a restrictive ACL on the
+  data dir plus the boot/physical prerequisites of §7.2/SEC-09/SEC-08. A monotonic
+  hardware/TPM counter would close it and is out of scope for v1.
 - **Remote code execution surface (SEC-01).** Because `content.inject_js`/`inject_css`
   execute in the page's own JavaScript world on the trusted content origin (Tauri
   `initialization_script`), bucket write is *arbitrary code execution* on every kiosk,
@@ -764,8 +801,13 @@ baseline is **not** a secure kiosk (§1 goal wording; RT-11/RT-12/RT-15).
   FBE), a BIOS/UEFI supervisor password, Secure Boot, and disabled USB and network (PXE)
   boot. Without these, an attacker reads `kiosk-credential.json` and rewrites `kiosk.ini`
   `config_url` to an attacker server — single-device takeover with no bucket access.
-  Signed config + the Secure-Boot-protected pinned key make a repointed `config_url`
-  yield configs that fail verification and fall back to last-good.
+  Signed config + the Secure-Boot-protected pinned key make a repointed `config_url` yield
+  **forged** configs that fail verification and fall back to last-good. That alone does
+  **not** defeat *replay of another device's genuinely-signed config*: with bucket read
+  (SEC-04) — or any stale/redirected object — a repointed `config_url` can serve a config
+  that is validly signed, merely authored for a different kiosk, and it would verify. What
+  closes that is **device binding** (SEC-11): the signed payload names the device it is for,
+  and a mismatch rejects the whole document.
 - **Remote origins** get no Tauri IPC and no navigation-sentinel bridge: idle reset and
   exit gesture are native (§3.5), so page content cannot trigger native actions;
   `kiosk://` navigations from a remote origin are logged and blocked.
@@ -790,7 +832,7 @@ baseline is **not** a secure kiosk (§1 goal wording; RT-11/RT-12/RT-15).
 | Phase | Deliverable | Contents |
 |---|---|---|
 | **P0** | skeleton | workspace, Tauri app boots fullscreen with hardcoded URL on Windows, CI builds Windows (release) + Linux (compile check). **P0 gate (PF-01):** demonstrate that `AcceleratorKeyPressed` and/or `WH_KEYBOARD_LL` actually swallow Alt+Tab / Alt+F4 / Ctrl+W inside a focused fullscreen Tauri/WebView2 window (Tauri #13919); also confirm native pointer/touch tap-capture works over the focused webview (exit-gesture dependency, §3.5); if neither holds, Assigned Access / Shell Launcher becomes a P1 requirement |
-| **P1** | Windows MVP — deployable | kiosk.ini, hardening set (§7) incl. injection engine + printing/permissions/autofill/pinch/script-dialog controls, **exit gesture + native PIN pad (emits exit code 86)**, offline video + connectivity FSM + decode-failure fallback, remote config cycle (whole-doc validation, bounds, versioning, self-check), **signed config + anti-rollback**, GCL client + trusted time + insertId + tiered spool + rate-limits, launcher watchdog + heartbeat (process liveness) + READY arming + safe mode + escalation, **renderer hang + crash recovery (`CoreWebView2.ProcessFailed`: `RenderProcessUnresponsive`→reload, `RenderProcessExited`→recreate)**, **nightly reload**, WiX MSI (**Authenticode-signed**, credential ACL) with WebView2 bootstrap, **touch text entry validated on touch hardware**, splash/error/pinpad pages, §7.2 Windows OS-lockdown docs |
+| **P1** | Windows MVP — deployable | kiosk.ini, hardening set (§7) incl. injection engine + printing/permissions/autofill/pinch/script-dialog controls, **exit gesture + native PIN pad (emits exit code 86)**, offline video + connectivity FSM + decode-failure fallback, remote config cycle (whole-doc validation, bounds, versioning, self-check), **signed config + device binding + anti-rollback**, GCL client + trusted time + insertId + tiered spool + rate-limits, launcher watchdog + heartbeat (process liveness) + READY arming + safe mode + escalation, **renderer hang + crash recovery (`CoreWebView2.ProcessFailed`: `RenderProcessUnresponsive`→reload, `RenderProcessExited`→recreate)**, **nightly reload**, WiX MSI (**Authenticode-signed**, credential ACL) with WebView2 bootstrap, **touch text entry validated on touch hardware**, splash/error/pinpad pages, §7.2 Windows OS-lockdown docs |
 | **P2** | Linux + robustness | WebKitGTK parity (incl. pinch-gesture intercept, keep-awake at compositor), .deb + systemd + cage docs + §7.2 Linux hardening, idle reset (native), **memory cap restart + health-sampled RSS**, cross-platform webview-hang detection (JS ping), config-driven `inject_css`/`inject_js` knobs (behind signed config), remote log level, restart_app |
 | **P3** | Android | Tauri android target, Kotlin plugin (Lock Task/device-owner fail-closed, foreground service + `foregroundServiceType`, boot receiver, keep-screen-on, `setMediaPlaybackRequiresUserGesture`, ActionMode override, `with_webview` JNI settings), in-process watchdog + in-app crash-loop/safe-mode, APK + device-owner provisioning docs. **Early P3 spike:** confirm `with_webview` JNI can mutate WebSettings / attach listeners |
 | **P4** | fleet niceties | auto-update — **Windows/Linux only** (launcher performs staged, signed binary swap; Android updates via MDM/Play per §1 non-goal), one-shot remote commands (reload/clear-cache/screenshot, executed-ID dedup), automated staged/canary config rollout, URL playlist rotation, display on/off schedule, Cloud Monitoring dashboard + log-based-metrics docs |
@@ -856,6 +898,8 @@ lockdown**). Android 8.0 (API 26)+; **unattended/secure = device-owner provision
 | Clock skew breaks GCL JWT | trusted-time offset from gstatic/OAuth HTTP `Date` clamps JWT `iat`/`exp` so tokens mint without NTP; `clock.skew` WARNING; spool+retry backstop; NTP still documented |
 | Spooled telemetry silently discarded (skew / long outage past retention) | timestamp rewrite/clamp at drain; `spool.dropped_expired` surfaced; insertId prevents retry duplicates |
 | Unsigned config = fleet takeover by any bucket-write principal | signed config (Ed25519) + pinned key + monotonic revision anti-rollback, shipped P1 |
+| Replay of another device's *genuinely-signed* config (bucket READ + repointed `config_url`/MITM/stale object is enough — no forgery) | **device binding**: `device_id` inside the signed payload must equal the device's effective device_id; checked right after the signature, on the fetch AND boot/last-good paths (SEC-11) |
+| Rollback floor reset by truncating `config-lastgood.json` + forcing a reboot ⇒ replay of an older correctly-signed, correctly-bound config | **known-open, accepted for v1** (a disk-only floor cannot defend itself). OS-layer mitigation: restrictive data-dir ACL (§7.2/SEC-09) + boot prerequisites (SEC-08); a TPM monotonic counter would close it |
 | `inject_js`/`inject_css` = RCE on every device | rejected unless config signed; egress bounded by subresource allowlist + CSP |
 | Single stolen device exposes the fleet (shared SA key + bucket-wide read + PIN hash) | keystore at-rest storage; per-object IAM condition; per-device credentials/token-proxy; PIN hash off shared-readable config |
 | Physical boot / disk pull bypasses OS ACLs | FDE + UEFI password + Secure Boot + USB/PXE-boot disabled as hard prerequisites; signed config + pinned key resist `config_url` repointing |
