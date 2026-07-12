@@ -2,3 +2,4 @@
 
 pub mod bootstrap;
 pub mod schema;
+pub mod validate;

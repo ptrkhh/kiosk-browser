@@ -87,6 +87,8 @@ pub struct Permissions {
     pub notifications: bool,
     #[serde(default)]
     pub clipboard_read: bool,
+    #[serde(flatten)]
+    pub unknown: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -159,6 +161,8 @@ pub struct ExitGesture {
     #[serde(default)]
     pub alphanumeric: bool,
     pub pin_hash: String,
+    #[serde(flatten)]
+    pub unknown: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
