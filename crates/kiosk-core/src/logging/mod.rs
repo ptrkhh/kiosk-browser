@@ -1,6 +1,7 @@
 //! Telemetry — Google Cloud Logging (spec §6).
 
 pub mod auth;
+pub mod client;
 pub mod entry;
 pub mod event;
 pub mod ratelimit;
