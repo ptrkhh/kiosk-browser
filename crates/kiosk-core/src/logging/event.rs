@@ -169,9 +169,13 @@ mod tests {
     }
 
     #[test]
-    fn taxonomy_covers_every_event_variant() {
-        // Guards against adding an Event variant without adding it to the spec
-        // table above. Update BOTH when the spec's §6 table changes.
+    fn taxonomy_table_still_covers_all_23_spec_events() {
+        // Adding an Event variant is already caught by the compiler: name() and
+        // severity() match exhaustively with no catch-all arm, so a new variant
+        // fails to compile (E0004). This test covers the other direction — a row
+        // silently deleted from TAXONOMY would shrink the loop above's coverage
+        // without any compile error, so the table's size is pinned to the spec's
+        // 23 rows. Update it only when the spec's §6 table changes.
         assert_eq!(TAXONOMY.len(), 23, "spec §6 defines 23 events");
     }
 
