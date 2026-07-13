@@ -2,4 +2,5 @@
 
 pub mod entry;
 pub mod event;
+pub mod spool;
 pub mod time;
