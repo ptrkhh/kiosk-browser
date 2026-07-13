@@ -557,6 +557,16 @@ impl Spool {
         self.low.commit(&acked)
     }
 
+    /// The spool's own root directory (`<dir>/spool`). Callers that must persist
+    /// state whose lifetime is tied to the spool's — the `Logger`'s per-entry
+    /// retry budget and its quarantine counters — put it here, so it survives the
+    /// same SIGKILL the spool is built to survive (TEL-10).
+    pub fn dir(&self) -> &Path {
+        self.seq_path
+            .parent()
+            .expect("the seq file always lives inside the spool root")
+    }
+
     /// Entries lost to drop-oldest. Surfaced in the next `health.sample` so
     /// loss is visible, never silent (rule 6).
     pub fn dropped_expired(&self) -> u64 {

@@ -9,7 +9,10 @@ pub mod spool;
 pub mod time;
 pub mod transport;
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
@@ -39,6 +42,10 @@ pub const MAX_REJECT_ATTEMPTS: u32 = 3;
 /// Bounded evidence kept about quarantined entries, for the operator.
 const MAX_REMEMBERED_QUARANTINES: usize = 32;
 
+/// The Logger's durable side-state, inside the spool root.
+const REJECT_STATE_FILE: &str = "reject.json";
+const REJECT_STATE_TMP: &str = "reject.json.tmp";
+
 #[derive(Debug, thiserror::Error)]
 pub enum LoggerError {
     #[error("spool failure: {0}")]
@@ -61,11 +68,62 @@ fn status_is_permanent(status: u16) -> bool {
 }
 
 /// A single quarantined entry: what we dropped, and why.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Quarantined {
     pub insert_id: String,
     pub status: u16,
     pub attempts: u32,
+}
+
+/// The Logger's durable side-state, next to the spool's own (`spool/reject.json`).
+///
+/// It is persisted for the same reason T4 persists `dropped_expired`: **the
+/// device whose telemetry matters most is the one the watchdog is killing every
+/// few seconds**, and an in-memory retry budget resets on every boot. A poison
+/// entry would then never reach `MAX_REJECT_ATTEMPTS` (that takes ~3 flushes),
+/// would be re-sent from the spool on every boot, and would wedge the drain
+/// FOREVER — the exact failure this design exists to prevent, reached through the
+/// back door of a restart loop. The loss counters are persisted for the mirror
+/// reason: a quarantine followed by a kill before the next `health.sample` would
+/// otherwise erase its own evidence.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct RejectState {
+    /// insert_id -> how many times a PERMANENT per-entry rejection named it.
+    #[serde(default)]
+    attempts: BTreeMap<String, u32>,
+    #[serde(default)]
+    dropped_rejected: u64,
+    #[serde(default)]
+    quarantined: Vec<Quarantined>,
+}
+
+impl RejectState {
+    fn load(dir: &Path) -> RejectState {
+        fs::read_to_string(dir.join(REJECT_STATE_FILE))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    /// Write-then-rename, fsynced — the same durability recipe as the spool's
+    /// `seq`. A failure is swallowed: it degrades this to the old in-memory
+    /// behavior, and it must never propagate into `log()`.
+    fn persist(&self, dir: &Path) {
+        let Ok(text) = serde_json::to_string(self) else {
+            return;
+        };
+        let tmp = dir.join(REJECT_STATE_TMP);
+        let write = File::create(&tmp).and_then(|mut f| {
+            f.write_all(text.as_bytes())?;
+            f.sync_all()
+        });
+        if write.is_err() {
+            return;
+        }
+        let _ = fs::rename(&tmp, dir.join(REJECT_STATE_FILE));
+        // Make the rename itself durable, not just the file's contents.
+        let _ = File::open(dir).map(|f| f.sync_all());
+    }
 }
 
 /// The telemetry facade: rate-limit → stamp → spool → batch → drain (spec §6).
@@ -86,7 +144,7 @@ pub struct Logger {
     limiter: RateLimiter,
     clock: TrustedClock,
 
-    /// Entries appended since the last flush attempt — the 100-entry trigger.
+    /// Entries known to be awaiting delivery — see [`Logger::pending`].
     pending: usize,
     last_flush: Instant,
 
@@ -94,33 +152,33 @@ pub struct Logger {
     backoff: Duration,
     retry_after: Option<Instant>,
 
-    /// insert_id -> how many times a PERMANENT per-entry rejection named it.
-    reject_attempts: HashMap<String, u32>,
-    quarantined: Vec<Quarantined>,
-    dropped_rejected: u64,
+    /// Durable: survives the SIGKILL that a crash loop delivers. See [`RejectState`].
+    state: RejectState,
 }
 
 impl Logger {
     pub fn new(
         ctx: EntryContext,
-        spool: Spool,
+        mut spool: Spool,
         client: GclClient,
         limiter: RateLimiter,
         clock: TrustedClock,
     ) -> Logger {
+        let state = RejectState::load(spool.dir());
+        // Whatever a previous process left spooled is still awaiting delivery, so
+        // the entry trigger must see it. Cheap: it is bounded by MAX_BATCH.
+        let pending = spool.drain_batch(MAX_BATCH).map(|b| b.len()).unwrap_or(0);
         Logger {
             ctx,
             spool,
             client,
             limiter,
             clock,
-            pending: 0,
+            pending,
             last_flush: Instant::now(),
             backoff: BACKOFF_MIN,
             retry_after: None,
-            reject_attempts: HashMap::new(),
-            quarantined: Vec::new(),
-            dropped_rejected: 0,
+            state,
         }
     }
 
@@ -198,10 +256,30 @@ impl Logger {
     ///   for local loss (`spool.dropped_expired`, "surfaced in the next
     ///   `health.sample` — loss is visible, not silent"); P1-D reports both
     ///   counters from the same place.
+    /// * **An UNATTRIBUTABLE permanent failure commits nothing.** If
+    ///   `failed_indices` is empty, or names only indices outside the batch, we
+    ///   have been told the batch failed but not *which* entries — and "not named
+    ///   ⇒ accepted" would then quietly commit the ENTIRE batch off the spool for
+    ///   entries Cloud Logging never stored. (Reachable, not theoretical: T7's
+    ///   parser yields `Some(vec![])` for a `logEntryErrors: {}` body or for keys
+    ///   that are not integers.) Silent loss of a whole batch is strictly worse
+    ///   than a wedge, which is at least visible as a quiet device — so the whole
+    ///   batch is kept, nothing is charged, and we back off.
+    /// * The retry budget and the loss counters are **persisted** — see
+    ///   [`RejectState`]; a crash loop must not reset them.
     pub fn flush(&mut self) -> Result<(), LoggerError> {
-        let batch = self.spool.drain_batch(MAX_BATCH)?;
+        let batch = match self.spool.drain_batch(MAX_BATCH) {
+            Ok(b) => b,
+            Err(e) => {
+                // A broken spool is a failure like any other: back off rather
+                // than re-entering on every tick.
+                self.last_flush = Instant::now();
+                self.fail();
+                return Err(e.into());
+            }
+        };
         self.last_flush = Instant::now();
-        self.pending = 0;
+        self.pending = self.pending.saturating_sub(batch.len());
         if batch.is_empty() {
             self.succeed();
             return Ok(());
@@ -210,8 +288,12 @@ impl Logger {
         match self.client.write(&batch) {
             Ok(()) => {
                 self.spool.commit_drained(&batch)?;
+                let mut changed = false;
                 for e in &batch {
-                    self.reject_attempts.remove(&e.insert_id);
+                    changed |= self.state.attempts.remove(&e.insert_id).is_some();
+                }
+                if changed {
+                    self.state.persist(self.spool.dir());
                 }
                 self.succeed();
                 Ok(())
@@ -221,7 +303,11 @@ impl Logger {
                 failed_indices,
                 body,
             }) => {
-                if status_is_permanent(status) {
+                // Nothing was delivered, so these entries are still awaiting it.
+                self.pending += batch.len();
+                let attributable =
+                    status_is_permanent(status) && failed_indices.iter().any(|i| *i < batch.len());
+                if attributable {
                     self.triage_rejections(&batch, &failed_indices, status)?;
                 }
                 self.fail();
@@ -234,6 +320,7 @@ impl Logger {
             Err(e) => {
                 // Nothing is committed: the entries stay spooled with the same
                 // insertIds and are retried after the backoff.
+                self.pending += batch.len();
                 self.fail();
                 Err(e.into())
             }
@@ -241,6 +328,11 @@ impl Logger {
     }
 
     /// The permanent-rejection half of `flush`'s triage. See its docs.
+    ///
+    /// The caller has already established that at least one `failed_indices`
+    /// entry is IN RANGE, so "not named ⇒ accepted" is a sound inference here and
+    /// nowhere else. Out-of-range indices are ignored (they name no entry we can
+    /// charge), never wrapped or clamped onto an innocent entry.
     fn triage_rejections(
         &mut self,
         batch: &[LogEntry],
@@ -256,20 +348,21 @@ impl Logger {
                 // is required: leaving it behind would retry it forever
                 // alongside the poison entry.
                 accepted.push(entry.clone());
-                self.reject_attempts.remove(&entry.insert_id);
+                self.state.attempts.remove(&entry.insert_id);
                 continue;
             }
             let attempts = self
-                .reject_attempts
+                .state
+                .attempts
                 .entry(entry.insert_id.clone())
                 .or_insert(0);
             *attempts += 1;
             if *attempts >= MAX_REJECT_ATTEMPTS {
                 let attempts = *attempts;
-                self.reject_attempts.remove(&entry.insert_id);
-                self.dropped_rejected += 1;
-                if self.quarantined.len() < MAX_REMEMBERED_QUARANTINES {
-                    self.quarantined.push(Quarantined {
+                self.state.attempts.remove(&entry.insert_id);
+                self.state.dropped_rejected += 1;
+                if self.state.quarantined.len() < MAX_REMEMBERED_QUARANTINES {
+                    self.state.quarantined.push(Quarantined {
                         insert_id: entry.insert_id.clone(),
                         status,
                         attempts,
@@ -279,10 +372,15 @@ impl Logger {
             }
         }
 
+        // The budget and the counters must be durable BEFORE the entries leave
+        // the spool: a kill in between must not lose the evidence of the drop.
+        self.state.persist(self.spool.dir());
+
         // One commit call: `commit_drained` matches on insertId, so committing
         // the accepted and the quarantined together is exactly "remove these".
         accepted.extend(quarantine);
         if !accepted.is_empty() {
+            self.pending = self.pending.saturating_sub(accepted.len());
             self.spool.commit_drained(&accepted)?;
         }
         Ok(())
@@ -332,13 +430,15 @@ impl Logger {
     /// Entries Cloud Logging permanently refused and we therefore dropped, so the
     /// rest of the telemetry could flow. Loss is visible, never silent: P1-D
     /// surfaces this in `health.sample` next to `spool.dropped_expired`.
+    /// Durable across a restart: a quarantine followed by a watchdog kill before
+    /// the next `health.sample` must not erase its own evidence.
     pub fn dropped_rejected(&self) -> u64 {
-        self.dropped_rejected
+        self.state.dropped_rejected
     }
 
-    /// A bounded record of which entries were quarantined and why.
+    /// A bounded record of which entries were quarantined and why. Also durable.
     pub fn quarantined(&self) -> &[Quarantined] {
-        &self.quarantined
+        &self.state.quarantined
     }
 
     /// Entries lost to the spool's drop-oldest budget (TEL-07).
@@ -346,7 +446,15 @@ impl Logger {
         self.spool.dropped_expired()
     }
 
-    /// Entries appended since the last flush attempt.
+    /// **Entries awaiting delivery** — not "entries appended since the last
+    /// flush". It counts everything logged (including whatever a previous process
+    /// left spooled) and is reduced only by what a flush actually got *committed*;
+    /// a failed flush puts its batch straight back. So after a flush that drained
+    /// 100 of a 250-entry backlog it reads 150, the 100-entry trigger stays armed,
+    /// and the backlog drains at one batch per tick instead of one per 10 s.
+    ///
+    /// It is a lower bound in one edge case: a `drain_batch` that itself failed
+    /// leaves the count untouched. It is never an over-count of undelivered work.
     pub fn pending(&self) -> usize {
         self.pending
     }
@@ -888,6 +996,194 @@ mod tests {
         lg.flush().expect("the second attempt succeeds");
         assert_eq!(lg.dropped_rejected(), 0);
         assert_eq!(t.insert_ids(1), vec!["lobby-01-1".to_string()]);
+    }
+
+    /// The batch-loss hole. `partial_error_indices` (T7) builds its vec from the
+    /// `logEntryErrors` keys, so an empty `logEntryErrors: {}` — or keys that are
+    /// not integers — yields a `PartialFailure` with an EMPTY index set. The
+    /// "not named ⇒ Cloud Logging accepted it" inference then applies to the whole
+    /// batch and commits every entry off the spool, permanently, for entries that
+    /// were never stored. Silent loss of an entire batch, no counter touched.
+    ///
+    /// An unattributable failure means we know the batch failed but not which
+    /// entries. Nothing may be committed and nothing may be charged.
+    #[test]
+    fn an_unattributable_partial_failure_commits_nothing() {
+        let unattributable = [
+            // logEntryErrors: {} — the parser returns Some(vec![]).
+            serde_json::json!({"error":{"code":400,"status":"INVALID_ARGUMENT","details":[{
+                "@type":"type.googleapis.com/google.logging.v2.WriteLogEntriesPartialErrors",
+                "logEntryErrors": {}
+            }]}})
+            .to_string(),
+            // Indices that name no entry in a batch of 2.
+            partial_body(&[7, 9]),
+        ];
+
+        for body in unattributable {
+            let dir = tempfile::tempdir().unwrap();
+            let t = FakeTransport::new(vec![resp(400, &body)]);
+            let mut lg = logger_with(dir.path(), t.clone());
+
+            lg.log(Event::AppStart, Map::new());
+            lg.log(Event::NetOffline, Map::new());
+            for _ in 0..(MAX_REJECT_ATTEMPTS * 2) {
+                let _ = lg.flush();
+            }
+
+            assert_eq!(
+                uncommitted(dir.path()),
+                vec!["lobby-01-1".to_string(), "lobby-01-2".to_string()],
+                "a permanent failure that names no entry in the batch must commit \
+                 NOTHING — the entries were not stored, and committing them is \
+                 unrecoverable silent loss of the whole batch. Body: {body}"
+            );
+            assert_eq!(
+                lg.dropped_rejected(),
+                0,
+                "and nothing may be charged an attempt either"
+            );
+            assert!(lg.quarantined().is_empty());
+        }
+    }
+
+    /// An out-of-range index alongside a real one must not derail the triage: the
+    /// in-range entry is still charged, the bogus index is simply ignored.
+    #[test]
+    fn an_out_of_range_index_alongside_a_real_one_is_ignored_not_wrapped() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = FakeTransport::new(vec![resp(400, &partial_body(&[1, 42]))]);
+        let mut lg = logger_with(dir.path(), t.clone());
+
+        lg.log(Event::AppStart, Map::new()); // -1: accepted
+        lg.log(Event::NetOffline, Map::new()); // -2: rejected
+        let _ = lg.flush();
+
+        assert_eq!(
+            uncommitted(dir.path()),
+            vec!["lobby-01-2".to_string()],
+            "index 42 names nothing and must not be wrapped onto an innocent entry"
+        );
+    }
+
+    /// IMPORTANT-2. The device whose telemetry matters most is the one the
+    /// watchdog is killing every few seconds. An in-memory retry budget resets on
+    /// every boot, so the poison entry never reaches MAX_REJECT_ATTEMPTS (that
+    /// takes ~3 flushes), is re-sent from the spool on every boot, and wedges the
+    /// drain FOREVER — this design's own failure mode, through the back door of a
+    /// restart loop.
+    #[test]
+    fn the_retry_budget_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Boot 1: two permanent rejections. Not yet at the limit.
+        let t = FakeTransport::new(vec![resp(400, &partial_body(&[0]))]);
+        let mut lg = logger_with(dir.path(), t.clone());
+        lg.log(Event::AppStart, Map::new());
+        let _ = lg.flush();
+        let _ = lg.flush();
+        assert_eq!(lg.dropped_rejected(), 0, "2 of 3 attempts: not yet dropped");
+        drop(lg); // the watchdog's SIGKILL: no Drop hook does anything for us
+
+        // Boot 2: ONE more rejection must be enough. If the budget reset, the
+        // entry survives this flush and telemetry is wedged forever.
+        let t = FakeTransport::new(vec![resp(400, &partial_body(&[0])), ok(200)]);
+        let mut lg = logger_with(dir.path(), t.clone());
+        let _ = lg.flush();
+
+        assert_eq!(
+            lg.dropped_rejected(),
+            1,
+            "the retry budget must be DURABLE: a crash loop resets an in-memory \
+             counter on every boot, so the poison entry would never reach the \
+             limit and would wedge the drain forever"
+        );
+        assert!(
+            uncommitted(dir.path()).is_empty(),
+            "and the drain must be unwedged"
+        );
+    }
+
+    /// IMPORTANT-3. `dropped_rejected` is how the operator ever learns of the
+    /// loss (P1-D surfaces it in `health.sample`, as T4 does for
+    /// `spool.dropped_expired`). A quarantine followed by a kill before the next
+    /// sample must not erase its own evidence.
+    #[test]
+    fn the_loss_counters_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = FakeTransport::new(vec![resp(400, &partial_body(&[0]))]);
+        let mut lg = logger_with(dir.path(), t.clone());
+        lg.log(Event::AppStart, Map::new());
+        for _ in 0..MAX_REJECT_ATTEMPTS {
+            let _ = lg.flush();
+        }
+        assert_eq!(lg.dropped_rejected(), 1);
+        assert_eq!(lg.quarantined()[0].insert_id, "lobby-01-1");
+        drop(lg);
+
+        let t = FakeTransport::new(vec![ok(200)]);
+        let lg = logger_with(dir.path(), t);
+        assert_eq!(
+            lg.dropped_rejected(),
+            1,
+            "loss is reported, not swallowed — a counter the crash resets makes \
+             the loss silent exactly when it happened"
+        );
+        assert_eq!(lg.quarantined()[0].insert_id, "lobby-01-1");
+        assert_eq!(lg.quarantined()[0].status, 400);
+    }
+
+    /// IMPORTANT-4. `pending()` means "awaiting delivery". A flush that drained
+    /// 100 of a larger backlog must leave the rest counted, or the 100-entry
+    /// trigger disarms and the backlog crawls out at one batch per 10 s.
+    #[test]
+    fn pending_counts_undelivered_entries_not_appends_since_the_last_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = FakeTransport::new(vec![ok(200)]);
+        let mut lg = logger_with(dir.path(), t.clone());
+
+        for _ in 0..250 {
+            lg.log(Event::AppStart, Map::new());
+        }
+        assert_eq!(lg.pending(), 250);
+
+        lg.flush().unwrap();
+        assert_eq!(
+            lg.pending(),
+            150,
+            "a flush delivers at most MAX_BATCH; the remaining backlog is still \
+             awaiting delivery and the entry trigger must stay armed"
+        );
+        lg.tick(); // still >= 100 pending => flushes again immediately
+        assert_eq!(t.write_count(), 2);
+        assert_eq!(lg.pending(), 50);
+
+        // A failed flush puts its batch back: those entries are still undelivered.
+        let dir = tempfile::tempdir().unwrap();
+        let t = FakeTransport::new(vec![resp(500, "boom")]);
+        let mut lg = logger_with(dir.path(), t);
+        lg.log(Event::AppStart, Map::new());
+        let _ = lg.flush();
+        assert_eq!(lg.pending(), 1, "a failed flush delivered nothing");
+    }
+
+    /// A spool left behind by a killed process is still awaiting delivery, so the
+    /// new Logger must count it — otherwise a restart hides a full backlog from
+    /// the entry trigger.
+    #[test]
+    fn a_reopened_logger_counts_the_backlog_a_previous_process_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = FakeTransport::new(vec![resp(500, "boom")]);
+        let mut lg = logger_with(dir.path(), t);
+        for _ in 0..3 {
+            lg.log(Event::AppStart, Map::new());
+        }
+        let _ = lg.flush();
+        drop(lg);
+
+        let t = FakeTransport::new(vec![ok(200)]);
+        let lg = logger_with(dir.path(), t);
+        assert_eq!(lg.pending(), 3, "the orphaned spool is undelivered work");
     }
 
     #[test]
