@@ -62,6 +62,30 @@ impl SpoolConfig {
     }
 }
 
+/// `fsync` the directory itself, so a `rename` into it is durable and not just
+/// atomic. Without this, a power cut can leave the OLD `seq` (or no `seq`)
+/// visible even though the new file's contents were fsynced — and a counter
+/// that goes backwards reissues insertIds.
+///
+/// Errors are deliberately ignored: not every platform/filesystem supports
+/// opening a directory for fsync, and failing an append over it would be worse
+/// than the durability gap it closes. `std::fs` only — no per-OS crate (spec §4).
+fn fsync_dir(dir: &Path) {
+    let _ = File::open(dir).map(|f| f.sync_all());
+}
+
+/// The persisted, fsynced side-state of a ring. `dropped` lives here rather
+/// than in memory because the INFO flood that drops entries is very often the
+/// same event that ends in a watchdog kill — a counter that resets on restart
+/// would make exactly the loss it exists to report invisible (rule 6).
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct RingState {
+    /// segment name -> committed leading line count.
+    committed: BTreeMap<String, u64>,
+    #[serde(default)]
+    dropped: u64,
+}
+
 /// One severity tier: a directory of `NNNNN.jsonl` segments plus a persisted
 /// per-segment commit cursor (how many leading lines have been acknowledged).
 #[derive(Debug)]
@@ -103,7 +127,7 @@ impl Ring {
         let cursor_path = dir.join("cursor.json");
         // A corrupt cursor is not fatal: it only means already-sent entries are
         // re-sent, and the reused insertId makes that harmless.
-        let cursor: BTreeMap<String, u64> = fs::read_to_string(&cursor_path)
+        let state: RingState = fs::read_to_string(&cursor_path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
@@ -113,10 +137,37 @@ impl Ring {
             budget_bytes,
             segment_bytes,
             sizes,
-            cursor,
+            cursor: state.committed,
             active: None,
-            dropped: 0,
+            dropped: state.dropped,
         })
+    }
+
+    /// The highest `seq` embedded in any `insert_id` still on disk in this ring
+    /// (`{device_id}-{seq}`; the suffix after the LAST '-'). Used to self-heal a
+    /// lost counter. Every line is scanned, including committed ones — a
+    /// committed entry may already have reached Cloud Logging, so its seq is
+    /// just as unsafe to reuse.
+    fn max_seq_on_disk(&self) -> u64 {
+        let mut max = 0u64;
+        for name in self.sizes.keys() {
+            let Ok(f) = File::open(self.dir.join(name)) else {
+                continue;
+            };
+            for line in BufReader::new(f).lines().map_while(Result::ok) {
+                let Ok(e) = serde_json::from_str::<LogEntry>(&line) else {
+                    continue; // torn line
+                };
+                if let Some(seq) = e
+                    .insert_id
+                    .rsplit_once('-')
+                    .and_then(|(_, s)| s.parse::<u64>().ok())
+                {
+                    max = max.max(seq);
+                }
+            }
+        }
+        max
     }
 
     fn newest(&self) -> Option<String> {
@@ -200,9 +251,25 @@ impl Ring {
         Ok(())
     }
 
-    fn read_entries(&self) -> Result<Vec<LogEntry>, SpoolError> {
+    /// Read up to `limit` uncommitted entries, oldest segment first, and STOP.
+    ///
+    /// Without the early stop, every `drain_batch` re-parsed the entire ring —
+    /// O(spool x batches). Under exactly the flood the spool exists for, the
+    /// drainer would be re-parsing 40 MB to ship 100 entries while the ring
+    /// keeps evicting, so it can never catch up.
+    ///
+    /// Reading the oldest `limit` entries per ring is sufficient for a correct
+    /// global oldest-first merge: within a ring, file order IS append order, and
+    /// appends happen in wall-clock order, so no unread entry in this ring can
+    /// be older than the ones we read. (If the trusted clock steps backwards
+    /// mid-run, the selection can be locally imperfect — but nothing is lost:
+    /// every entry stays on disk until committed and is drained on a later pass.)
+    fn read_entries(&self, limit: usize) -> Result<Vec<LogEntry>, SpoolError> {
         let mut out = Vec::new();
         for name in self.sizes.keys() {
+            if out.len() >= limit {
+                break;
+            }
             let path = self.dir.join(name);
             let skip = self.cursor.get(name).copied().unwrap_or(0) as usize;
             let f = match File::open(&path) {
@@ -210,6 +277,9 @@ impl Ring {
                 Err(_) => continue,
             };
             for line in BufReader::new(f).lines().skip(skip) {
+                if out.len() >= limit {
+                    break;
+                }
                 let Ok(line) = line else { continue };
                 // A torn write from a power cut must not brick telemetry: an
                 // unparseable line is skipped, never fatal.
@@ -264,16 +334,22 @@ impl Ring {
         self.persist_cursor()
     }
 
+    /// Persist the commit cursor AND the drop counter together, then fsync the
+    /// directory so the rename itself survives a power cut.
     fn persist_cursor(&self) -> Result<(), SpoolError> {
         let path = self.dir.join("cursor.json");
         let tmp = self.dir.join("cursor.json.tmp");
-        let body = serde_json::to_string(&self.cursor)?;
+        let body = serde_json::to_string(&RingState {
+            committed: self.cursor.clone(),
+            dropped: self.dropped,
+        })?;
         {
             let mut f = File::create(&tmp).map_err(io(&tmp))?;
             f.write_all(body.as_bytes()).map_err(io(&tmp))?;
             f.sync_all().map_err(io(&tmp))?;
         }
         fs::rename(&tmp, &path).map_err(io(&path))?;
+        fsync_dir(&self.dir);
         Ok(())
     }
 }
@@ -300,20 +376,41 @@ impl Spool {
         fs::create_dir_all(&root).map_err(io(&root))?;
 
         let segment_bytes = cfg.segment_mb.max(1) * MB;
-        let high_budget = cfg.reserve_high_mb.max(1) * MB;
-        // Rule 1: the rings' budgets are independent, so a low-ring flood can
-        // never take space away from the high ring.
-        let low_budget = cfg.max_mb.saturating_sub(cfg.reserve_high_mb).max(1) * MB;
 
+        // Rule 1: the rings' budgets are independent, so a low-ring flood can
+        // never take space away from the high ring. But they must also SUM to
+        // no more than max_mb — `spool_reserve_high_mb` is only clamped in the
+        // config layer, so a nonsense reserve (>= max_mb) must be defended
+        // against here rather than trusted.
+        let max_mb = cfg.max_mb.max(2); // each ring needs at least 1 MB to function
+        let reserve_mb = cfg.reserve_high_mb.clamp(1, max_mb - 1);
+        let high_budget = reserve_mb * MB;
+        let low_budget = (max_mb - reserve_mb) * MB;
+
+        let high = Ring::open(root.join("high"), high_budget, segment_bytes)?;
+        let low = Ring::open(root.join("low"), low_budget, segment_bytes)?;
+
+        // TEL-03 self-heal. A missing/empty/torn `seq` must NEVER send the
+        // counter back to 0: `next_seq` would reissue insertIds that already
+        // exist in the spool — and may already have reached Cloud Logging,
+        // which would then dedup the NEW entries away. Silent data loss.
+        //
+        // So the counter is seeded from the max of what was persisted and the
+        // highest seq still visible in the spool's own entries. It can then
+        // never go backwards past an entry we can still see. Skipping seqs is
+        // explicitly harmless; reusing one is not.
         let seq_path = root.join("seq");
-        let seq: u64 = fs::read_to_string(&seq_path)
+        let persisted: u64 = fs::read_to_string(&seq_path)
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0);
+        let seq = persisted
+            .max(high.max_seq_on_disk())
+            .max(low.max_seq_on_disk());
 
         Ok(Spool {
-            high: Ring::open(root.join("high"), high_budget, segment_bytes)?,
-            low: Ring::open(root.join("low"), low_budget, segment_bytes)?,
+            high,
+            low,
             seq_path,
             seq,
         })
@@ -341,6 +438,13 @@ impl Spool {
             f.sync_all().map_err(io(&tmp))?;
         }
         fs::rename(&tmp, &self.seq_path).map_err(io(&self.seq_path))?;
+        // sync_all on the tmp file makes its CONTENTS durable, not the rename.
+        // Without a directory fsync a power cut can leave the pre-rename value
+        // (or no file at all) visible while an entry carrying the newer seq is
+        // durably on disk — and then the counter goes backwards.
+        if let Some(parent) = self.seq_path.parent() {
+            fsync_dir(parent);
+        }
         self.seq = next;
         Ok(next)
     }
@@ -349,8 +453,14 @@ impl Spool {
     /// A `None` timestamp sorts first — it predates trusted time, so it is
     /// older than anything carrying a clock.
     pub fn drain_batch(&mut self, max: usize) -> Result<Vec<LogEntry>, SpoolError> {
-        let mut all = self.high.read_entries()?;
-        all.extend(self.low.read_entries()?);
+        // Each ring yields at most `max` (its oldest); the merge of the two
+        // then yields the global oldest `max`. Neither ring is read in full.
+        let mut all = self.high.read_entries(max)?;
+        all.extend(self.low.read_entries(max)?);
+        // The insert_id tiebreak is LEXICOGRAPHIC, so "d1-10" < "d1-9". That is
+        // arbitrary-but-stable, NOT chronological — and that is fine: it only
+        // breaks ties between entries sharing a timestamp. Cloud Logging orders
+        // by timestamp; insertId is purely a dedup key, never an ordering key.
         all.sort_by(|a, b| (&a.timestamp, &a.insert_id).cmp(&(&b.timestamp, &b.insert_id)));
         all.truncate(max);
         Ok(all)
@@ -368,6 +478,16 @@ impl Spool {
     /// loss is visible, never silent (rule 6).
     pub fn dropped_expired(&self) -> u64 {
         self.high.dropped + self.low.dropped
+    }
+
+    /// The high ring's byte budget. `high_budget_bytes() + low_budget_bytes()`
+    /// is the spool's disk cap.
+    pub fn high_budget_bytes(&self) -> u64 {
+        self.high.budget_bytes
+    }
+
+    pub fn low_budget_bytes(&self) -> u64 {
+        self.low.budget_bytes
     }
 }
 
@@ -569,6 +689,166 @@ mod tests {
         let low = std::fs::read_to_string(dir.path().join("spool/low/00000.jsonl")).unwrap();
         assert!(high.contains("d1-2") && !high.contains("d1-1"));
         assert!(low.contains("d1-1") && !low.contains("d1-2"));
+    }
+
+    /// CRITICAL. A destroyed / truncated / unparseable `spool/seq` must NOT send
+    /// the counter back to 0, because `next_seq` would then re-issue insertIds
+    /// that already exist — in the spool AND possibly already in Cloud Logging,
+    /// which would dedup the NEW entries away. That is silent data loss.
+    #[test]
+    fn a_destroyed_seq_file_cannot_reissue_a_used_insert_id() {
+        for wreck in ["", "garbage", "\u{0}\u{0}\u{0}"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut s = Spool::open(dir.path(), cfg()).unwrap();
+            let mut used = Vec::new();
+            for _ in 0..5 {
+                let seq = s.next_seq().unwrap();
+                let e = entry(Event::AppStart, seq);
+                used.push(e.insert_id.clone());
+                s.append(&e).unwrap();
+            }
+            drop(s);
+
+            // A power cut leaves the counter empty/torn/absent.
+            std::fs::write(dir.path().join("spool").join("seq"), wreck).unwrap();
+
+            let mut s = Spool::open(dir.path(), cfg()).unwrap();
+            let seq = s.next_seq().unwrap();
+            let e = entry(Event::AppStart, seq);
+            assert!(
+                !used.contains(&e.insert_id),
+                "seq file wrecked with {wreck:?} reissued a used insertId: {} (already used: {used:?})",
+                e.insert_id
+            );
+        }
+    }
+
+    #[test]
+    fn a_deleted_seq_file_cannot_reissue_a_used_insert_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Spool::open(dir.path(), cfg()).unwrap();
+        let mut used = Vec::new();
+        for _ in 0..5 {
+            let seq = s.next_seq().unwrap();
+            let e = entry(Event::AppStart, seq);
+            used.push(e.insert_id.clone());
+            s.append(&e).unwrap();
+        }
+        drop(s);
+        std::fs::remove_file(dir.path().join("spool").join("seq")).unwrap();
+
+        let mut s = Spool::open(dir.path(), cfg()).unwrap();
+        // The spool self-heals from the entries it still holds.
+        let seq = s.next_seq().unwrap();
+        assert!(
+            seq > 5,
+            "seq must not go backwards past spooled entries: {seq}"
+        );
+        let e = entry(Event::AppStart, seq);
+        assert!(!used.contains(&e.insert_id), "reissued {}", e.insert_id);
+    }
+
+    /// Rule 6: an INFO flood is very often the same event that ends in a
+    /// watchdog kill, so a drop counter that resets on restart makes exactly
+    /// the loss it exists to report invisible.
+    #[test]
+    fn the_dropped_counter_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let tiny = SpoolConfig {
+            max_mb: 2,
+            reserve_high_mb: 1,
+            segment_mb: 1,
+        };
+        let mut s = Spool::open(dir.path(), tiny).unwrap();
+        for seq in 1..6_000u64 {
+            s.append(&entry(Event::AppStart, seq)).unwrap();
+        }
+        let dropped = s.dropped_expired();
+        assert!(dropped > 0, "the flood must have dropped entries");
+        drop(s);
+
+        let s = Spool::open(dir.path(), tiny).unwrap();
+        assert_eq!(
+            s.dropped_expired(),
+            dropped,
+            "the drop count must survive the restart that the flood probably caused"
+        );
+    }
+
+    /// The disk cap must hold even when an operator sets a reserve that is
+    /// larger than the whole spool. `Spool::open` defends itself.
+    #[test]
+    fn a_reserve_larger_than_the_max_still_respects_the_disk_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Spool::open(
+            dir.path(),
+            SpoolConfig {
+                max_mb: 2,
+                reserve_high_mb: 10, // nonsense: >= max_mb
+                segment_mb: 1,
+            },
+        )
+        .unwrap();
+        assert!(
+            s.high_budget_bytes() + s.low_budget_bytes() <= 2 * MB,
+            "high {} + low {} must not exceed max_mb",
+            s.high_budget_bytes(),
+            s.low_budget_bytes()
+        );
+        // And both rings must still be usable.
+        s.append(&entry(Event::WatchdogSafeMode, 1)).unwrap();
+        s.append(&entry(Event::AppStart, 2)).unwrap();
+        assert_eq!(s.drain_batch(10).unwrap().len(), 2);
+    }
+
+    /// The mirror of the flood test: a HIGH flood evicts the HIGH ring's own
+    /// oldest, and must not touch the low ring.
+    #[test]
+    fn a_high_severity_flood_evicts_its_own_ring_not_the_low_ring() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Spool::open(
+            dir.path(),
+            SpoolConfig {
+                max_mb: 2,
+                reserve_high_mb: 1,
+                segment_mb: 1,
+            },
+        )
+        .unwrap();
+
+        s.append(&entry(Event::AppStart, 1)).unwrap(); // INFO -> low ring
+
+        // Enough WARNINGs to overflow the 1 MB high ring. Kept modest because
+        // every one of these pays a real fsync — which is the point of the tier.
+        for seq in 2..3_000u64 {
+            s.append(&entry(Event::NavBlocked, seq)).unwrap(); // WARNING -> high ring
+        }
+
+        let drained = s.drain_batch(100_000).unwrap();
+        assert!(
+            drained.iter().any(|e| e.insert_id == "d1-1"),
+            "a HIGH flood must not evict the low ring's entry"
+        );
+        assert!(
+            s.dropped_expired() > 0,
+            "the high ring must have evicted its own oldest"
+        );
+        assert!(
+            !drained.iter().any(|e| e.insert_id == "d1-2"),
+            "the high ring's OLDEST entry is the one that goes"
+        );
+    }
+
+    #[test]
+    fn drain_batch_returns_the_oldest_max_entries_without_reading_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Spool::open(dir.path(), cfg()).unwrap();
+        for seq in 1..500u64 {
+            s.append(&entry(Event::AppStart, seq)).unwrap();
+        }
+        let batch = s.drain_batch(5).unwrap();
+        assert_eq!(batch.len(), 5);
+        assert_eq!(batch[0].insert_id, "d1-1", "still oldest-first");
     }
 
     #[test]
