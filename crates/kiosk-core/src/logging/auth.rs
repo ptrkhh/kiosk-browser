@@ -57,8 +57,9 @@ pub enum AuthError {
     TokenEndpoint { status: u16, body: String },
     #[error("token endpoint response was not the expected JSON: {0}")]
     MalformedTokenResponse(String),
-    /// A non-positive `expires_in`. See `mint` for why this is not clamped.
-    #[error("token endpoint returned a non-positive expires_in: {0}")]
+    /// An `expires_in` inside the refresh margin (so: unusable by construction).
+    /// See `mint` for why this is rejected rather than clamped.
+    #[error("token endpoint returned an unusable expires_in: {0}s (must exceed the {REFRESH_MARGIN_SECONDS}s refresh margin)")]
     InvalidExpiry(i64),
 }
 
@@ -270,23 +271,31 @@ impl TokenSource {
             });
         }
 
+        // Truncated for the same reason as the error body below: serde echoes the
+        // OFFENDING value verbatim, so a 200 with a mistyped field (say a 100 KB
+        // string where `expires_in` should be) would otherwise inflate an error
+        // string - and thence a log line - without bound.
         let parsed: TokenResponse = serde_json::from_str(&response.body)
-            .map_err(|e| AuthError::MalformedTokenResponse(e.to_string()))?;
+            .map_err(|e| AuthError::MalformedTokenResponse(truncate_for_error(&e.to_string())))?;
 
-        // NEVER trust the endpoint's `expires_in`; clamp it into the (0, 3600]
-        // Google actually issues.
+        // NEVER trust the endpoint's `expires_in`. The usable range is
+        // (REFRESH_MARGIN_SECONDS, JWT_LIFETIME_SECONDS].
         //
-        // A non-positive value is REJECTED rather than clamped. Clamping it up
-        // to 1 s would not help: 1 s is inside the 5-minute refresh margin, so
-        // every `token()` call would re-mint through the SUCCESS path - the
-        // unbounded, backoff-free mint storm the cache exists to prevent. An
-        // error is the safe shape: it is visible, and the caller's retry backoff
-        // rate-limits it.
+        // The LOWER bound is the refresh margin, not zero. The cache predicate
+        // is `now + REFRESH_MARGIN_SECONDS < expires_at`, so ANY lifetime inside
+        // the margin - 1 s, 60 s, 300 s, as much as a non-positive value - fails
+        // that predicate on the very next call and is re-minted every single
+        // time: an unbounded, backoff-free mint storm through the SUCCESS path,
+        // which is precisely what the cache exists to prevent. Such a token is
+        // unusable by construction, so we REJECT rather than clamp: an error is
+        // visible, is not cached, and is rate-limited by the caller's backoff.
+        // (Clamping a bad value UP into the margin would just re-create the
+        // storm quietly.)
         //
-        // An absurdly large value is the mirror image (cache a long-dead token
-        // and 401 forever), but it is safe to clamp DOWN: the worst case is that
-        // we re-mint an hour early.
-        if parsed.expires_in <= 0 {
+        // The UPPER bound is the mirror image (cache a long-dead token and 401
+        // forever), but it is safe to clamp DOWN: worst case we re-mint an hour
+        // early.
+        if parsed.expires_in <= REFRESH_MARGIN_SECONDS {
             return Err(AuthError::InvalidExpiry(parsed.expires_in));
         }
         let lifetime = parsed.expires_in.min(JWT_LIFETIME_SECONDS);
@@ -576,19 +585,43 @@ mod tests {
         );
     }
 
+    /// A full-life token, held until the clock advances to within the 5-minute
+    /// margin of its expiry, must be re-minted BEFORE it dies.
+    ///
+    /// This drives the refresh the way it actually happens in production - time
+    /// passes - rather than by having the server hand back a stub lifetime. (It
+    /// no longer *can*: a lifetime inside the margin is now rejected outright,
+    /// see `an_expires_in_inside_the_refresh_margin_is_rejected...`.)
     #[test]
     fn a_token_near_expiry_is_refreshed_proactively() {
-        // 120 s of life left: inside the 5-minute refresh margin.
         let t = FakeTransport::with(vec![
-            FakeTransport::ok_token("first-token", 120),
+            FakeTransport::ok_token("first-token", 3600),
             FakeTransport::ok_token("second-token", 3600),
         ]);
-        let mut ts = token_source(t.clone());
+        let clock = clock_at("Sun, 12 Jul 2026 08:30:00 GMT");
+        let mut ts = TokenSource::new(sa(), t.clone(), clock.clone());
+
         assert_eq!(ts.token().unwrap().expose(), "first-token");
+        assert_eq!(t.call_count(), 1);
+
+        // 09:00:00 - 30 min in, 30 min of life left: comfortably outside the
+        // margin, so the cache must still hold.
+        clock
+            .observe_http_date("Sun, 12 Jul 2026 09:00:00 GMT")
+            .unwrap();
+        assert_eq!(ts.token().unwrap().expose(), "first-token");
+        assert_eq!(t.call_count(), 1, "still outside the refresh margin");
+
+        // 09:26:00 - the token expires at 09:30:00, so only 4 min remain: inside
+        // the 5-minute margin. It must be refreshed proactively, while the old
+        // one is still technically valid.
+        clock
+            .observe_http_date("Sun, 12 Jul 2026 09:26:00 GMT")
+            .unwrap();
         assert_eq!(
             ts.token().unwrap().expose(),
             "second-token",
-            "a token inside the refresh margin must be re-minted"
+            "a token inside the refresh margin must be re-minted before it dies"
         );
         assert_eq!(t.call_count(), 2);
     }
@@ -695,12 +728,20 @@ mod tests {
         ));
     }
 
-    /// A non-positive `expires_in` would put `expires_at` in the past, so every
-    /// `token()` call would re-mint through the success path: an unbounded,
-    /// backoff-free mint storm. It must be an error instead.
+    /// An `expires_in` that lands INSIDE the refresh margin is unusable by
+    /// construction: the cache predicate is
+    /// `now + REFRESH_MARGIN_SECONDS < expires_at`, so such a token fails it on
+    /// the very next `token()` call and is re-minted every single time -
+    /// an unbounded, backoff-free mint storm through the SUCCESS path.
+    ///
+    /// The boundary is therefore the refresh margin, NOT zero. `expires_in: 1`
+    /// and `expires_in: 300` storm exactly as hard as `expires_in: 0` does; a
+    /// `<= 0` check only ever caught them by accident of adjacency. This test
+    /// pins the *property* (nothing inside the margin is ever cached), not the
+    /// old boundary.
     #[test]
-    fn a_non_positive_expires_in_is_rejected_not_turned_into_a_mint_storm() {
-        for bad in [-1i64, 0] {
+    fn an_expires_in_inside_the_refresh_margin_is_rejected_not_turned_into_a_mint_storm() {
+        for bad in [-1i64, 0, 1, 60, 299, REFRESH_MARGIN_SECONDS] {
             let t = FakeTransport::with(vec![FakeTransport::ok_token(SECRET_TOKEN, bad)]);
             let mut ts = token_source(t.clone());
             match ts.token() {
@@ -709,6 +750,22 @@ mod tests {
             }
             assert!(ts.cached.is_none(), "an unusable token must not be cached");
         }
+    }
+
+    /// The other side of the boundary: one second past the refresh margin is
+    /// usable, and must be cached rather than re-minted.
+    #[test]
+    fn an_expires_in_just_past_the_refresh_margin_is_accepted_and_cached() {
+        let good = REFRESH_MARGIN_SECONDS + 1;
+        let t = FakeTransport::with(vec![FakeTransport::ok_token(SECRET_TOKEN, good)]);
+        let mut ts = token_source(t.clone());
+        assert_eq!(ts.token().expect("usable").expose(), SECRET_TOKEN);
+        ts.token().expect("still usable");
+        assert_eq!(
+            t.call_count(),
+            1,
+            "a token past the margin must be cached, not re-minted"
+        );
     }
 
     /// The mirror image: an absurd `expires_in` must not cache a dead token
@@ -752,5 +809,27 @@ mod tests {
             rendered.len()
         );
         assert!(rendered.contains("truncated"));
+    }
+
+    /// The same unbounded-log-line vector through a different variant: a 200
+    /// whose `expires_in` is a huge string makes serde echo that value verbatim
+    /// into its error message.
+    #[test]
+    fn an_oversized_malformed_body_error_is_truncated() {
+        let huge = "B".repeat(100_000);
+        let t = FakeTransport::with(vec![Ok(HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: format!(r#"{{"access_token":"x","expires_in":"{huge}"}}"#),
+        })]);
+        let mut ts = token_source(t.clone());
+        let err = ts.token().expect_err("a string expires_in is malformed");
+        assert!(matches!(err, AuthError::MalformedTokenResponse(_)));
+        let rendered = err.to_string();
+        assert!(
+            rendered.len() < 1000,
+            "the serde error was not truncated: {} bytes",
+            rendered.len()
+        );
     }
 }
