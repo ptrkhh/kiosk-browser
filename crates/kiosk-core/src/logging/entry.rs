@@ -289,4 +289,63 @@ mod tests {
         assert_eq!(red, "<unparseable>");
         assert_eq!(hash.len(), 8);
     }
+
+    #[test]
+    fn userinfo_credentials_never_reach_the_log() {
+        let raw = "https://user:hunter2@app.example.com/p?x=1";
+
+        let (red, hash) = redact_url(raw, UrlDetail::Path);
+        assert_eq!(red, "https://app.example.com/p");
+        assert!(
+            !red.contains("hunter2"),
+            "password must never reach the log"
+        );
+        assert!(!red.contains("user:"), "username must never reach the log");
+        assert_eq!(hash.len(), 8);
+
+        let (red, hash) = redact_url(raw, UrlDetail::Host);
+        assert_eq!(red, "https://app.example.com");
+        assert!(
+            !red.contains("hunter2"),
+            "password must never reach the log"
+        );
+        assert!(!red.contains("user:"), "username must never reach the log");
+        assert_eq!(hash.len(), 8);
+    }
+
+    #[test]
+    fn an_opaque_scheme_url_is_not_logged_verbatim() {
+        // Opaque schemes have no host, so they take the host-less path.
+        let (red, hash) = redact_url("javascript:alert(document.cookie)", UrlDetail::Path);
+        assert_eq!(red, "<unparseable>");
+        assert!(!red.contains("cookie"));
+        assert_eq!(hash.len(), 8);
+
+        let (red, hash) = redact_url(
+            "data:text/html,<script>fetch('/x')</script>",
+            UrlDetail::Path,
+        );
+        assert_eq!(red, "<unparseable>");
+        assert!(!red.contains("script"));
+        assert_eq!(hash.len(), 8);
+    }
+
+    #[test]
+    fn a_file_url_does_not_leak_a_local_path() {
+        let (red, hash) = redact_url("file:///etc/shadow", UrlDetail::Path);
+        assert!(
+            !red.contains("shadow"),
+            "local paths must not reach the log"
+        );
+        assert_eq!(hash.len(), 8);
+    }
+
+    #[test]
+    fn an_unparseable_url_is_never_emitted_verbatim_even_at_full_detail() {
+        // The Err(_) branch wins over UrlDetail: a URL we could not parse may
+        // itself be hostile, so it is never echoed back at any detail level.
+        let (red, hash) = redact_url("::: %%% not a url", UrlDetail::Full);
+        assert_eq!(red, "<unparseable>");
+        assert_eq!(hash.len(), 8);
+    }
 }
