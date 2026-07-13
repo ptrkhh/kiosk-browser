@@ -84,6 +84,17 @@ struct RingState {
     committed: BTreeMap<String, u64>,
     #[serde(default)]
     dropped: u64,
+    /// A MIRROR of the reserved-seq high-water mark (TEL-03).
+    ///
+    /// Self-healing from the spool's own insertIds structurally cannot cover the
+    /// case where `spool/seq` is lost AND every entry has been committed away —
+    /// there is then nothing on disk to heal from, `next_seq` restarts at 1, and
+    /// it collides with insertIds Cloud Logging has ALREADY accepted, which then
+    /// dedups the new entries away. So the high-water mark is written to a second,
+    /// independent, already-fsynced file. Losing any ONE of the three sources
+    /// (seq file, either ring's state, the entries themselves) is now survivable.
+    #[serde(default)]
+    seq_high_water: u64,
 }
 
 /// One severity tier: a directory of `NNNNN.jsonl` segments plus a persisted
@@ -100,6 +111,15 @@ struct Ring {
     /// Cached handle to the newest segment, opened in append mode.
     active: Option<(String, File)>,
     dropped: u64,
+    /// Mirror of the spool's reserved-seq high-water mark. See `RingState`.
+    seq_high_water: u64,
+    /// Test-only instrumentation: how many segment files `read_entries` opened.
+    /// Per-`Ring` rather than a global, so tests running in parallel cannot
+    /// pollute each other's count. It exists so the bounded-drain test can
+    /// assert the BOUND it claims, instead of asserting something the old
+    /// unbounded implementation would also have satisfied.
+    #[cfg(test)]
+    segments_read: std::cell::Cell<usize>,
 }
 
 fn seg_name(n: u64) -> String {
@@ -113,6 +133,13 @@ fn seg_index(name: &str) -> Option<u64> {
 impl Ring {
     fn open(dir: PathBuf, budget_bytes: u64, segment_bytes: u64) -> Result<Ring, SpoolError> {
         fs::create_dir_all(&dir).map_err(io(&dir))?;
+
+        // A ring must have room for at least TWO segments inside its budget,
+        // otherwise `enforce_budget` (which never evicts the active segment)
+        // can never engage: a 2 MB ring with 5 MB segments grows one 5 MB
+        // segment and blows the disk cap by itself. Peak on-disk per ring is
+        // then bounded by its budget rather than `budget + segment_mb`.
+        let segment_bytes = segment_bytes.min(budget_bytes / 2).max(1);
 
         let mut sizes = BTreeMap::new();
         for e in fs::read_dir(&dir).map_err(io(&dir))? {
@@ -140,6 +167,9 @@ impl Ring {
             cursor: state.committed,
             active: None,
             dropped: state.dropped,
+            seq_high_water: state.seq_high_water,
+            #[cfg(test)]
+            segments_read: std::cell::Cell::new(0),
         })
     }
 
@@ -148,6 +178,14 @@ impl Ring {
     /// lost counter. Every line is scanned, including committed ones — a
     /// committed entry may already have reached Cloud Logging, so its seq is
     /// just as unsafe to reuse.
+    ///
+    /// This deliberately does NOT deserialize a typed `LogEntry`: it pulls the
+    /// `insert_id` field out of an untyped `Value`. A typed parse would couple
+    /// the self-heal to `LogEntry`'s schema, so the day `LogEntry` gains a
+    /// required field, every pre-upgrade line would fail to parse and this would
+    /// silently return 0 — quietly reopening the insertId collision hole on
+    /// exactly the upgrade boundary where nobody would think to look for it.
+    /// It is also much cheaper, which matters for an O(spool) boot scan.
     fn max_seq_on_disk(&self) -> u64 {
         let mut max = 0u64;
         for name in self.sizes.keys() {
@@ -155,14 +193,13 @@ impl Ring {
                 continue;
             };
             for line in BufReader::new(f).lines().map_while(Result::ok) {
-                let Ok(e) = serde_json::from_str::<LogEntry>(&line) else {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
                     continue; // torn line
                 };
-                if let Some(seq) = e
-                    .insert_id
-                    .rsplit_once('-')
-                    .and_then(|(_, s)| s.parse::<u64>().ok())
-                {
+                let Some(id) = v.get("insert_id").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if let Some(seq) = id.rsplit_once('-').and_then(|(_, s)| s.parse::<u64>().ok()) {
                     max = max.max(seq);
                 }
             }
@@ -270,6 +307,8 @@ impl Ring {
             if out.len() >= limit {
                 break;
             }
+            #[cfg(test)]
+            self.segments_read.set(self.segments_read.get() + 1);
             let path = self.dir.join(name);
             let skip = self.cursor.get(name).copied().unwrap_or(0) as usize;
             let f = match File::open(&path) {
@@ -342,6 +381,7 @@ impl Ring {
         let body = serde_json::to_string(&RingState {
             committed: self.cursor.clone(),
             dropped: self.dropped,
+            seq_high_water: self.seq_high_water,
         })?;
         {
             let mut f = File::create(&tmp).map_err(io(&tmp))?;
@@ -362,12 +402,22 @@ fn count_lines(path: &Path) -> Result<u64, SpoolError> {
     Ok(BufReader::new(f).lines().map_while(Result::ok).count() as u64)
 }
 
+/// How many seqs are reserved (and fsynced) at once. A crash forfeits the unused
+/// remainder of the block — and SKIPPING seqs is explicitly harmless, while
+/// REUSING one is silent data loss. So we trade a bounded, harmless gap for one
+/// fsync per 1000 seqs instead of one per seq.
+const SEQ_BLOCK: u64 = 1000;
+
 #[derive(Debug)]
 pub struct Spool {
     high: Ring,
     low: Ring,
     seq_path: PathBuf,
+    /// The last seq handed out.
     seq: u64,
+    /// The high-water mark already persisted. Seqs up to here can be handed out
+    /// from memory with no further I/O; past it we must reserve a new block.
+    reserved: u64,
 }
 
 impl Spool {
@@ -399,12 +449,22 @@ impl Spool {
         // highest seq still visible in the spool's own entries. It can then
         // never go backwards past an entry we can still see. Skipping seqs is
         // explicitly harmless; reusing one is not.
+        // Three INDEPENDENT sources, and we take the max of all of them:
+        //   1. `spool/seq`          — the reserved high-water mark;
+        //   2. each ring's state    — a mirror of the same mark (survives 1's loss);
+        //   3. the entries on disk  — survives loss of BOTH counters.
+        // Losing any one of these can no longer walk the counter backwards. Only
+        // losing all three at once can, and at that point the spool is gone.
+        // Note this resumes from the RESERVED mark, not the last-issued value, so
+        // a crash mid-block re-issues nothing.
         let seq_path = root.join("seq");
         let persisted: u64 = fs::read_to_string(&seq_path)
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0);
         let seq = persisted
+            .max(high.seq_high_water)
+            .max(low.seq_high_water)
             .max(high.max_seq_on_disk())
             .max(low.max_seq_on_disk());
 
@@ -413,6 +473,10 @@ impl Spool {
             low,
             seq_path,
             seq,
+            // Nothing beyond `seq` is known-reserved: force a fresh reservation
+            // on the first `next_seq`. A recovered value may have come from the
+            // on-disk scan, which says nothing about what was reserved.
+            reserved: seq,
         })
     }
 
@@ -430,11 +494,21 @@ impl Spool {
     /// collides insertIds and makes Cloud Logging silently dedup away a real
     /// entry.
     pub fn next_seq(&mut self) -> Result<u64, SpoolError> {
-        let next = self.seq + 1;
+        if self.seq >= self.reserved {
+            // Reserve a whole block BEFORE handing any of it out, so a crash can
+            // only ever skip seqs, never repeat them.
+            self.reserve(self.seq + SEQ_BLOCK)?;
+        }
+        self.seq += 1;
+        Ok(self.seq)
+    }
+
+    /// Persist a new reserved high-water mark to all three durable places.
+    fn reserve(&mut self, mark: u64) -> Result<(), SpoolError> {
         let tmp = self.seq_path.with_extension("tmp");
         {
             let mut f = File::create(&tmp).map_err(io(&tmp))?;
-            f.write_all(next.to_string().as_bytes()).map_err(io(&tmp))?;
+            f.write_all(mark.to_string().as_bytes()).map_err(io(&tmp))?;
             f.sync_all().map_err(io(&tmp))?;
         }
         fs::rename(&tmp, &self.seq_path).map_err(io(&self.seq_path))?;
@@ -445,8 +519,17 @@ impl Spool {
         if let Some(parent) = self.seq_path.parent() {
             fsync_dir(parent);
         }
-        self.seq = next;
-        Ok(next)
+
+        // Mirror it into both rings' (already fsynced) state files, so that
+        // losing `spool/seq` cannot walk the counter backwards even when the
+        // spool holds no entries to self-heal from.
+        self.high.seq_high_water = mark;
+        self.low.seq_high_water = mark;
+        self.high.persist_cursor()?;
+        self.low.persist_cursor()?;
+
+        self.reserved = mark;
+        Ok(())
     }
 
     /// Oldest-first across BOTH rings, ordered by `(timestamp, insert_id)`.
@@ -839,16 +922,161 @@ mod tests {
         );
     }
 
+    /// The bound is the point of this test, so it ASSERTS the bound. The
+    /// previous version checked only `len == 5` and `batch[0] == "d1-1"` —
+    /// both of which the old unbounded implementation also satisfied, so it
+    /// could never have caught a regression back to O(spool).
     #[test]
-    fn drain_batch_returns_the_oldest_max_entries_without_reading_everything() {
+    fn drain_batch_reads_only_the_segments_it_needs_to_fill_max() {
         let dir = tempfile::tempdir().unwrap();
-        let mut s = Spool::open(dir.path(), cfg()).unwrap();
-        for seq in 1..500u64 {
+        // 1 MB budget per ring => 512 KB segments, so ~5000 INFO entries span
+        // several segments in the low ring.
+        let mut s = Spool::open(
+            dir.path(),
+            SpoolConfig {
+                max_mb: 20,
+                reserve_high_mb: 10,
+                segment_mb: 1,
+            },
+        )
+        .unwrap();
+        for seq in 1..5_000u64 {
             s.append(&entry(Event::AppStart, seq)).unwrap();
         }
+        let segments = std::fs::read_dir(dir.path().join("spool").join("low"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".jsonl"))
+            .count();
+        assert!(segments > 1, "need a multi-segment ring to test the bound");
+
+        s.low.segments_read.set(0);
         let batch = s.drain_batch(5).unwrap();
+        let touched = s.low.segments_read.get();
+
         assert_eq!(batch.len(), 5);
         assert_eq!(batch[0].insert_id, "d1-1", "still oldest-first");
+        assert!(
+            touched < segments,
+            "a 5-entry drain must not read all {segments} segments (read {touched})"
+        );
+    }
+
+    /// The residual seq hole that self-healing structurally CANNOT close: the
+    /// seq file is destroyed AND every entry has been committed away, so there
+    /// is nothing on disk left to heal from. Without a second persisted copy of
+    /// the high-water mark, next_seq restarts at 1 and collides with insertIds
+    /// Cloud Logging has ALREADY accepted — which silently dedups the new ones.
+    #[test]
+    fn a_destroyed_seq_file_with_an_empty_spool_cannot_reissue_a_used_insert_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Spool::open(dir.path(), cfg()).unwrap();
+        let mut used = Vec::new();
+        for _ in 0..5 {
+            let seq = s.next_seq().unwrap();
+            let e = entry(Event::AppStart, seq);
+            used.push(e.insert_id.clone());
+            s.append(&e).unwrap();
+        }
+        drop(s);
+
+        // Everything is delivered and committed away. NOTE the reopen: commit
+        // will not delete the ACTIVE segment, so without this the committed
+        // lines would still be on disk and the on-disk scan could heal from
+        // them — which would make this test silently not test its own scenario.
+        let mut s = Spool::open(dir.path(), cfg()).unwrap();
+        let drained = s.drain_batch(100).unwrap();
+        assert_eq!(drained.len(), 5);
+        s.commit_drained(&drained).unwrap();
+        drop(s);
+
+        // The spool now holds NO entries to self-heal from.
+        for ring in ["high", "low"] {
+            let segs = std::fs::read_dir(dir.path().join("spool").join(ring))
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".jsonl"))
+                .count();
+            assert_eq!(segs, 0, "{ring} ring must hold no segments");
+        }
+
+        std::fs::write(dir.path().join("spool").join("seq"), "").unwrap();
+
+        let mut s = Spool::open(dir.path(), cfg()).unwrap();
+        let seq = s.next_seq().unwrap();
+        let e = entry(Event::AppStart, seq);
+        assert!(
+            !used.contains(&e.insert_id),
+            "reissued {} with an empty spool and no seq file (already used: {used:?})",
+            e.insert_id
+        );
+    }
+
+    /// A crash mid-block must forfeit the block's unused remainder, never replay
+    /// it. Skipping seqs is harmless; reusing one is not.
+    #[test]
+    fn a_crash_mid_block_never_reissues_a_handed_out_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut issued = Vec::new();
+        // Three "processes", none of which exhausts its reserved block.
+        for _ in 0..3 {
+            let mut s = Spool::open(dir.path(), cfg()).unwrap();
+            for _ in 0..3 {
+                issued.push(s.next_seq().unwrap());
+            }
+            // Simulated SIGKILL: no drop hook, no flush, block unexhausted.
+        }
+        let mut sorted = issued.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            issued.len(),
+            "a seq was reissued across restarts: {issued:?}"
+        );
+    }
+
+    /// `max_mb` must be an actual on-disk ceiling, not just the sum of the two
+    /// budgets: segments rotate at `segment_mb`, so an unclamped 5 MB segment in
+    /// a 1 MB ring would blow the cap on its own before eviction could engage.
+    #[test]
+    fn actual_bytes_on_disk_stay_within_max_mb() {
+        let dir = tempfile::tempdir().unwrap();
+        let max_mb = 4;
+        let mut s = Spool::open(
+            dir.path(),
+            SpoolConfig {
+                max_mb,
+                reserve_high_mb: 2,
+                segment_mb: 5, // absurdly large for these rings; must be clamped
+            },
+        )
+        .unwrap();
+
+        for seq in 1..12_000u64 {
+            // Alternate the rings so BOTH are pushed past their budgets.
+            let ev = if seq % 2 == 0 {
+                Event::AppStart
+            } else {
+                Event::NavBlocked
+            };
+            s.append(&entry(ev, seq)).unwrap();
+        }
+
+        let mut bytes = 0u64;
+        for ring in ["high", "low"] {
+            for e in std::fs::read_dir(dir.path().join("spool").join(ring)).unwrap() {
+                let e = e.unwrap();
+                if e.file_name().to_string_lossy().ends_with(".jsonl") {
+                    bytes += e.metadata().unwrap().len();
+                }
+            }
+        }
+        assert!(
+            bytes <= max_mb * MB,
+            "segment bytes on disk ({bytes}) exceeded max_mb ({})",
+            max_mb * MB
+        );
     }
 
     #[test]
