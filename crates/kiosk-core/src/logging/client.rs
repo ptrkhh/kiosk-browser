@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 
-use crate::logging::auth::{AuthError, TokenSource};
+use crate::logging::auth::{AuthError, Secret, TokenSource};
 use crate::logging::entry::LogEntry;
 use crate::logging::time::TrustedClock;
 use crate::logging::transport::{HttpResponse, Transport, TransportError};
@@ -84,6 +84,24 @@ fn truncate_for_error(body: &str) -> String {
         end -= 1;
     }
     format!("{}... [{} bytes truncated]", &body[..end], body.len() - end)
+}
+
+/// Prepares a response body for inclusion in an error string: strip the bearer
+/// token, THEN truncate.
+///
+/// The token strip is not theoretical. A misconfigured proxy, a captive portal,
+/// or a `logging.googleapis.com` that some middlebox has redirected can echo the
+/// request - headers and all - back in its error body. That body goes verbatim
+/// into a `ClientError`, and a `ClientError` gets logged. `Secret` protects the
+/// token everywhere it is *held*; this protects it where it comes *back to us*
+/// from the network, which no amount of `Debug` redaction on our own types can
+/// cover.
+///
+/// Scrub before truncating, so a token sitting across the truncation boundary is
+/// still removed rather than half-printed.
+fn sanitize_for_error(body: &str, token: &Secret) -> String {
+    let scrubbed = body.replace(token.expose(), "<redacted-bearer-token>");
+    truncate_for_error(&scrubbed)
 }
 
 /// Pulls the zero-based indices out of a `WriteLogEntriesPartialErrors` detail,
@@ -164,6 +182,21 @@ impl GclClient {
             };
 
             if (200..300).contains(&response.status) {
+                // Google documents that a partialSuccess rejection comes back as
+                // the status of one of the FAILED entries - i.e. a non-2xx - so
+                // this branch "should" be unreachable. We check anyway: `Ok(())`
+                // is the caller's licence to commit the batch off the spool, and
+                // committing an entry that was never written is UNRECOVERABLE.
+                // "Never a silent success" must be an invariant of our code, not
+                // an inference about someone else's server. The cost is parsing
+                // `{}` once per successful flush.
+                if let Some(failed_indices) = partial_error_indices(&response.body) {
+                    return Err(ClientError::PartialFailure {
+                        status: response.status,
+                        failed_indices,
+                        body: sanitize_for_error(&response.body, &token),
+                    });
+                }
                 return Ok(());
             }
 
@@ -178,7 +211,7 @@ impl GclClient {
                 return Err(ClientError::Unauthorized);
             }
 
-            let body = truncate_for_error(&response.body);
+            let body = sanitize_for_error(&response.body, &token);
             return Err(match partial_error_indices(&response.body) {
                 Some(failed_indices) => ClientError::PartialFailure {
                     status: response.status,
@@ -728,16 +761,109 @@ mod tests {
         assert_eq!(t.mint_count(), 0, "and must not even mint a token");
     }
 
+    /// A REFLECTING endpoint - a misconfigured proxy, a captive portal, a
+    /// middlebox that has hijacked `logging.googleapis.com` - echoes our request
+    /// back to us in its error body, headers and all. That body goes verbatim
+    /// into a `ClientError`, and a `ClientError` gets logged. So the bearer token
+    /// arrives back over the network inside data we are about to log.
+    ///
+    /// The canned body below therefore ACTUALLY CONTAINS the token. (It did not
+    /// before: the body was the string "upstream said: whatever", which never
+    /// held the token, so the test could only ever have failed if the client
+    /// concatenated the header into the error itself - it could not fail for the
+    /// threat its own name described. That gap was hiding a REAL leak: the body
+    /// was passed verbatim to `truncate_for_error`, so this test now fails
+    /// against the previous implementation. `sanitize_for_error` is the fix.)
+    ///
+    /// `Secret`'s redaction cannot help here: the token in the body is a plain
+    /// `String` that came from the network, not a `Secret` we hold.
     #[test]
-    fn the_bearer_token_never_appears_in_an_error() {
-        // A 500 whose body echoes the request (a misconfigured proxy) must not
-        // put the token into a logged error string.
-        let t = FakeTransport::new(vec![resp(500, "upstream said: whatever", None)]);
+    fn a_reflecting_endpoint_cannot_echo_the_bearer_token_into_an_error() {
+        for status in [500u16, 400, 429] {
+            let echoed = format!(
+                "your request was: POST /v2/entries:write\r\n\
+                 Authorization: Bearer {TOKEN_A}\r\n\
+                 Content-Type: application/json"
+            );
+            assert!(
+                echoed.contains(TOKEN_A),
+                "the fixture must really contain the token, or this test proves nothing"
+            );
+
+            let t = FakeTransport::new(vec![resp(status, &echoed, None)]);
+            let clock = established_clock();
+            let mut c = client(t, clock.clone());
+            let err = c.write(&[entry(1, &clock)]).expect_err("non-2xx");
+
+            let rendered = format!("{err} {err:?}");
+            assert!(
+                !rendered.contains(TOKEN_A),
+                "the bearer token came back from the endpoint and leaked into a \
+                 logged error ({status}): {rendered}"
+            );
+            assert!(
+                rendered.contains("<redacted-bearer-token>"),
+                "the token should be redacted in place, not merely absent by luck: {rendered}"
+            );
+        }
+    }
+
+    /// The last hole in "never a silent success".
+    ///
+    /// Google documents that a `partialSuccess` rejection comes back as the status
+    /// of one of the FAILED entries, so a 200-with-partial-errors should not
+    /// happen. But `Ok(())` is the caller's licence to `commit_drained` the batch
+    /// off the spool, and committing an entry that was never written is
+    /// unrecoverable. If that documented behavior is ever wrong, or ever changes,
+    /// a 2xx path that never looks at the body loses those entries silently.
+    ///
+    /// So the invariant must live in our code, not in Google's documentation.
+    #[test]
+    fn a_2xx_carrying_partial_errors_is_still_not_a_silent_success() {
+        let body = serde_json::json!({
+            "error": {
+                "code": 400,
+                "status": "INVALID_ARGUMENT",
+                "details": [{
+                    "@type": "type.googleapis.com/google.logging.v2.WriteLogEntriesPartialErrors",
+                    "logEntryErrors": { "2": {"code": 3, "message": "Log entry too large"} }
+                }]
+            }
+        })
+        .to_string();
+
+        let t = FakeTransport::new(vec![resp(200, &body, None)]);
         let clock = established_clock();
-        let mut c = client(t, clock.clone());
-        let err = c.write(&[entry(1, &clock)]).expect_err("500");
-        let rendered = format!("{err} {err:?}");
-        assert!(!rendered.contains(TOKEN_A), "the token leaked: {rendered}");
+        let mut c = client(t.clone(), clock.clone());
+
+        let batch = vec![entry(1, &clock), entry(2, &clock), entry(3, &clock)];
+        match c.write(&batch) {
+            Err(ClientError::PartialFailure {
+                status,
+                failed_indices,
+                ..
+            }) => {
+                assert_eq!(status, 200);
+                assert_eq!(failed_indices, vec![2]);
+            }
+            other => panic!(
+                "a 2xx whose body reports per-entry failures must NOT be reported as \
+                 success - the caller would commit the rejected entries off the spool \
+                 and they would be gone; got {other:?}"
+            ),
+        }
+    }
+
+    /// The other side of that check: an ordinary 200 (empty JSON body) is still a
+    /// plain success, and the partial-errors probe must not turn it into an error.
+    #[test]
+    fn an_ordinary_2xx_is_still_a_success() {
+        let t = FakeTransport::new(vec![resp(200, "{}", None)]);
+        let clock = established_clock();
+        let mut c = client(t.clone(), clock.clone());
+        c.write(&[entry(1, &clock)])
+            .expect("an empty 200 body is an unqualified success");
+        assert_eq!(t.write_count(), 1);
     }
 
     #[test]
