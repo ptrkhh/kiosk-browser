@@ -19,3 +19,9 @@ jsonwebtoken = "9"
 
 [dev-dependencies]
 tempfile = "3"
+# Test-only: the RSA keypair for the JWT tests is GENERATED at run time, never
+# committed. A `-----BEGIN PRIVATE KEY-----` in the repo is the highest-signal
+# pattern secret scanners hunt for, and a fixture PEM is silently swallowed by
+# the `*.pem` rule in .gitignore.
+rsa = { version = "0.9", features = ["pem"] }
+rand = "0.8"

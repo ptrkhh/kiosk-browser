@@ -6,9 +6,11 @@
 //!
 //! Two properties are load-bearing:
 //!
-//! 1. **The access token is a secret.** It lives in memory only. It is never
-//!    spooled, never logged, and [`TokenSource`]'s `Debug` is written by hand so
-//!    the token cannot leak into a panic message or a `dbg!`.
+//! 1. **The access token is a secret**, and so is the RSA private key. Both live
+//!    in memory only, wrapped in [`Secret`], whose `Debug` AND `Display` redact.
+//!    That makes the redaction structural rather than aspirational: a
+//!    `#[derive(Debug)]` on any struct holding one is safe, and the raw value is
+//!    reachable only through the explicitly-named, greppable [`Secret::expose`].
 //! 2. **`iat`/`exp` come from the trusted clock, never `Utc::now()`.** A kiosk
 //!    with a dead CMOS battery has a local clock that is years wrong; a JWT
 //!    signed with it is rejected by Google with an opaque `invalid_grant`. If
@@ -55,28 +57,81 @@ pub enum AuthError {
     TokenEndpoint { status: u16, body: String },
     #[error("token endpoint response was not the expected JSON: {0}")]
     MalformedTokenResponse(String),
+    /// A non-positive `expires_in`. See `mint` for why this is not clamped.
+    #[error("token endpoint returned a non-positive expires_in: {0}")]
+    InvalidExpiry(i64),
+}
+
+/// The token endpoint's body is attacker-influenceable and unbounded, and it
+/// ends up inside an error that will be logged. Two reasons to cap it: a hostile
+/// endpoint could inflate a log line arbitrarily, and a misconfigured
+/// `token_uri` pointing at a request-reflecting endpoint would echo our signed
+/// assertion JWT straight back into the error string - and thence into a log.
+const MAX_ERROR_BODY_BYTES: usize = 256;
+
+fn truncate_for_error(body: &str) -> String {
+    if body.len() <= MAX_ERROR_BODY_BYTES {
+        return body.to_string();
+    }
+    // Do not split a UTF-8 code point.
+    let mut end = MAX_ERROR_BODY_BYTES;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... [{} bytes truncated]", &body[..end], body.len() - end)
+}
+
+/// A secret string (an RSA private key, a bearer token) that cannot be printed
+/// by accident.
+///
+/// Both `Debug` and `Display` redact, so neither `{:?}` nor `{}` can leak it -
+/// including through a `#[derive(Debug)]` on any struct that holds one, and
+/// including `format!`/`panic!`/`tracing::info!`. The raw value is reachable
+/// only via [`Secret::expose`], which makes every disclosure deliberate and,
+/// crucially, greppable: `grep -rn '\.expose()'` enumerates every place a
+/// secret escapes. T7/T8 will hold these values; this is what stops a future
+/// debug line from becoming a breach.
+#[derive(Clone, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// The raw secret. Every call site is a deliberate disclosure - do not add
+    /// one without a reason.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl std::fmt::Display for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
 }
 
 /// The fields we need from a Google service-account key file. Everything else
 /// (`project_id`, `private_key_id`, ...) is ignored here.
-#[derive(Clone, Deserialize)]
+///
+/// `Debug` is derived - and that is safe *by construction*, because the private
+/// key is a [`Secret`], which redacts itself. There is no hand-written `Debug`
+/// to fall out of sync with the fields.
+#[derive(Debug, Clone, Deserialize)]
 pub struct ServiceAccount {
     pub client_email: String,
-    /// PEM. Secret material - never rendered anywhere (see the hand-written
-    /// `Debug` below).
-    pub private_key: String,
+    /// The RSA private key PEM. Private field: only `sign_assertion` (in this
+    /// module) needs it, so no accessor is offered.
+    private_key: Secret,
     pub token_uri: String,
-}
-
-/// Hand-written: a derived `Debug` here would print the RSA private key.
-impl std::fmt::Debug for ServiceAccount {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ServiceAccount")
-            .field("client_email", &self.client_email)
-            .field("token_uri", &self.token_uri)
-            .field("private_key", &"<redacted>")
-            .finish()
-    }
 }
 
 impl ServiceAccount {
@@ -86,7 +141,7 @@ impl ServiceAccount {
         if sa.client_email.trim().is_empty() {
             return Err(AuthError::MissingField("client_email"));
         }
-        if sa.private_key.trim().is_empty() {
+        if sa.private_key.expose().trim().is_empty() {
             return Err(AuthError::MissingField("private_key"));
         }
         if sa.token_uri.trim().is_empty() {
@@ -108,13 +163,14 @@ struct Claims {
 
 #[derive(Deserialize)]
 struct TokenResponse {
-    access_token: String,
+    access_token: Secret,
     expires_in: i64,
 }
 
 /// A cached access token. Held in memory only, and never rendered.
+#[derive(Debug)]
 struct CachedToken {
-    value: String,
+    value: Secret,
     /// Absolute expiry, in trusted time.
     expires_at: DateTime<Utc>,
 }
@@ -132,26 +188,17 @@ pub struct TokenSource {
     cached: Option<CachedToken>,
 }
 
-/// Hand-written so the bearer token (and the private key) can never reach a log
-/// line, a panic message, or a `dbg!`. See TEL-05.
+/// Hand-written only because `Arc<dyn Transport>` is not `Debug`. The secrets
+/// need no special handling here: the private key and the cached token are both
+/// [`Secret`]s, which redact themselves, so this delegates to their `Debug`
+/// rather than re-implementing redaction (which could fall out of sync). See
+/// TEL-05.
 impl std::fmt::Debug for TokenSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TokenSource")
-            .field("client_email", &self.service_account.client_email)
-            .field("token_uri", &self.service_account.token_uri)
-            .field("private_key", &"<redacted>")
-            .field(
-                "cached_token",
-                &match &self.cached {
-                    Some(_) => "<redacted>",
-                    None => "<none>",
-                },
-            )
-            .field(
-                "cached_token_expires_at",
-                &self.cached.as_ref().map(|c| c.expires_at),
-            )
-            .finish()
+            .field("service_account", &self.service_account)
+            .field("cached", &self.cached)
+            .finish_non_exhaustive()
     }
 }
 
@@ -177,7 +224,10 @@ impl TokenSource {
 
     /// A valid access token, minting one only if the cache is empty or the
     /// cached token is within [`REFRESH_MARGIN_SECONDS`] of expiry.
-    pub fn token(&mut self) -> Result<String, AuthError> {
+    ///
+    /// Returns a [`Secret`]: the caller must say `.expose()` to get the bearer
+    /// string, so it cannot be logged by accident.
+    pub fn token(&mut self) -> Result<Secret, AuthError> {
         let now = self.clock.trusted_utc().ok_or(AuthError::NoTrustedTime)?;
 
         if let Some(cached) = &self.cached {
@@ -216,16 +266,34 @@ impl TokenSource {
         if !(200..300).contains(&response.status) {
             return Err(AuthError::TokenEndpoint {
                 status: response.status,
-                body: response.body,
+                body: truncate_for_error(&response.body),
             });
         }
 
         let parsed: TokenResponse = serde_json::from_str(&response.body)
             .map_err(|e| AuthError::MalformedTokenResponse(e.to_string()))?;
 
+        // NEVER trust the endpoint's `expires_in`; clamp it into the (0, 3600]
+        // Google actually issues.
+        //
+        // A non-positive value is REJECTED rather than clamped. Clamping it up
+        // to 1 s would not help: 1 s is inside the 5-minute refresh margin, so
+        // every `token()` call would re-mint through the SUCCESS path - the
+        // unbounded, backoff-free mint storm the cache exists to prevent. An
+        // error is the safe shape: it is visible, and the caller's retry backoff
+        // rate-limits it.
+        //
+        // An absurdly large value is the mirror image (cache a long-dead token
+        // and 401 forever), but it is safe to clamp DOWN: the worst case is that
+        // we re-mint an hour early.
+        if parsed.expires_in <= 0 {
+            return Err(AuthError::InvalidExpiry(parsed.expires_in));
+        }
+        let lifetime = parsed.expires_in.min(JWT_LIFETIME_SECONDS);
+
         Ok(CachedToken {
             value: parsed.access_token,
-            expires_at: now + Duration::seconds(parsed.expires_in),
+            expires_at: now + Duration::seconds(lifetime),
         })
     }
 
@@ -241,9 +309,10 @@ impl TokenSource {
             exp: iat + JWT_LIFETIME_SECONDS,
         };
 
-        let key =
-            jsonwebtoken::EncodingKey::from_rsa_pem(self.service_account.private_key.as_bytes())
-                .map_err(|e| AuthError::BadPrivateKey(e.to_string()))?;
+        let key = jsonwebtoken::EncodingKey::from_rsa_pem(
+            self.service_account.private_key.expose().as_bytes(),
+        )
+        .map_err(|e| AuthError::BadPrivateKey(e.to_string()))?;
         let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
 
         jsonwebtoken::encode(&header, &claims, &key).map_err(|e| AuthError::Signing(e.to_string()))
@@ -254,11 +323,61 @@ impl TokenSource {
 mod tests {
     use super::*;
     use crate::logging::transport::HttpResponse;
-    use std::sync::Mutex;
+    use std::sync::{LazyLock, Mutex};
 
-    const SA_JSON: &str = include_str!("testdata/test_service_account.json");
-    const PUBLIC_PEM: &str = include_str!("testdata/test_service_account.pub.pem");
     const SECRET_TOKEN: &str = "ya29.SUPER-SECRET-BEARER-TOKEN";
+
+    /// The RSA keypair used by every test, generated ONCE per test binary.
+    ///
+    /// Generated at run time rather than committed as a fixture. A committed
+    /// `-----BEGIN PRIVATE KEY-----` inside a file named `*service_account*` is
+    /// the single highest-signal pattern that GitHub push protection, gitleaks,
+    /// and TruffleHog scan for. It would raise a permanent "leaked credential"
+    /// alert that a human has to triage and dismiss forever - training people to
+    /// ignore precisely the alert that will one day be real. Keygen is ~200 ms,
+    /// paid once for the whole binary; that is far cheaper than that.
+    ///
+    /// (It also means the repo cannot repeat the `.gitignore`-swallows-the-PEM
+    /// bug: there is no `.pem` to forget to commit.)
+    struct TestKey {
+        private_pem: String,
+        public_pem: String,
+    }
+
+    static TEST_KEY: LazyLock<TestKey> = LazyLock::new(|| {
+        use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
+        use rsa::{RsaPrivateKey, RsaPublicKey};
+
+        let mut rng = rand::thread_rng();
+        let private = RsaPrivateKey::new(&mut rng, 2048).expect("generate test RSA key");
+        let public = RsaPublicKey::from(&private);
+        TestKey {
+            private_pem: private
+                .to_pkcs8_pem(LineEnding::LF)
+                .expect("encode private pem")
+                .to_string(),
+            public_pem: public
+                .to_public_key_pem(LineEnding::LF)
+                .expect("encode public pem"),
+        }
+    });
+
+    /// A service-account JSON document, shaped like Google's, signed by the
+    /// generated key.
+    fn sa_json() -> String {
+        serde_json::json!({
+            "type": "service_account",
+            "project_id": "test-project",
+            "private_key": TEST_KEY.private_pem,
+            "client_email": "kiosk-logger@test-project.iam.gserviceaccount.com",
+            "token_uri": "https://oauth2.googleapis.com/token",
+        })
+        .to_string()
+    }
+
+    fn sa() -> ServiceAccount {
+        ServiceAccount::from_json(&sa_json()).expect("fixture parses")
+    }
 
     struct FakeTransport {
         requests: Mutex<Vec<(String, String)>>,
@@ -319,24 +438,25 @@ mod tests {
         }
     }
 
-    /// A clock whose trusted time is `year`-ish, established from an HTTP Date,
-    /// so it is nowhere near the local clock.
+    /// A clock whose trusted time is established from an HTTP `Date`, so it is
+    /// nowhere near the local clock.
     fn clock_at(http_date: &str) -> TrustedClock {
         let c = TrustedClock::new();
         c.observe_http_date(http_date).expect("valid HTTP date");
         c
     }
 
-    fn sa() -> ServiceAccount {
-        ServiceAccount::from_json(SA_JSON).expect("fixture parses")
+    /// A TokenSource on a known-good clock with the given canned responses.
+    fn token_source(t: Arc<FakeTransport>) -> TokenSource {
+        TokenSource::new(sa(), t, clock_at("Sun, 12 Jul 2026 08:30:00 GMT"))
     }
 
     fn decode_claims(jwt: &str) -> Claims {
-        let key = jsonwebtoken::DecodingKey::from_rsa_pem(PUBLIC_PEM.as_bytes())
+        let key = jsonwebtoken::DecodingKey::from_rsa_pem(TEST_KEY.public_pem.as_bytes())
             .expect("test public key");
         let mut v = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
-        // We are asserting on the claims ourselves; do not let the validator
-        // reject the token just because the trusted clock is far from `now`.
+        // We assert on the claims ourselves; do not let the validator reject the
+        // token merely because the trusted clock is far from `now`.
         v.validate_exp = false;
         v.validate_aud = false;
         jsonwebtoken::decode::<Claims>(jwt, &key, &v)
@@ -352,7 +472,10 @@ mod tests {
             "kiosk-logger@test-project.iam.gserviceaccount.com"
         );
         assert_eq!(sa.token_uri, "https://oauth2.googleapis.com/token");
-        assert!(sa.private_key.starts_with("-----BEGIN PRIVATE KEY-----"));
+        assert!(sa
+            .private_key
+            .expose()
+            .starts_with("-----BEGIN PRIVATE KEY-----"));
 
         assert!(matches!(
             ServiceAccount::from_json("{ not json"),
@@ -369,7 +492,7 @@ mod tests {
     #[test]
     fn jwt_claims_match_googles_server_to_server_contract() {
         let t = FakeTransport::with(vec![FakeTransport::ok_token(SECRET_TOKEN, 3600)]);
-        let mut ts = TokenSource::new(sa(), t.clone(), clock_at("Sun, 12 Jul 2026 08:30:00 GMT"));
+        let mut ts = token_source(t.clone());
         ts.token().expect("mints");
 
         let claims = decode_claims(&t.assertion(0));
@@ -441,11 +564,11 @@ mod tests {
     #[test]
     fn the_token_is_cached_and_not_reminted_on_every_call() {
         let t = FakeTransport::with(vec![FakeTransport::ok_token(SECRET_TOKEN, 3600)]);
-        let mut ts = TokenSource::new(sa(), t.clone(), clock_at("Sun, 12 Jul 2026 08:30:00 GMT"));
+        let mut ts = token_source(t.clone());
         let a = ts.token().expect("mints");
         let b = ts.token().expect("cached");
-        assert_eq!(a, SECRET_TOKEN);
-        assert_eq!(a, b);
+        assert_eq!(a.expose(), SECRET_TOKEN);
+        assert_eq!(a.expose(), b.expose());
         assert_eq!(
             t.call_count(),
             1,
@@ -460,10 +583,10 @@ mod tests {
             FakeTransport::ok_token("first-token", 120),
             FakeTransport::ok_token("second-token", 3600),
         ]);
-        let mut ts = TokenSource::new(sa(), t.clone(), clock_at("Sun, 12 Jul 2026 08:30:00 GMT"));
-        assert_eq!(ts.token().unwrap(), "first-token");
+        let mut ts = token_source(t.clone());
+        assert_eq!(ts.token().unwrap().expose(), "first-token");
         assert_eq!(
-            ts.token().unwrap(),
+            ts.token().unwrap().expose(),
             "second-token",
             "a token inside the refresh margin must be re-minted"
         );
@@ -476,11 +599,11 @@ mod tests {
             FakeTransport::ok_token("first-token", 3600),
             FakeTransport::ok_token("second-token", 3600),
         ]);
-        let mut ts = TokenSource::new(sa(), t.clone(), clock_at("Sun, 12 Jul 2026 08:30:00 GMT"));
-        assert_eq!(ts.token().unwrap(), "first-token");
+        let mut ts = token_source(t.clone());
+        assert_eq!(ts.token().unwrap().expose(), "first-token");
         ts.invalidate(); // models the 401 from Cloud Logging
-        assert_eq!(ts.token().unwrap(), "second-token");
-        assert_eq!(ts.token().unwrap(), "second-token");
+        assert_eq!(ts.token().unwrap().expose(), "second-token");
+        assert_eq!(ts.token().unwrap().expose(), "second-token");
         assert_eq!(
             t.call_count(),
             2,
@@ -491,8 +614,8 @@ mod tests {
     #[test]
     fn the_token_never_appears_in_debug_output() {
         let t = FakeTransport::with(vec![FakeTransport::ok_token(SECRET_TOKEN, 3600)]);
-        let mut ts = TokenSource::new(sa(), t.clone(), clock_at("Sun, 12 Jul 2026 08:30:00 GMT"));
-        assert_eq!(ts.token().unwrap(), SECRET_TOKEN);
+        let mut ts = token_source(t.clone());
+        assert_eq!(ts.token().unwrap().expose(), SECRET_TOKEN);
 
         let rendered = format!("{ts:?}");
         assert!(
@@ -507,6 +630,38 @@ mod tests {
         assert!(rendered.contains("kiosk-logger@test-project"));
     }
 
+    /// Pins the redaction on `ServiceAccount` ITSELF.
+    ///
+    /// `TokenSource`'s `Debug` used to reach past `ServiceAccount` and print its
+    /// own fields, so `the_token_never_appears_in_debug_output` never invoked
+    /// `ServiceAccount`'s `Debug` at all - its "no private key" assertion passed
+    /// for an unrelated reason, and the private-key redaction was protected by
+    /// nothing. This formats a `ServiceAccount` directly.
+    #[test]
+    fn the_private_key_never_appears_in_service_account_debug_output() {
+        let sa = sa();
+        let rendered = format!("{sa:?}");
+        assert!(
+            !rendered.contains("BEGIN PRIVATE KEY"),
+            "the private key leaked into ServiceAccount's Debug: {rendered}"
+        );
+        assert!(
+            !rendered.contains(sa.private_key.expose()),
+            "the private key leaked into ServiceAccount's Debug"
+        );
+        assert!(rendered.contains("kiosk-logger@test-project"));
+    }
+
+    /// A `Secret` must not leak through `Display` either - `{}` is at least as
+    /// easy to type as `{:?}` in a log line.
+    #[test]
+    fn a_secret_redacts_in_both_debug_and_display() {
+        let s = Secret::new("hunter2");
+        assert!(!format!("{s:?}").contains("hunter2"));
+        assert!(!format!("{s}").contains("hunter2"));
+        assert_eq!(s.expose(), "hunter2");
+    }
+
     #[test]
     fn a_token_endpoint_failure_is_reported_not_panicked() {
         for status in [429u16, 500, 401] {
@@ -515,8 +670,7 @@ mod tests {
                 headers: vec![],
                 body: r#"{"error":"unavailable"}"#.into(),
             })]);
-            let mut ts =
-                TokenSource::new(sa(), t.clone(), clock_at("Sun, 12 Jul 2026 08:30:00 GMT"));
+            let mut ts = token_source(t.clone());
             match ts.token() {
                 Err(AuthError::TokenEndpoint { status: s, .. }) => assert_eq!(s, status),
                 other => panic!("expected TokenEndpoint error for {status}, got {other:?}"),
@@ -525,7 +679,7 @@ mod tests {
 
         // A dead network is an error too, not a panic.
         let t = FakeTransport::with(vec![Err("dns failure".to_string())]);
-        let mut ts = TokenSource::new(sa(), t.clone(), clock_at("Sun, 12 Jul 2026 08:30:00 GMT"));
+        let mut ts = token_source(t.clone());
         assert!(matches!(ts.token(), Err(AuthError::Transport(_))));
 
         // Garbage in the 200 body is an error, not a panic.
@@ -534,10 +688,69 @@ mod tests {
             headers: vec![],
             body: "not json".into(),
         })]);
-        let mut ts = TokenSource::new(sa(), t.clone(), clock_at("Sun, 12 Jul 2026 08:30:00 GMT"));
+        let mut ts = token_source(t.clone());
         assert!(matches!(
             ts.token(),
             Err(AuthError::MalformedTokenResponse(_))
         ));
+    }
+
+    /// A non-positive `expires_in` would put `expires_at` in the past, so every
+    /// `token()` call would re-mint through the success path: an unbounded,
+    /// backoff-free mint storm. It must be an error instead.
+    #[test]
+    fn a_non_positive_expires_in_is_rejected_not_turned_into_a_mint_storm() {
+        for bad in [-1i64, 0] {
+            let t = FakeTransport::with(vec![FakeTransport::ok_token(SECRET_TOKEN, bad)]);
+            let mut ts = token_source(t.clone());
+            match ts.token() {
+                Err(AuthError::InvalidExpiry(v)) => assert_eq!(v, bad),
+                other => panic!("expected InvalidExpiry for expires_in={bad}, got {other:?}"),
+            }
+            assert!(ts.cached.is_none(), "an unusable token must not be cached");
+        }
+    }
+
+    /// The mirror image: an absurd `expires_in` must not cache a dead token
+    /// forever. Clamped DOWN to the 3600 Google actually issues - worst case we
+    /// re-mint an hour early.
+    #[test]
+    fn an_absurd_expires_in_is_clamped_to_one_hour() {
+        let t = FakeTransport::with(vec![FakeTransport::ok_token(SECRET_TOKEN, i64::MAX / 2)]);
+        let mut ts = token_source(t.clone());
+        let now = ts.clock.trusted_utc().unwrap();
+        ts.token().expect("mints");
+
+        let expires_at = ts.cached.as_ref().unwrap().expires_at;
+        let lifetime = (expires_at - now).num_seconds();
+        assert!(
+            lifetime <= 3600,
+            "expires_in must be clamped to <= 3600, got {lifetime}"
+        );
+        // Still cached, though: one absurd value must not cause a re-mint storm.
+        ts.token().expect("cached");
+        assert_eq!(t.call_count(), 1);
+    }
+
+    /// The endpoint's body is attacker-influenceable and ends up in a logged
+    /// error. A request-reflecting `token_uri` would otherwise echo our signed
+    /// assertion JWT into the log.
+    #[test]
+    fn an_oversized_error_body_is_truncated() {
+        let huge = "A".repeat(100_000);
+        let t = FakeTransport::with(vec![Ok(HttpResponse {
+            status: 500,
+            headers: vec![],
+            body: huge,
+        })]);
+        let mut ts = token_source(t.clone());
+        let err = ts.token().expect_err("500 is an error");
+        let rendered = err.to_string();
+        assert!(
+            rendered.len() < 1000,
+            "error body was not truncated: {} bytes",
+            rendered.len()
+        );
+        assert!(rendered.contains("truncated"));
     }
 }
