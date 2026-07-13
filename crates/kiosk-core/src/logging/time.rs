@@ -33,20 +33,39 @@ impl TrustedClock {
         }
     }
 
-    /// Parses an HTTP `Date` header (RFC 7231 IMF-fixdate, e.g.
-    /// `Sun, 12 Jul 2026 08:30:00 GMT`) and records the offset between the
-    /// server's clock and ours. `chrono::DateTime::parse_from_rfc2822`
-    /// rejects the trailing `GMT` (RFC 2822 wants a numeric zone like
-    /// `+0000`), so we normalize that suffix before parsing.
+    /// Parses an HTTP `Date` header and records the offset between the server's
+    /// clock and ours.
+    ///
+    /// We accept ONLY IMF-fixdate (`Sun, 12 Jul 2026 08:30:00 GMT`), which is
+    /// what RFC 9110 6.6.1 mandates for a `Date` header - and we check for the
+    /// literal, uppercase, case-sensitive `GMT` suffix ourselves BEFORE handing
+    /// anything to chrono.
+    ///
+    /// This strictness is deliberate. `chrono`'s RFC 2822 parser implements the
+    /// obsolete-zone grammar, so it will happily accept `... 08:30:00 EST` as a
+    /// real -05:00 offset (and `PST` as -08:00, and bare military letters). A
+    /// `Date` from a misconfigured reverse proxy, a captive portal, or a hostile
+    /// responder would then shift our harvested offset by hours *through the
+    /// success path* - silently poisoning every log timestamp and every JWT
+    /// `iat`/`exp` while looking perfectly healthy. Falling through to a bare
+    /// `parse_from_rfc2822` is exactly that bug, so we do not do it.
+    ///
+    /// We therefore fail closed: anything that is not IMF-fixdate - an obsolete
+    /// zone, a numeric zone, a lowercase `gmt`, a legal-but-obsolete RFC 850 or
+    /// asctime date, or junk - is rejected and leaves any established offset
+    /// untouched. This is a clock *harvester*, not a general HTTP date parser:
+    /// declining to update the clock is always safe, adopting a wrong one is not.
     pub fn observe_http_date(&self, header_value: &str) -> Result<(), TimeError> {
-        let normalized = if let Some(prefix) = header_value.strip_suffix(" GMT") {
-            format!("{prefix} +0000")
-        } else {
-            header_value.to_string()
-        };
+        let bad = || TimeError::BadDate(header_value.to_string());
+
+        // IMF-fixdate always ends in the literal uppercase `GMT`. Only once we
+        // have confirmed that do we rewrite it to the numeric zone RFC 2822
+        // requires; every other shape is refused outright.
+        let prefix = header_value.strip_suffix(" GMT").ok_or_else(bad)?;
+        let normalized = format!("{prefix} +0000");
 
         let server_utc = DateTime::parse_from_rfc2822(&normalized)
-            .map_err(|_| TimeError::BadDate(header_value.to_string()))?
+            .map_err(|_| bad())?
             .with_timezone(&Utc);
 
         let local_utc = Utc::now();
@@ -151,6 +170,52 @@ mod tests {
             "a multi-year offset must be reported as skew (offset {:?})",
             c.offset_seconds()
         );
+    }
+
+    /// RFC 2822's grammar accepts obsolete zone abbreviations (`EST` => -05:00,
+    /// `PST` => -08:00, and bare military letters). An HTTP `Date` is always
+    /// IMF-fixdate (RFC 9110 6.6.1) and therefore always ends in `GMT`, so any
+    /// other zone means the header is not a trustworthy HTTP-date. Accepting one
+    /// would silently shift the harvested offset by hours through the SUCCESS
+    /// path -- poisoning every log line and JWT while looking healthy. Rejecting
+    /// is always safe: we simply keep whatever offset we already had.
+    #[test]
+    fn obsolete_rfc2822_zones_are_rejected_not_silently_accepted() {
+        for bad in [
+            "Sun, 12 Jul 2026 08:30:00 EST",
+            "Sun, 12 Jul 2026 08:30:00 PST",
+            "Sun, 12 Jul 2026 08:30:00 CST",
+            "Sun, 12 Jul 2026 08:30:00 A", // bare military-letter zone
+        ] {
+            let c = TrustedClock::new();
+            c.observe_http_date(HTTP_DATE).unwrap();
+            let before = c.offset_seconds();
+            assert!(
+                c.observe_http_date(bad).is_err(),
+                "{bad} must be rejected, not silently accepted as an offset"
+            );
+            assert_eq!(
+                c.offset_seconds(),
+                before,
+                "{bad} must not move an established clock"
+            );
+        }
+    }
+
+    #[test]
+    fn a_numeric_zone_is_rejected_because_it_is_not_imf_fixdate() {
+        let c = TrustedClock::new();
+        c.observe_http_date("Sun, 12 Jul 2026 08:30:00 +0500")
+            .expect_err("a numeric zone is not a legal HTTP Date");
+        assert_eq!(c.offset_seconds(), None);
+    }
+
+    #[test]
+    fn a_lowercase_gmt_is_rejected() {
+        let c = TrustedClock::new();
+        c.observe_http_date("Sun, 12 Jul 2026 08:30:00 gmt")
+            .expect_err("RFC 9110 mandates the uppercase literal GMT");
+        assert_eq!(c.offset_seconds(), None);
     }
 
     #[test]
