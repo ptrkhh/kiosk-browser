@@ -33,7 +33,26 @@ pub struct Resource {
     pub labels: ResourceLabels,
 }
 
+/// The Cloud Logging `LogEntry` wire shape.
+///
+/// `rename_all = "camelCase"` is load-bearing, not cosmetic. proto3 JSON is
+/// documented to accept the original proto field names (`log_name`) alongside
+/// lowerCamelCase (`logName`) — but that was a *belief* about someone else's
+/// server that nothing here had verified, and if it is wrong then every batch is
+/// rejected and nothing ships. lowerCamelCase is the canonical spelling Google's
+/// own examples and discovery document use, so it retires the risk without a live
+/// API call.
+///
+/// `resource.labels` keys are deliberately NOT renamed: they are literal map keys
+/// in the `generic_node` monitored-resource descriptor (`project_id`, `node_id`,
+/// `namespace`, `location`), not proto fields.
+///
+/// **This is also the spool's on-disk format.** `spool.rs::max_seq_on_disk` scans
+/// raw lines for the insertId field by NAME — if that name and this rename ever
+/// disagree, the seq self-heal silently returns 0 and reopens the insertId
+/// collision hole. It reads `insertId` (and still accepts the old `insert_id`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LogEntry {
     pub log_name: String,
     pub resource: Resource,
@@ -241,6 +260,42 @@ mod tests {
         );
         assert_eq!(back.severity, e.severity);
         assert_eq!(back.timestamp, e.timestamp);
+    }
+
+    /// The wire shape is the CANONICAL lowerCamelCase, asserted exactly.
+    ///
+    /// This used to be checked with an "either spelling is fine" assertion, which
+    /// is a tell that nobody was sure which one Cloud Logging accepts. It is also
+    /// the spool's on-disk format, and `spool.rs::max_seq_on_disk` scans raw lines
+    /// for `insertId` by name — so a rename that silently slipped past would take
+    /// the seq self-heal down with it.
+    #[test]
+    fn the_wire_shape_uses_canonical_lower_camel_case_proto_field_names() {
+        let e = LogEntry::new(Event::AppStart, &ctx(), 3, &established_clock(), Map::new());
+        let v: Value = serde_json::to_value(&e).unwrap();
+
+        for key in ["logName", "insertId", "jsonPayload"] {
+            assert!(v.get(key).is_some(), "missing canonical field `{key}`: {v}");
+        }
+        for legacy in ["log_name", "insert_id", "json_payload"] {
+            assert!(
+                v.get(legacy).is_none(),
+                "the snake_case spelling `{legacy}` must NOT be on the wire: {v}"
+            );
+        }
+        assert_eq!(v["insertId"], "lobby-01-3");
+        assert_eq!(v["logName"], "projects/proj/logs/kiosk");
+
+        // `resource.labels` keys are literal monitored-resource map keys, NOT
+        // proto fields — they must stay snake_case.
+        let labels = &v["resource"]["labels"];
+        for key in ["project_id", "node_id", "namespace", "location"] {
+            assert!(
+                labels.get(key).is_some(),
+                "resource label `{key}` must stay snake_case: {labels}"
+            );
+        }
+        assert_eq!(v["resource"]["type"], "generic_node");
     }
 
     // --- URL redaction (TEL-08) ---

@@ -120,6 +120,12 @@ struct Ring {
     /// unbounded implementation would also have satisfied.
     #[cfg(test)]
     segments_read: std::cell::Cell<usize>,
+    /// Test-only instrumentation: how many times this ring fsynced its DIRECTORY.
+    /// An fsync is unobservable from safe Rust, so the durability test asserts
+    /// the call was made on the path that must make it; it cannot prove the
+    /// kernel reached the platter. See `fsync_own_dir`.
+    #[cfg(test)]
+    dir_fsyncs: std::cell::Cell<usize>,
 }
 
 fn seg_name(n: u64) -> String {
@@ -170,7 +176,18 @@ impl Ring {
             seq_high_water: state.seq_high_water,
             #[cfg(test)]
             segments_read: std::cell::Cell::new(0),
+            #[cfg(test)]
+            dir_fsyncs: std::cell::Cell::new(0),
         })
+    }
+
+    /// `fsync` this ring's directory, counting the call so a test can assert it
+    /// happened (see `dir_fsyncs`). Every directory fsync in a `Ring` goes through
+    /// here — going around it would make the instrumentation lie.
+    fn fsync_own_dir(&self) {
+        #[cfg(test)]
+        self.dir_fsyncs.set(self.dir_fsyncs.get() + 1);
+        fsync_dir(&self.dir);
     }
 
     /// The highest `seq` embedded in any `insert_id` still on disk in this ring
@@ -196,7 +213,17 @@ impl Ring {
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
                     continue; // torn line
                 };
-                let Some(id) = v.get("insert_id").and_then(|v| v.as_str()) else {
+                // The field name MUST track `LogEntry`'s serde rename
+                // (`insertId`). If it ever silently stops matching, this returns 0
+                // and `Spool::open` loses one of its three seq sources — the
+                // insertId collision hole, reopened where nobody would look.
+                // `insert_id` is still accepted so a spool written before the
+                // camelCase change can still be healed from.
+                let Some(id) = v
+                    .get("insertId")
+                    .or_else(|| v.get("insert_id"))
+                    .and_then(|v| v.as_str())
+                else {
                     continue;
                 };
                 if let Some(seq) = id.rsplit_once('-').and_then(|(_, s)| s.parse::<u64>().ok()) {
@@ -215,13 +242,31 @@ impl Ring {
         self.sizes.values().sum()
     }
 
+    /// Open (creating if needed) a segment in append mode.
+    ///
+    /// **A newly CREATED segment fsyncs the directory before it is handed back.**
+    /// `append_line` fsyncs the FILE for a high-severity entry, which makes its
+    /// contents durable — but not the directory entry that names the file. On a
+    /// power cut the directory metadata may never have reached the platter, and
+    /// the entire segment vanishes: the `watchdog.safe_mode` line that explains
+    /// why the device died is gone, defeated by exactly the event TEL-10 exists to
+    /// survive. `persist_cursor` and `Spool::reserve` already fsync the directory
+    /// for this reason; segment creation is the third place that needs it.
+    ///
+    /// The window is not narrow: the high ring is low-volume, so the FIRST
+    /// CRITICAL entry on a fresh device — and the first after any segment deletion
+    /// — creates a new file.
     fn open_segment(&mut self, name: &str) -> Result<&mut File, SpoolError> {
         let path = self.dir.join(name);
+        let existed = path.exists();
         let f = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
             .map_err(io(&path))?;
+        if !existed {
+            self.fsync_own_dir();
+        }
         self.sizes.entry(name.to_string()).or_insert(0);
         self.active = Some((name.to_string(), f));
         Ok(&mut self.active.as_mut().expect("just set").1)
@@ -335,7 +380,21 @@ impl Ring {
     /// and would otherwise block the cursor forever). Fully committed segments
     /// are deleted. Segments are never rewritten in place — a crash mid-rewrite
     /// would lose data.
-    fn commit(&mut self, acked: &HashSet<&str>) -> Result<(), SpoolError> {
+    ///
+    /// **This is PREFIX-based, not set-based**, and the difference is load-bearing
+    /// for callers. `acked` is a set, but what advances is the LEADING committed
+    /// run: the walk stops at the first line whose `insert_id` is not in `acked`.
+    /// So an acked line sitting BEHIND a non-acked one in the same segment is
+    /// *not* removed — it stays on disk and is re-drained (harmlessly: the
+    /// `insertId` is reused byte-identically, so Cloud Logging dedups the
+    /// re-send). Prefix-only is deliberate: a set-based removal would have to
+    /// rewrite segments in place, and a crash mid-rewrite loses data.
+    ///
+    /// Returns **how many lines the cursor actually advanced over**, summed across
+    /// segments — which is NOT necessarily `acked.len()`. `mod.rs::triage_rejections`
+    /// depends on this to keep its `pending` count honest.
+    fn commit(&mut self, acked: &HashSet<&str>) -> Result<usize, SpoolError> {
+        let mut advanced = 0usize;
         let names: Vec<String> = self.sizes.keys().cloned().collect();
         for name in names {
             let path = self.dir.join(&name);
@@ -358,6 +417,9 @@ impl Ring {
                 }
                 n += 1;
             }
+            // How far the prefix moved THIS call — not how many acked entries the
+            // caller handed us. A non-acked line blocks the prefix behind it.
+            advanced += (n - start) as usize;
             if n == 0 {
                 continue;
             }
@@ -370,7 +432,8 @@ impl Ring {
                 self.cursor.insert(name, n);
             }
         }
-        self.persist_cursor()
+        self.persist_cursor()?;
+        Ok(advanced)
     }
 
     /// Persist the commit cursor AND the drop counter together, then fsync the
@@ -389,7 +452,7 @@ impl Ring {
             f.sync_all().map_err(io(&tmp))?;
         }
         fs::rename(&tmp, &path).map_err(io(&path))?;
-        fsync_dir(&self.dir);
+        self.fsync_own_dir();
         Ok(())
     }
 }
@@ -551,10 +614,36 @@ impl Spool {
 
     /// The ONLY thing that removes entries. Called after the network confirmed
     /// the write; an uncommitted drain is re-delivered on the next drain.
-    pub fn commit_drained(&mut self, entries: &[LogEntry]) -> Result<(), SpoolError> {
+    ///
+    /// Returns **how many spooled lines this actually committed**, which is not
+    /// necessarily `entries.len()`: each ring advances a leading committed PREFIX
+    /// (see [`Ring::commit`]), so an acked entry sitting behind a still-unacked
+    /// one in the same ring stays on disk until the blocker clears. Callers that
+    /// track undelivered work must trust this number, not `entries.len()`.
+    pub fn commit_drained(&mut self, entries: &[LogEntry]) -> Result<usize, SpoolError> {
         let acked: HashSet<&str> = entries.iter().map(|e| e.insert_id.as_str()).collect();
-        self.high.commit(&acked)?;
-        self.low.commit(&acked)
+        let high = self.high.commit(&acked)?;
+        let low = self.low.commit(&acked)?;
+        Ok(high + low)
+    }
+
+    /// How many entries are still on the spool awaiting delivery: every line past
+    /// each segment's commit cursor, in both rings.
+    ///
+    /// O(spool). Called ONCE, at `Logger::new`, to count the backlog a killed
+    /// process left behind — `drain_batch(MAX_BATCH)` cannot do that job, because
+    /// it caps at 100 and a device that crashed with a 40 MB spool would reopen
+    /// believing it had 100 entries to deliver.
+    pub fn uncommitted_count(&self) -> usize {
+        let mut n = 0usize;
+        for ring in [&self.high, &self.low] {
+            for name in ring.sizes.keys() {
+                let lines = count_lines(&ring.dir.join(name)).unwrap_or(0);
+                let committed = ring.cursor.get(name).copied().unwrap_or(0);
+                n += lines.saturating_sub(committed) as usize;
+            }
+        }
+        n
     }
 
     /// The spool's own root directory (`<dir>/spool`). Callers that must persist
@@ -758,9 +847,13 @@ mod tests {
 
         let seg = dir.path().join("spool").join("high").join("00000.jsonl");
         let text = std::fs::read_to_string(&seg).expect("high segment exists at append time");
+        // The CANONICAL spelling, asserted exactly. Accepting either spelling here
+        // would hide a rename from the seq self-heal, which scans raw lines for
+        // this very field name.
         assert!(
-            text.contains("\"insertId\":\"d1-1\"") || text.contains("\"insert_id\":\"d1-1\""),
-            "the CRITICAL entry must be readable from a fresh handle immediately: {text}"
+            text.contains("\"insertId\":\"d1-1\""),
+            "the CRITICAL entry must be readable from a fresh handle immediately, \
+             under the canonical lowerCamelCase key: {text}"
         );
 
         // And it must survive a reopen that never saw the writer.
@@ -768,6 +861,48 @@ mod tests {
         let batch = s2.drain_batch(10).unwrap();
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].insert_id, "d1-1");
+    }
+
+    /// TEL-10, the half the fsync test above cannot reach. `sync_all()` on the
+    /// FILE makes its contents durable; it says nothing about the DIRECTORY ENTRY
+    /// that names the file. A brand-new segment whose directory entry never
+    /// reached the platter disappears WHOLE on a power cut — taking the
+    /// `watchdog.safe_mode` line with it. And this is the common case, not a
+    /// corner: the high ring is low-volume, so the first CRITICAL entry on a fresh
+    /// device creates its segment.
+    ///
+    /// HONEST LIMITS: an `fsync` is unobservable from safe Rust. This asserts the
+    /// CALL is made on the path that must make it (via `Ring::fsync_own_dir`,
+    /// which every directory fsync in a `Ring` goes through). It does not — and
+    /// cannot, from here — prove the kernel pushed the metadata to the platter.
+    #[test]
+    fn creating_a_new_segment_for_a_critical_entry_fsyncs_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Spool::open(dir.path(), cfg()).unwrap();
+        s.high.dir_fsyncs.set(0);
+
+        // The FIRST high-severity entry on a fresh device: creates 00000.jsonl.
+        s.append(&entry(Event::WatchdogSafeMode, 1)).unwrap();
+        assert_eq!(
+            s.high.dir_fsyncs.get(),
+            1,
+            "creating the segment that holds a CRITICAL entry must fsync the \
+             directory, or the whole file can vanish in the crash the entry exists \
+             to explain"
+        );
+
+        // An append to an EXISTING segment must not pay for it again — the
+        // directory entry is already durable.
+        s.append(&entry(Event::WatchdogSafeMode, 2)).unwrap();
+        assert_eq!(
+            s.high.dir_fsyncs.get(),
+            1,
+            "an append to an existing segment must not re-fsync the directory"
+        );
+
+        // And the entry really is on disk, from a handle that never saw the writer.
+        let mut s2 = Spool::open(dir.path(), cfg()).unwrap();
+        assert_eq!(s2.drain_batch(10).unwrap().len(), 2);
     }
 
     #[test]
@@ -1020,6 +1155,36 @@ mod tests {
             "reissued {} with an empty spool and no seq file (already used: {used:?})",
             e.insert_id
         );
+    }
+
+    /// The self-heal reads the insertId out of RAW spool lines by FIELD NAME, so
+    /// it is coupled to `LogEntry`'s serde rename. If the two ever drift apart it
+    /// does not fail loudly — it silently finds nothing, returns 0, and the
+    /// insertId collision hole reopens exactly where nobody would look for it.
+    /// This pins the coupling from BOTH ends: the on-disk key is the canonical
+    /// `insertId`, AND the scanner actually finds a seq under it.
+    #[test]
+    fn the_seq_self_heal_finds_the_insert_id_under_the_name_the_entry_serializes_it_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Spool::open(dir.path(), cfg()).unwrap();
+        s.append(&entry(Event::AppStart, 41)).unwrap();
+        s.append(&entry(Event::WatchdogSafeMode, 42)).unwrap();
+        drop(s);
+
+        let low = std::fs::read_to_string(dir.path().join("spool/low/00000.jsonl")).unwrap();
+        assert!(
+            low.contains("\"insertId\":\"d1-41\""),
+            "the spool's on-disk key must be the canonical one: {low}"
+        );
+
+        let s = Spool::open(dir.path(), cfg()).unwrap();
+        assert_eq!(
+            s.low.max_seq_on_disk(),
+            41,
+            "the raw-line scanner must find the seq under the field name LogEntry \
+             actually serializes — a silent 0 here reopens the insertId hole"
+        );
+        assert_eq!(s.high.max_seq_on_disk(), 42);
     }
 
     /// A crash mid-block must forfeit the block's unused remainder, never replay

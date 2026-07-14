@@ -46,6 +46,63 @@ const MAX_REMEMBERED_QUARANTINES: usize = 32;
 const REJECT_STATE_FILE: &str = "reject.json";
 const REJECT_STATE_TMP: &str = "reject.json.tmp";
 
+/// The rate limiter's suppressed counts (TEL-09), inside the spool root.
+/// Deliberately a DIFFERENT file from `reject.json` — see [`SuppressState`].
+const SUPPRESS_STATE_FILE: &str = "suppress.json";
+const SUPPRESS_STATE_TMP: &str = "suppress.json.tmp";
+
+/// How hard a durable write tries — because "durable" is two different
+/// guarantees against two different threats, and this subsystem needs both.
+///
+/// `fsync` is what makes a write survive a **power cut**. It is *not* what makes
+/// it survive a **process death**: once `write()` and `rename()` have returned,
+/// the new bytes are in the kernel's page cache and the directory entry points at
+/// them, so the *next process* reads them back whether or not this one was
+/// `SIGKILL`ed. The kernel outlives the process.
+///
+/// That distinction is the whole reason this enum exists. It lets the
+/// once-per-flush paths buy power-cut durability, while the once-per-EVENT path
+/// (a rate-limiter suppression — which by construction only ever happens during a
+/// flood) buys only kill durability, which is the threat it actually faces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Durability {
+    /// write + atomic rename. Survives a `SIGKILL`; does not survive a power cut.
+    /// Cheap enough (no fsync) to pay on every event.
+    ProcessKill,
+    /// write + fsync + atomic rename + fsync(dir). Survives a power cut. Costs
+    /// two fsyncs, so it belongs only on paths that run once per flush.
+    PowerCut,
+}
+
+/// Write `text` to `dir/name` via a temp file and an atomic rename, at the
+/// requested durability. The rename is what makes a reader (this process or the
+/// next one) see either the whole old file or the whole new one, never a torn mix.
+///
+/// Callers swallow the error: a failure here degrades the state to its in-memory
+/// behavior, and it must never propagate into `log()`.
+fn write_state(
+    dir: &Path,
+    name: &str,
+    tmp_name: &str,
+    text: &str,
+    durability: Durability,
+) -> std::io::Result<()> {
+    let tmp = dir.join(tmp_name);
+    let mut f = File::create(&tmp)?;
+    f.write_all(text.as_bytes())?;
+    if durability == Durability::PowerCut {
+        f.sync_all()?;
+    }
+    // Close before renaming: Windows will not rename a file that is still open.
+    drop(f);
+    fs::rename(&tmp, dir.join(name))?;
+    if durability == Durability::PowerCut {
+        // Make the rename itself durable, not just the file's contents.
+        let _ = File::open(dir).map(|f| f.sync_all());
+    }
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LoggerError {
     #[error("spool failure: {0}")]
@@ -108,21 +165,99 @@ impl RejectState {
     /// Write-then-rename, fsynced — the same durability recipe as the spool's
     /// `seq`. A failure is swallowed: it degrades this to the old in-memory
     /// behavior, and it must never propagate into `log()`.
+    ///
+    /// Always [`Durability::PowerCut`]: this is the retry budget that stops a
+    /// poison entry wedging telemetry across a watchdog restart loop, and it is
+    /// only ever written on the flush path (once per flush, never per event), so
+    /// it can afford the two fsyncs and must not go without them.
     fn persist(&self, dir: &Path) {
         let Ok(text) = serde_json::to_string(self) else {
             return;
         };
-        let tmp = dir.join(REJECT_STATE_TMP);
-        let write = File::create(&tmp).and_then(|mut f| {
-            f.write_all(text.as_bytes())?;
-            f.sync_all()
-        });
-        if write.is_err() {
+        let _ = write_state(
+            dir,
+            REJECT_STATE_FILE,
+            REJECT_STATE_TMP,
+            &text,
+            Durability::PowerCut,
+        );
+    }
+}
+
+/// The rate limiter's suppressed-event counts (TEL-09), made durable.
+///
+/// ## Why it is durable at all
+///
+/// This was the last loss counter in the subsystem living only in RAM
+/// (`dropped_expired`, `dropped_rejected` and `quarantined` are all persisted next
+/// to the fsynced spool, each with a test pinning it), and it had the same shape
+/// of bug as the two already fixed: a `nav.blocked` redirect loop suppresses 40k
+/// events, the watchdog kills the process before the next `tick()` can coalesce
+/// them, and the summary entry — *the entire point of rate-limiting rather than
+/// silently dropping* — is never emitted. The loss went silent at exactly the
+/// moment it mattered.
+///
+/// ## Why it is a SEPARATE file from `reject.json`
+///
+/// Because the two have opposite cost profiles and opposite loss tolerances, and
+/// sharing a file would force the strictest setting of each onto the other:
+///
+/// * `reject.json` is loss-INTOLERANT (losing the retry budget re-opens the
+///   wedged-telemetry hole) and written once per flush, so it always fsyncs.
+/// * this counter is written once per *suppressed event* — i.e. only ever during
+///   a flood, at flood rate — and is loss-tolerant at the margin (a summary that
+///   says 39 990 instead of 40 000 still says "redirect loop").
+///
+/// Folding the counter into `reject.json` and then writing it *without* fsync (to
+/// afford the frequency) would drag the retry budget down to the counter's
+/// durability; writing it *with* fsync (to protect the budget) would drag the
+/// counter up to the budget's cost — see below. Two files, two answers.
+///
+/// ## Why the per-event write does NOT fsync
+///
+/// A suppression, by construction, only happens when something is flooding. It is
+/// therefore the highest-frequency path in the whole logger — and the rate limiter
+/// exists precisely to make a flood *cheap*. Paying two fsyncs per suppressed
+/// event would make the suppressed path more expensive than the *admitted* one (an
+/// INFO append fsyncs nothing at all — `spool.rs::enforce_budget` is explicit that
+/// "an INFO append must not pay for an fsync it does not need"), and would turn a
+/// 1 000/s redirect loop into 2 000 fsyncs/s of blocking I/O and flash wear on a
+/// kiosk's eMMC. The mechanism that bounds the cost of a flood would have become
+/// the thing that melts the device during one.
+///
+/// So the per-event write is [`Durability::ProcessKill`]: write + atomic rename,
+/// no fsync. That is *exactly* the guarantee the finding calls for — the named
+/// threat is a **watchdog `SIGKILL`**, and the page cache outlives the process, so
+/// the next boot reads the count back in full. The counts are additionally fsynced
+/// ([`Durability::PowerCut`]) whenever they are drained into a summary, once per
+/// tick, which bounds what a genuine *power cut* can cost to the suppressions of a
+/// single tick window.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct SuppressState {
+    /// event name -> events suppressed but not yet coalesced into a summary entry.
+    #[serde(default)]
+    counts: BTreeMap<String, u64>,
+}
+
+impl SuppressState {
+    fn load(dir: &Path) -> SuppressState {
+        fs::read_to_string(dir.join(SUPPRESS_STATE_FILE))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn persist(&self, dir: &Path, durability: Durability) {
+        let Ok(text) = serde_json::to_string(self) else {
             return;
-        }
-        let _ = fs::rename(&tmp, dir.join(REJECT_STATE_FILE));
-        // Make the rename itself durable, not just the file's contents.
-        let _ = File::open(dir).map(|f| f.sync_all());
+        };
+        let _ = write_state(
+            dir,
+            SUPPRESS_STATE_FILE,
+            SUPPRESS_STATE_TMP,
+            &text,
+            durability,
+        );
     }
 }
 
@@ -154,20 +289,35 @@ pub struct Logger {
 
     /// Durable: survives the SIGKILL that a crash loop delivers. See [`RejectState`].
     state: RejectState,
+
+    /// Durable for the same reason, at a cheaper durability because it is written
+    /// once per suppressed event rather than once per flush. See [`SuppressState`].
+    suppressed: SuppressState,
 }
 
 impl Logger {
     pub fn new(
         ctx: EntryContext,
-        mut spool: Spool,
+        spool: Spool,
         client: GclClient,
         limiter: RateLimiter,
         clock: TrustedClock,
     ) -> Logger {
         let state = RejectState::load(spool.dir());
+        // A flood the last process did not live long enough to coalesce is still
+        // owed a summary entry; the first `tick()` will emit it.
+        let suppressed = SuppressState::load(spool.dir());
         // Whatever a previous process left spooled is still awaiting delivery, so
-        // the entry trigger must see it. Cheap: it is bounded by MAX_BATCH.
-        let pending = spool.drain_batch(MAX_BATCH).map(|b| b.len()).unwrap_or(0);
+        // the entry trigger must see ALL of it.
+        //
+        // This used to be `drain_batch(MAX_BATCH)`, which caps at 100: a device
+        // that crashed with a 40 MB spool reopened believing it had 100 entries to
+        // deliver, the first flush drained exactly those 100 and set `pending` to
+        // 0, and the entry trigger disarmed — so the backlog trickled out at one
+        // batch per 10 s tick while the ring kept evicting entries that would never
+        // be sent. `uncommitted_count` is an O(spool) scan, but it happens once, at
+        // boot, alongside the seq self-heal that already reads every line.
+        let pending = spool.uncommitted_count();
         Logger {
             ctx,
             spool,
@@ -179,6 +329,7 @@ impl Logger {
             backoff: BACKOFF_MIN,
             retry_after: None,
             state,
+            suppressed,
         }
     }
 
@@ -195,6 +346,24 @@ impl Logger {
     /// durable by the time the caller gets control back.
     pub fn log(&mut self, event: Event, fields: Map<String, Value>) {
         if matches!(self.limiter.admit(event), Admit::Suppress) {
+            // The suppressed count is recorded DURABLY, not just in the limiter's
+            // RAM (see `SuppressState`): the flood that trips the limiter is very
+            // often the same flood that ends in a watchdog kill, and a count that
+            // dies with the process takes the coalesced summary entry — the whole
+            // point of rate-limiting rather than silently dropping — with it.
+            //
+            // `ProcessKill`, NOT `PowerCut`: this runs once per suppressed event,
+            // i.e. at flood rate, and fsyncing here would make the mechanism that
+            // exists to bound the cost of a flood into the most expensive path in
+            // the logger. A `SIGKILL` is the threat named, and a write+rename
+            // already beats it — the page cache outlives the process.
+            *self
+                .suppressed
+                .counts
+                .entry(event.name().to_string())
+                .or_insert(0) += 1;
+            self.suppressed
+                .persist(self.spool.dir(), Durability::ProcessKill);
             return;
         }
         self.emit(event, fields);
@@ -376,12 +545,29 @@ impl Logger {
         // the spool: a kill in between must not lose the evidence of the drop.
         self.state.persist(self.spool.dir());
 
-        // One commit call: `commit_drained` matches on insertId, so committing
-        // the accepted and the quarantined together is exactly "remove these".
+        // One commit call for the accepted and the quarantined together.
+        //
+        // `commit_drained` does NOT mean "remove these". Each ring advances a
+        // leading committed PREFIX (see `Ring::commit`), so it means "advance the
+        // longest acked prefix of these". When a poison entry physically PRECEDES
+        // its accepted batch-mates in the SAME ring — three `AppStart`s with the
+        // oldest rejected — the prefix cannot move past it and NOTHING is
+        // committed. The mates are then re-drained and re-sent on every flush until
+        // the poison is quarantined.
+        //
+        // That is bounded (MAX_REJECT_ATTEMPTS) and safe (the re-send reuses the
+        // same insertIds, which Cloud Logging dedups), so we accept it rather than
+        // rewriting segments in place — a crash mid-rewrite loses data, which is
+        // strictly worse than a bounded re-send.
+        //
+        // What we must NOT do is decrement `pending` by `accepted.len()` on the
+        // strength of a commit that did not happen: that under-counts undelivered
+        // work and disarms the 100-entry trigger. So we decrement by what the spool
+        // says it ACTUALLY committed.
         accepted.extend(quarantine);
         if !accepted.is_empty() {
-            self.pending = self.pending.saturating_sub(accepted.len());
-            self.spool.commit_drained(&accepted)?;
+            let committed = self.spool.commit_drained(&accepted)?;
+            self.pending = self.pending.saturating_sub(committed);
         }
         Ok(())
     }
@@ -408,13 +594,48 @@ impl Logger {
 
     /// Turn each suppressed-event count into a real entry (TEL-09), so the loop
     /// is bounded but never hidden.
+    ///
+    /// The counts are drained from the DURABLE state ([`SuppressState`]), not from
+    /// the limiter's in-memory counters — so a flood that a watchdog kill
+    /// interrupted still surfaces its summary on the next boot, instead of
+    /// vanishing with the process it helped kill. The limiter's own counters are
+    /// drained too, and DISCARDED: they count the same suppressions the durable
+    /// state already has, and leaving them would double-count on the next call.
     fn emit_summaries(&mut self) {
-        for (event, suppressed) in self.limiter.take_summaries() {
-            let mut fields = Map::new();
-            fields.insert("suppressed_count".into(), Value::from(suppressed));
-            fields.insert("rate_limited".into(), Value::Bool(true));
-            self.emit(event, fields);
+        let _ = self.limiter.take_summaries();
+        if self.suppressed.counts.is_empty() {
+            return;
         }
+        let drained = std::mem::take(&mut self.suppressed.counts);
+
+        for (name, count) in &drained {
+            // Only a capped event can ever have been suppressed, so `caps()` is a
+            // total lookup for anything that got in here.
+            let Some((event, _, _)) = ratelimit::caps().iter().find(|(e, _, _)| e.name() == name)
+            else {
+                continue;
+            };
+            let mut fields = Map::new();
+            fields.insert("suppressed_count".into(), Value::from(*count));
+            fields.insert("rate_limited".into(), Value::Bool(true));
+            self.emit(*event, fields);
+        }
+
+        // Clear the durable counts only AFTER the summaries are spooled — never
+        // before. Every capped event is WARNING+ (`nav.blocked`/`nav.error` are
+        // WARNING, `webview.crash` is ERROR), so each `emit` above fsynced its
+        // summary into the high ring before it returned (TEL-10): the evidence is
+        // already on disk by the time we erase the counter that produced it.
+        //
+        // The ordering is the whole point. A crash in the window between emitting
+        // and clearing re-emits a duplicate summary on the next boot — LOUD, and
+        // harmless. Clearing first would instead have LOST the flood's evidence in
+        // that window, which is precisely the failure this mechanism exists to
+        // prevent. When the two failure modes are "say it twice" and "never say
+        // it", a telemetry system picks the former, exactly as the spool itself
+        // does (at-least-once delivery, deduped downstream by `insertId`).
+        self.suppressed
+            .persist(self.spool.dir(), Durability::PowerCut);
     }
 
     fn succeed(&mut self) {
@@ -453,8 +674,20 @@ impl Logger {
     /// 100 of a 250-entry backlog it reads 150, the 100-entry trigger stays armed,
     /// and the backlog drains at one batch per tick instead of one per 10 s.
     ///
-    /// It is a lower bound in one edge case: a `drain_batch` that itself failed
-    /// leaves the count untouched. It is never an over-count of undelivered work.
+    /// On a fresh `Logger` it is the EXACT size of the backlog a previous process
+    /// left spooled — every uncommitted line in both rings, not a `MAX_BATCH`-
+    /// capped sample of it. That is what keeps the 100-entry trigger armed while a
+    /// large backlog drains, at one batch per tick rather than one per 10 s.
+    ///
+    /// Two known imprecisions, both bounded and both in the safe direction for the
+    /// trigger:
+    /// * a `drain_batch` that itself failed leaves the count untouched (a lower
+    ///   bound on that path);
+    /// * an entry evicted by the spool's drop-oldest budget before it was ever
+    ///   delivered is still counted here until the next `Logger::new` recounts. It
+    ///   is reported as lost through `dropped_expired()`; the only consequence of
+    ///   the over-count is that the entry trigger stays armed slightly too eagerly,
+    ///   which costs one empty flush.
     pub fn pending(&self) -> usize {
         self.pending
     }
@@ -509,7 +742,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|e| e["insert_id"].as_str().unwrap().to_string())
+                .map(|e| e["insertId"].as_str().unwrap().to_string())
                 .collect()
         }
     }
@@ -677,7 +910,7 @@ mod tests {
 
         let lines = spooled_lines(dir.path());
         assert_eq!(lines.len(), 1, "the entry must already be on disk");
-        assert_eq!(lines[0]["json_payload"]["event"], "watchdog.safe_mode");
+        assert_eq!(lines[0]["jsonPayload"]["event"], "watchdog.safe_mode");
         assert_eq!(lines[0]["severity"], "CRITICAL");
         assert_eq!(
             t.write_count(),
@@ -825,10 +1058,10 @@ mod tests {
         let entries = sent["entries"].as_array().unwrap();
         let summary = entries
             .iter()
-            .find(|e| e["json_payload"]["suppressed_count"].is_number())
+            .find(|e| e["jsonPayload"]["suppressed_count"].is_number())
             .expect("a suppressed flood must surface as a coalesced summary entry");
-        assert_eq!(summary["json_payload"]["event"], "nav.blocked");
-        assert_eq!(summary["json_payload"]["suppressed_count"], 40);
+        assert_eq!(summary["jsonPayload"]["event"], "nav.blocked");
+        assert_eq!(summary["jsonPayload"]["suppressed_count"], 40);
         assert_eq!(
             entries.len(),
             21,
@@ -836,7 +1069,7 @@ mod tests {
         );
         // The summary is a real entry: severity and insertId like any other.
         assert_eq!(summary["severity"], "WARNING");
-        assert!(summary["insert_id"]
+        assert!(summary["insertId"]
             .as_str()
             .unwrap()
             .starts_with("lobby-01-"));
@@ -860,11 +1093,11 @@ mod tests {
         let body = t.write_body(0);
         assert_eq!(body["partialSuccess"], Value::Bool(true));
         let e = &body["entries"].as_array().unwrap()[0];
-        assert_eq!(e["json_payload"]["event"], "watchdog.restart");
-        assert_eq!(e["json_payload"]["exit_code"], 86);
-        assert_eq!(e["log_name"], "projects/proj/logs/kiosk");
+        assert_eq!(e["jsonPayload"]["event"], "watchdog.restart");
+        assert_eq!(e["jsonPayload"]["exit_code"], 86);
+        assert_eq!(e["logName"], "projects/proj/logs/kiosk");
         assert_eq!(e["resource"]["labels"]["node_id"], "lobby-01");
-        assert_eq!(e["insert_id"], "lobby-01-1");
+        assert_eq!(e["insertId"], "lobby-01-1");
     }
 
     // --- The poison entry (see `Logger::flush`) ---
@@ -948,6 +1181,67 @@ mod tests {
             vec!["lobby-01-2".to_string()],
             "the retry must carry ONLY the rejected entry"
         );
+    }
+
+    /// The case the two tests above CANNOT see. In both of them the poison entry
+    /// lands in a different RING from its batch-mates (INFO vs WARNING), so no
+    /// ring ever holds a non-acked line ahead of an acked one — and
+    /// `Ring::commit` advances a leading committed PREFIX. Here all three entries
+    /// are `AppStart` (INFO → the same ring) and the OLDEST is the poison, so the
+    /// prefix cannot advance past it: the accepted mates stay physically spooled
+    /// until the poison is quarantined.
+    ///
+    /// That is bounded and safe (the re-send reuses the same insertIds, which
+    /// Cloud Logging dedups). What must NOT happen is `pending` being decremented
+    /// for entries that were never committed off the spool: that under-counts
+    /// undelivered work and disarms the 100-entry trigger.
+    #[test]
+    fn a_poison_entry_ahead_of_its_accepted_mates_in_the_same_ring_keeps_pending_honest() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = FakeTransport::new(vec![
+            resp(400, &partial_body(&[0])),
+            resp(400, &partial_body(&[0])),
+            resp(400, &partial_body(&[0])),
+            ok(200),
+        ]);
+        let mut lg = logger_with(dir.path(), t.clone());
+
+        // All INFO => all in the LOW ring, in this physical order.
+        lg.log(Event::AppStart, Map::new()); // -1: poison, and the OLDEST line
+        lg.log(Event::AppStart, Map::new()); // -2: accepted
+        lg.log(Event::AppStart, Map::new()); // -3: accepted
+        assert_eq!(lg.pending(), 3);
+
+        let _ = lg.flush(); // attempt 1: -1 rejected, -2/-3 "accepted"
+
+        // The prefix cannot advance past the poison line, so nothing left the
+        // spool — and `pending` must say so.
+        assert_eq!(
+            uncommitted(dir.path()),
+            vec![
+                "lobby-01-1".to_string(),
+                "lobby-01-2".to_string(),
+                "lobby-01-3".to_string()
+            ],
+            "a leading poison line blocks the whole ring's commit prefix"
+        );
+        assert_eq!(
+            lg.pending(),
+            3,
+            "pending must count what is ACTUALLY still spooled: decrementing by \
+             accepted.len() here under-counts undelivered work and disarms the \
+             100-entry trigger"
+        );
+
+        // Once the poison is quarantined the prefix clears in one go.
+        let _ = lg.flush();
+        let _ = lg.flush();
+        assert_eq!(lg.dropped_rejected(), 1);
+        assert!(
+            uncommitted(dir.path()).is_empty(),
+            "quarantining the head unblocks the prefix for its mates"
+        );
+        assert_eq!(lg.pending(), 0, "and pending must land back at zero");
     }
 
     /// A transient rejection must NOT be treated as poison. A 429/5xx says the
@@ -1184,6 +1478,144 @@ mod tests {
         let t = FakeTransport::new(vec![ok(200)]);
         let lg = logger_with(dir.path(), t);
         assert_eq!(lg.pending(), 3, "the orphaned spool is undelivered work");
+    }
+
+    /// IMPORTANT-4, the case the 3-entry pinning test above structurally cannot
+    /// reach. `Logger::new` used to count the backlog with
+    /// `drain_batch(MAX_BATCH)`, capped at 100 — so a device that crashed with a
+    /// 40 MB spool reopened with `pending == 100`, the first flush drained exactly
+    /// those 100 and set `pending` to 0, and the entry trigger DISARMED. The
+    /// backlog then trickled out at one batch per 10 s tick while the ring kept
+    /// evicting entries that would never be sent.
+    #[test]
+    fn a_reopened_logger_drains_a_backlog_larger_than_max_batch_one_batch_per_tick() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // A previous process spooled 250 entries and died without delivering them.
+        {
+            let t = FakeTransport::new(vec![resp(500, "boom")]);
+            let mut lg = logger_with(dir.path(), t);
+            for _ in 0..250 {
+                lg.log(Event::AppStart, Map::new());
+            }
+            let _ = lg.flush();
+        }
+
+        let t = FakeTransport::new(vec![ok(200)]);
+        let mut lg = logger_with(dir.path(), t.clone());
+        assert_eq!(
+            lg.pending(),
+            250,
+            "the WHOLE orphaned backlog is undelivered work — capping the count at \
+             MAX_BATCH disarms the entry trigger after the first flush"
+        );
+
+        // Each tick must drain a full batch, because the trigger stays armed.
+        lg.tick();
+        assert_eq!(t.write_count(), 1);
+        assert_eq!(lg.pending(), 150);
+        lg.tick();
+        assert_eq!(
+            t.write_count(),
+            2,
+            "still >= 100 pending: flush immediately"
+        );
+        assert_eq!(lg.pending(), 50);
+        lg.tick(); // below the entry trigger now, but the 10 s timer has not run
+        assert_eq!(
+            t.write_count(),
+            2,
+            "under 100 pending and inside the interval: nothing more is due"
+        );
+
+        // And every one of the 250 really is accounted for.
+        let sent: usize = (0..t.write_count()).map(|n| t.insert_ids(n).len()).sum();
+        assert_eq!(sent, 200, "two full batches went out");
+        assert_eq!(
+            uncommitted(dir.path()).len(),
+            50,
+            "the remainder is spooled"
+        );
+    }
+
+    /// IMPORTANT-5. The suppressed count was the LAST loss counter in this
+    /// subsystem living only in RAM — `dropped_expired`, `dropped_rejected` and
+    /// `quarantined` are all durable, each with a test pinning it. A `nav.blocked`
+    /// redirect loop suppresses thousands of events; the watchdog kills the process
+    /// before the next `tick()` coalesces them; and the summary entry — the entire
+    /// point of rate-limiting rather than silently dropping — is never emitted. The
+    /// loss goes silent at exactly the moment it mattered.
+    #[test]
+    fn the_suppressed_count_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // The flood. nav.blocked: burst 20 => 20 admitted, 40 suppressed.
+        {
+            let t = FakeTransport::new(vec![ok(200)]);
+            let mut lg = logger_with(dir.path(), t.clone());
+            for _ in 0..60 {
+                lg.log(Event::NavBlocked, Map::new());
+            }
+            assert_eq!(lg.pending(), 20, "the cap must actually have bitten");
+            // The watchdog SIGKILLs the device HERE — before any tick() could
+            // coalesce the suppressions into a summary. No Drop hook saves us.
+            assert_eq!(t.write_count(), 0);
+        }
+
+        // The flood wrote its count to the SIDECAR, and never touched the retry
+        // budget. The separation is load-bearing: `suppress.json` is rewritten at
+        // flood rate WITHOUT an fsync (a SIGKILL is the threat, and the page cache
+        // beats it), whereas `reject.json` guards the poison-entry retry budget and
+        // must always fsync. Sharing one file would force one of those two to take
+        // the other's setting. See `SuppressState`.
+        let spool_dir = dir.path().join("spool");
+        assert!(
+            spool_dir.join(SUPPRESS_STATE_FILE).exists(),
+            "the suppressed count must be on disk before any tick(): {:?}",
+            std::fs::read_dir(&spool_dir).unwrap().collect::<Vec<_>>()
+        );
+        assert!(
+            !spool_dir.join(REJECT_STATE_FILE).exists(),
+            "a rate-limit flood must not rewrite the retry-budget file at all"
+        );
+
+        // Next boot. The summary must still be emitted.
+        let t = FakeTransport::new(vec![ok(200)]);
+        let mut lg = logger_with(dir.path(), t.clone());
+        lg.tick();
+        lg.flush().unwrap();
+
+        let entries = t.write_body(0)["entries"].as_array().unwrap().clone();
+        let summary = entries
+            .iter()
+            .find(|e| e["jsonPayload"]["suppressed_count"].is_number())
+            .expect(
+                "a flood the watchdog interrupted must STILL surface its coalesced \
+                 summary — a count that dies with the process makes the loss silent \
+                 exactly when it mattered",
+            );
+        assert_eq!(summary["jsonPayload"]["event"], "nav.blocked");
+        assert_eq!(
+            summary["jsonPayload"]["suppressed_count"], 40,
+            "and the count must be the real one, not a restarted zero"
+        );
+        assert_eq!(summary["jsonPayload"]["rate_limited"], Value::Bool(true));
+
+        // Drained, not repeated: a second boot must not re-emit it.
+        drop(lg);
+        let t2 = FakeTransport::new(vec![ok(200)]);
+        let mut lg = logger_with(dir.path(), t2.clone());
+        lg.log(Event::AppStop, Map::new()); // so there is a batch to inspect at all
+        lg.tick();
+        lg.flush().unwrap();
+        let again = t2.write_body(0)["entries"].as_array().unwrap().clone();
+        assert!(
+            !again
+                .iter()
+                .any(|e| e["jsonPayload"]["suppressed_count"].is_number()),
+            "the durable count is drained when it is coalesced, not re-emitted \
+             forever: {again:?}"
+        );
     }
 
     #[test]

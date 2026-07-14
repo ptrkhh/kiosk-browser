@@ -246,6 +246,41 @@ impl GclClient {
     /// silently discard it. An entry with no timestamp is sent without one -
     /// Logging then assigns receive time. An unparseable timestamp (which would
     /// poison the batch just as badly) is dropped to `None` for the same reason.
+    ///
+    /// # Two clauses of TEL-02 are deliberately NOT implemented
+    ///
+    /// Both are recorded here rather than silently skipped, so the next reader is
+    /// not misled into believing the spec is implemented as written.
+    ///
+    /// 1. **"An entry created before trusted time existed is rewritten once using
+    ///    the current offset and persisted."** Not done: a `None` timestamp stays
+    ///    `None` forever, so such an entry permanently falls back to Cloud
+    ///    Logging's server receive time.
+    ///
+    ///    Rewriting would mean back-dating an entry from an offset learned *after*
+    ///    it was written, which is a guess: the only thing we would actually know
+    ///    is the offset at *send* time, not the one that was true at *log* time,
+    ///    and the gap between them is exactly the unbounded interval in which the
+    ///    device had no clock. Server receive time is a real, monotone, honest
+    ///    bound (the entry was logged at or before it); a synthesised timestamp is
+    ///    a fiction that reads as fact. It would also make an entry's bytes — and
+    ///    therefore the spool line, which is written once and fsynced — mutable
+    ///    after the fact, for no gain over what the server already stamps.
+    ///
+    /// 2. **"Entries older than retention are dropped locally, incrementing
+    ///    `spool.dropped_expired`."** Not done: they are clamped UP to the
+    ///    retention floor and sent, so `dropped_expired` never counts age-expiry
+    ///    (it counts only the spool's own drop-oldest budget evictions).
+    ///
+    ///    An entry can only be older than 30 days if the device was offline for
+    ///    30 days — which is precisely the outage an operator most needs to see the
+    ///    telemetry for. Dropping it destroys the only evidence of the event;
+    ///    clamping it costs a timestamp that is wrong by however long the entry sat
+    ///    undelivered, while keeping the payload, the severity and the `insertId`.
+    ///    The entry's true time is recoverable anyway — it is embedded in the
+    ///    monotone `insertId` sequence and in the payload. Preferring a slightly
+    ///    wrong timestamp over no entry at all is the same trade the rest of this
+    ///    subsystem makes everywhere else.
     fn clamped(&self, entries: &[LogEntry]) -> Vec<LogEntry> {
         let Some(now) = self.clock.trusted_utc() else {
             // No trusted time: we have nothing to clamp against. (The token mint
@@ -469,7 +504,7 @@ mod tests {
         assert_eq!(sent.len(), 3, "every entry must be posted");
         let ids: Vec<&str> = sent
             .iter()
-            .map(|e| e.get("insert_id").unwrap().as_str().unwrap())
+            .map(|e| e.get("insertId").unwrap().as_str().unwrap())
             .collect();
         assert_eq!(ids, vec!["lobby-01-1", "lobby-01-2", "lobby-01-3"]);
     }
