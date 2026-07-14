@@ -11,6 +11,17 @@ ed25519-dalek = "2"
 base64 = "0.22"
 thiserror = "2"
 rust-ini = "0.21"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+sha2 = "0.10"
+url = "2"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+jsonwebtoken = "9"
 
 [dev-dependencies]
 tempfile = "3"
+# Test-only: the RSA keypair for the JWT tests is GENERATED at run time, never
+# committed. A `-----BEGIN PRIVATE KEY-----` in the repo is the highest-signal
+# pattern secret scanners hunt for, and a fixture PEM is silently swallowed by
+# the `*.pem` rule in .gitignore.
+rsa = { version = "0.9", features = ["pem"] }
+rand = "0.8"
