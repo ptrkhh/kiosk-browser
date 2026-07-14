@@ -26,6 +26,7 @@
 //! Layering (spec §4): no Tauri, no per-OS API.
 
 pub mod allowlist;
+pub mod scheme;
 
 pub use allowlist::Allowlist;
 
