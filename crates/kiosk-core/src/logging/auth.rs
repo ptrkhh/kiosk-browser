@@ -64,10 +64,11 @@ pub enum AuthError {
 }
 
 /// The token endpoint's body is attacker-influenceable and unbounded, and it
-/// ends up inside an error that will be logged. Two reasons to cap it: a hostile
-/// endpoint could inflate a log line arbitrarily, and a misconfigured
-/// `token_uri` pointing at a request-reflecting endpoint would echo our signed
-/// assertion JWT straight back into the error string - and thence into a log.
+/// ends up inside an error that will be logged. A hostile endpoint could inflate
+/// a log line arbitrarily, so it is capped.
+///
+/// Truncation alone is NOT the answer to the reflected-assertion threat - see
+/// [`sanitize_for_error`], which scrubs first.
 const MAX_ERROR_BODY_BYTES: usize = 256;
 
 fn truncate_for_error(body: &str) -> String {
@@ -80,6 +81,29 @@ fn truncate_for_error(body: &str) -> String {
         end -= 1;
     }
     format!("{}... [{} bytes truncated]", &body[..end], body.len() - end)
+}
+
+/// Prepares a token-endpoint-derived string for inclusion in an error: scrub the
+/// signed assertion, THEN truncate. The exact mirror of `client.rs`'s
+/// `sanitize_for_error`, which does the same for the bearer token.
+///
+/// A misconfigured `token_uri` pointing at a request-reflecting endpoint (a
+/// captive portal, a debug echo service, a middlebox) sends our POST body - which
+/// carries the RS256 assertion - straight back in its error body. That body goes
+/// verbatim into an `AuthError`, and an `AuthError` gets logged.
+///
+/// **Truncation is not redaction.** It bounded the leak only by the accident of
+/// `MAX_ERROR_BODY_BYTES < len(jwt)`, and what it left behind was the HEAD of the
+/// credential: the JOSE header and the front of the signed payload (which carries
+/// `iss` - the service-account email). Scrubbing first also means an assertion
+/// straddling the truncation boundary cannot be half-printed.
+fn sanitize_for_error(body: &str, assertion: &str) -> String {
+    // An empty needle would match everywhere; a signed JWT is never empty, but do
+    // not depend on that.
+    if assertion.is_empty() {
+        return truncate_for_error(body);
+    }
+    truncate_for_error(&body.replace(assertion, "<redacted-assertion-jwt>"))
 }
 
 /// A secret string (an RSA private key, a bearer token) that cannot be printed
@@ -267,16 +291,21 @@ impl TokenSource {
         if !(200..300).contains(&response.status) {
             return Err(AuthError::TokenEndpoint {
                 status: response.status,
-                body: truncate_for_error(&response.body),
+                // Scrub the assertion, THEN truncate: a reflecting endpoint echoes
+                // our signed JWT back to us, and truncation alone leaves its head
+                // in the error string. See `sanitize_for_error`.
+                body: sanitize_for_error(&response.body, &assertion),
             });
         }
 
-        // Truncated for the same reason as the error body below: serde echoes the
-        // OFFENDING value verbatim, so a 200 with a mistyped field (say a 100 KB
-        // string where `expires_in` should be) would otherwise inflate an error
-        // string - and thence a log line - without bound.
-        let parsed: TokenResponse = serde_json::from_str(&response.body)
-            .map_err(|e| AuthError::MalformedTokenResponse(truncate_for_error(&e.to_string())))?;
+        // Sanitized for both reasons at once: serde echoes the OFFENDING value
+        // verbatim, so a 200 whose body is a reflection of our own request can put
+        // the assertion into the serde error too - and a mistyped field (say a
+        // 100 KB string where `expires_in` should be) would inflate the error
+        // string, and thence a log line, without bound.
+        let parsed: TokenResponse = serde_json::from_str(&response.body).map_err(|e| {
+            AuthError::MalformedTokenResponse(sanitize_for_error(&e.to_string(), &assertion))
+        })?;
 
         // NEVER trust the endpoint's `expires_in`. The usable range is
         // (REFRESH_MARGIN_SECONDS, JWT_LIFETIME_SECONDS].
@@ -809,6 +838,93 @@ mod tests {
             rendered.len()
         );
         assert!(rendered.contains("truncated"));
+    }
+
+    /// THE reflected-secret case the truncation comment NAMES but truncation
+    /// does not solve. A misconfigured `token_uri` pointing at a
+    /// request-reflecting endpoint echoes the POST body — which carries our
+    /// signed RS256 assertion — straight back in its error body. Truncation cuts
+    /// it short only by accident of `256 < len(jwt)`, and only when the JWT sits
+    /// at the START of the echo; a reflector that prefixes anything at all leaks
+    /// the head of a signed credential into a log line.
+    ///
+    /// The fixture therefore ACTUALLY CONTAINS the assertion (the previous
+    /// oversized-body test used `"A".repeat(100_000)`, which cannot contain it,
+    /// so it could never catch this).
+    #[test]
+    fn a_reflected_assertion_jwt_is_scrubbed_from_the_error_not_merely_truncated() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// A transport that echoes the request body back inside its error body,
+        /// with a prefix — exactly what a reflecting endpoint does.
+        struct Reflector {
+            saw: AtomicBool,
+            body: Mutex<String>,
+            status: u16,
+        }
+        impl Transport for Reflector {
+            fn post(
+                &self,
+                _url: &str,
+                _headers: &[(&str, &str)],
+                body: &str,
+            ) -> Result<HttpResponse, TransportError> {
+                self.saw.store(true, Ordering::SeqCst);
+                *self.body.lock().unwrap() = body.to_string();
+                Ok(HttpResponse {
+                    status: self.status,
+                    headers: vec![],
+                    body: format!(
+                        "upstream rejected your request. echo of what you sent: {body} (end)"
+                    ),
+                })
+            }
+        }
+
+        // Both paths that put a response-derived string into an AuthError: the
+        // non-2xx body, and the serde error on a 200 (which quotes the input).
+        for status in [400u16, 200] {
+            let t = Arc::new(Reflector {
+                saw: AtomicBool::new(false),
+                body: Mutex::new(String::new()),
+                status,
+            });
+            let mut ts =
+                TokenSource::new(sa(), t.clone(), clock_at("Sun, 12 Jul 2026 08:30:00 GMT"));
+            let err = ts
+                .token()
+                .expect_err("a reflecting endpoint is never a success");
+            assert!(t.saw.load(Ordering::SeqCst));
+
+            let sent = t.body.lock().unwrap().clone();
+            let assertion = sent.split("assertion=").nth(1).unwrap().to_string();
+            assert!(
+                assertion.len() > 300 && assertion.matches('.').count() == 2,
+                "the fixture must really carry a signed JWT, or this test is vacuous: {assertion}"
+            );
+            // NOTE the granularity. Asserting only `!contains(&assertion)` would
+            // be VACUOUS: `truncate_for_error` caps at 256 bytes and the JWT is
+            // ~600, so the WHOLE assertion can never appear no matter what — such
+            // an assertion passes against the unscrubbed code and proves nothing.
+            // What truncation actually leaves behind is the HEAD of the credential
+            // (JOSE header + most of the signed payload). So we assert that no
+            // recognisable RUN of the assertion survives.
+            for rendered in [err.to_string(), format!("{err:?}")] {
+                for (i, chunk) in assertion
+                    .as_bytes()
+                    .chunks(48)
+                    .enumerate()
+                    .filter(|(_, c)| c.len() == 48)
+                {
+                    let chunk = std::str::from_utf8(chunk).expect("base64url is ascii");
+                    assert!(
+                        !rendered.contains(chunk),
+                        "HTTP {status}: 48 bytes of the signed assertion (chunk {i}) reached the \
+                         error string — truncation is not redaction. Rendered: {rendered}"
+                    );
+                }
+            }
+        }
     }
 
     /// The same unbounded-log-line vector through a different variant: a 200

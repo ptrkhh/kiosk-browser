@@ -58,9 +58,24 @@ pub struct ReqwestTransport {
 }
 
 impl ReqwestTransport {
+    /// **Redirects are refused, not followed.**
+    ///
+    /// reqwest follows up to 10 redirects by default, and it will carry our
+    /// `Authorization: Bearer ...` header along. Neither endpoint this transport
+    /// ever talks to (`oauth2.googleapis.com/token`,
+    /// `logging.googleapis.com/v2/entries:write`) legitimately redirects — so a
+    /// 302 can only come from something that has got in the way. This subsystem's
+    /// threat model ALREADY assumes that is possible: it is the entire reason
+    /// `client.rs::sanitize_for_error` and `auth.rs::sanitize_for_error` exist. A
+    /// middlebox that can 302 us can otherwise redirect the token-bearing POST to
+    /// a host of its choosing, and the secret leaves the device.
+    ///
+    /// With `Policy::none()` a 3xx is just an ordinary non-2xx `HttpResponse`, and
+    /// the callers already back off on those.
     pub fn new(timeout: Duration) -> Result<Self, TransportError> {
         let client = reqwest::blocking::Client::builder()
             .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| TransportError::Setup(e.to_string()))?;
         Ok(Self { client })
