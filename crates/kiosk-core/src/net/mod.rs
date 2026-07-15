@@ -8,4 +8,5 @@
 //! `std`/`url` logic — no sockets, no DNS resolution, no HTTP client. The actual probe
 //! GET and its timer live in `kiosk-main`; this module only decides *which URL* to GET.
 
+pub mod prober;
 pub mod reach;
