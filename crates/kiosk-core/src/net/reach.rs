@@ -275,6 +275,25 @@ mod tests {
     }
 
     #[test]
+    fn the_local_rule_is_suffix_anchored_not_a_substring_match() {
+        // The `.local` rule matches the mDNS SUFFIX, not the substring "local" anywhere in
+        // the host. Each of these is a multi-label PUBLIC host that merely contains the
+        // letters "local" — none ends in the `.local` label, so none is private. This is
+        // the guard against a future `ends_with(".local")` → `contains("local")`
+        // "simplification": that mutation would misclassify `local.evil.com` (an
+        // attacker-controlled public host) as private, and only this test would catch it.
+        for host in [
+            "local.evil.com",       // "local" is the FIRST label, not the suffix
+            "notlocal.example.com", // "local" is a substring of the first label
+            "mylocal.example.com",  // same shape, different prefix
+            "local.com",            // "local" is the registrable label, suffix is ".com"
+            "thelocalpub.co.uk",    // "local" buried mid-label
+        ] {
+            assert!(!is_private_host(host), "{host} must be public");
+        }
+    }
+
+    #[test]
     fn single_label_hostname_is_private() {
         // No dot at all: can only ever resolve via an internal/split-horizon resolver.
         for host in ["kiosk-server", "intranet", "monitor01"] {
