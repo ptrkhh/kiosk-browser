@@ -6,6 +6,8 @@ pub mod config;
 pub mod error;
 pub mod identity;
 pub mod logging;
+pub mod nav;
+pub mod net;
 
 /// The crate/product version, sourced from Cargo. Later plans extend this
 /// with the git sha for telemetry labels (spec §6 TEL-04).

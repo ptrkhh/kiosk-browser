@@ -240,7 +240,10 @@ ErrorPage(retry countdown)
 - Connectivity prober: HTTP GET to `connectivity_check_url` (default
   `https://www.gstatic.com/generate_204`), every 10 s while offline, 30 s while
   online. Two consecutive successes flip online; two failures flip offline (damping —
-  no flapping between video and site). Captive portals fail the 204 check correctly.
+  no flapping between video and site). On cold start there is no prior state to flap
+  from, so the very first probe outcome sets the initial state immediately (one success
+  → online; one failure → stays offline); the two-consecutive rule governs every
+  transition after that. Captive portals fail the 204 check correctly.
 - **Reachability scope (arch-13).** `connectivity_check_url` MUST sit on the same
   network path as `content.url` — the prober measures reachability of *that* URL, not
   general internet access. On intranet/air-gapped deployments the public default reads
@@ -591,7 +594,7 @@ are not accepted. The `jsonc` block above is annotated documentation; ship a com
   `generate_204` every 10–30 s; its `Date` response header is an authoritative UTC clock
   (verified live; RFC 9110 §6.6.1 mandates it), as are the OAuth and `entries:write`
   responses. `kiosk-core` maintains `time_offset = server_Date − local_clock`, refreshed
-  on each prober success; `trusted_UTC = local + offset`. JWT `iat`/`exp` and entry
+  on each prober response (success or failure); `trusted_UTC = local + offset`. JWT `iat`/`exp` and entry
   timestamps use `trusted_UTC`, so a dead-CMOS/skewed device still mints tokens when NTP
   (UDP/123) is blocked on a 443-only kiosk LAN. When `|offset|` exceeds ~30 s (the JWT
   tolerance) emit `clock.skew` (WARNING). NTP stays the documented primary; this is the
