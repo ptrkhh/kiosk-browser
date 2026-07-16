@@ -114,7 +114,18 @@ pub fn resolve_probe_url(configured: &str, home_url: &str) -> String {
     // `scheme://host[:port]`, port omitted when it is the scheme's default, IPv6 hosts
     // bracketed. Exactly the `scheme://host[:port]` form this function's contract
     // promises, and it is battle-tested URL-syntax handling rather than hand-rolled.
-    home.origin().ascii_serialization()
+    let origin = home.origin().ascii_serialization();
+
+    // A non-special scheme (`foo://10.0.0.5/x`) has an **opaque** origin, which serializes
+    // to the literal string `"null"` — not a URL the prober could ever GET. The private-host
+    // check above can still pass for such a home (its host parses as a private IP/name), so
+    // we must guard here: fall back to `configured` verbatim rather than hand the prober
+    // `"null"`. http/https homes — the only realistic `content.url` values — always have a
+    // tuple origin and never reach this branch.
+    if origin == "null" {
+        return configured.to_string();
+    }
+    origin
 }
 
 /// IP-literal classification backing rule 1 of [`is_private_host`].
@@ -414,5 +425,35 @@ mod tests {
         assert_eq!(parsed.host_str(), None, "premise");
         let resolved = resolve_probe_url(DEFAULT_CONNECTIVITY_CHECK_URL, home);
         assert_eq!(resolved, DEFAULT_CONNECTIVITY_CHECK_URL);
+    }
+
+    #[test]
+    fn a_non_special_scheme_home_with_a_private_host_keeps_configured_not_null() {
+        // A non-special scheme HAS a host (so is_private_host can pass) but an OPAQUE origin,
+        // which serializes to the literal string "null". resolve_probe_url must fall back to
+        // `configured` rather than hand the prober "null".
+        let home = "foo://10.0.0.5/x";
+        let parsed = Url::parse(home).expect("parses");
+        // Premise: it has a host, that host IS classified private, and its origin is opaque.
+        assert_eq!(
+            parsed.host_str(),
+            Some("10.0.0.5"),
+            "premise: non-special scheme still has a host"
+        );
+        assert!(
+            is_private_host(parsed.host_str().unwrap()),
+            "premise: 10.0.0.5 is private, so we reach the origin-serialization path"
+        );
+        assert_eq!(
+            parsed.origin().ascii_serialization(),
+            "null",
+            "premise: an opaque origin serializes to \"null\""
+        );
+
+        let resolved = resolve_probe_url(DEFAULT_CONNECTIVITY_CHECK_URL, home);
+        assert_eq!(
+            resolved, DEFAULT_CONNECTIVITY_CHECK_URL,
+            "must fall back to configured, never emit \"null\""
+        );
     }
 }

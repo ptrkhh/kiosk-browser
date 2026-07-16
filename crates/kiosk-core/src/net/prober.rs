@@ -100,6 +100,10 @@ enum Damping {
 }
 
 /// The damped connectivity prober state machine. See the module docs for the rules.
+///
+/// `Debug` is derived so P1-D can log a `Prober` in a panic hook / health sample; every
+/// field is already `Debug` ([`TrustedClock`], [`Link`], [`Damping`]).
+#[derive(Debug)]
 pub struct Prober {
     clock: TrustedClock,
     link: Link,
@@ -273,6 +277,39 @@ mod tests {
             p.link(),
             Link::Online,
             "still Online after a single failure"
+        );
+    }
+
+    #[test]
+    fn from_cold_a_single_success_after_a_failure_does_not_flip() {
+        // The mirror of `from_online_a_single_failure_does_not_flip`, on the offline side.
+        // A cold failure leaves the link Offline in a `Run { reachable: false, count: 1 }`
+        // state; a lone success then only STARTS a fresh success run — it must not flip
+        // Online on its own. Two consecutive successes are required to flip up, exactly as
+        // two consecutive failures are required to flip down.
+        let mut p = new_prober();
+        let cold = p.record(outcome(false)); // cold failure
+        assert_eq!(
+            cold, None,
+            "already Offline, so a cold failure is not a flip"
+        );
+        assert_eq!(
+            p.link(),
+            Link::Offline,
+            "premise: Offline after a cold failure"
+        );
+
+        let flip = p.record(outcome(true));
+
+        assert_eq!(
+            flip, None,
+            "ONE success out of a cold Offline must NOT flip -- it only starts a fresh \
+             success run; two consecutive successes are needed to flip Online"
+        );
+        assert_eq!(
+            p.link(),
+            Link::Offline,
+            "still Offline after a single success"
         );
     }
 
