@@ -269,7 +269,11 @@ mod tests {
             "ONE failure from Online must NOT flip -- this is the damping \
              property a naive (undamped) implementation gets wrong"
         );
-        assert_eq!(p.link(), Link::Online, "still Online after a single failure");
+        assert_eq!(
+            p.link(),
+            Link::Online,
+            "still Online after a single failure"
+        );
     }
 
     #[test]
@@ -433,7 +437,11 @@ mod tests {
         let clock = TrustedClock::new();
         let mut p = Prober::new(clock.clone());
         p.record(outcome(true)); // -> Online, clock still unset
-        assert_eq!(clock.offset_seconds(), None, "premise: no valid Date observed yet");
+        assert_eq!(
+            clock.offset_seconds(),
+            None,
+            "premise: no valid Date observed yet"
+        );
 
         // A single failure carrying a garbage Date: must not panic, must not
         // establish the clock, and -- being a LONE failure from Online -- must not
