@@ -212,15 +212,71 @@ impl Machine {
             },
 
             // Rule 5: the site failed while the link is up and `fallback` is video → offline
-            // video. `fallback = error_page` (rule 6) is Task 2 and falls through to the
-            // no-op below — so this arm genuinely branches on `fallback`.
+            // video. Paired with the rule-6 ErrorPage arm just below, the two `fallback` guards
+            // are exhaustive over `(Online, NavigationFailed)` — so this arm genuinely branches
+            // on `fallback`.
             (Online { .. }, NavigationFailed) if self.cfg.fallback == Fallback::Video => {
                 self.go_offline()
             }
 
-            // Rule 8 + the Task 2/3 seam: a LinkChanged to the link we are already in is a
-            // no-op (the prober already damped it), and every other unmatched pair is a
-            // no-op for now.
+            // Rule 6 (ErrorPage entry): the site failed while the link is up and `fallback` is
+            // error_page → show the bundled error page and arm the retry countdown. `attempts`
+            // starts at 1 because this triggering failure IS failed-load #1 (see the
+            // [`AppState::ErrorPage`] doc). The retry itself is modelled as an effect delivered
+            // on the next `CountdownExpired` (see the module docs), not emitted here.
+            (Online { .. }, NavigationFailed) if self.cfg.fallback == Fallback::ErrorPage => {
+                self.state = ErrorPage { attempts: 1 };
+                vec![Effect::ShowErrorPage {
+                    retry_after_seconds: self.cfg.error_retry_seconds,
+                }]
+            }
+
+            // Rule 7 (retry fired): the countdown elapsed → re-navigate the remembered home and
+            // STAY in ErrorPage with `attempts` unchanged; the outcome arrives later as
+            // `NavigationCommitted`/`NavigationFailed` (retry-as-effect, see the module docs).
+            // `home` is always `Some` here — ErrorPage is only reachable from `Online`, which
+            // requires config — but the machine stays total: no home → nothing to navigate.
+            (ErrorPage { .. }, CountdownExpired) => match self.home.clone() {
+                Some(url) => vec![Effect::Navigate(url)],
+                None => Vec::new(),
+            },
+
+            // Rule 7 (retry succeeded): the retry navigation committed → back to `Online`. Set
+            // the state DIRECTLY (not via `go_online`) with NO effect: the webview already
+            // navigated on `CountdownExpired` and has now committed, so emitting another
+            // `Navigate` would loop it. `home` is the committed url by construction.
+            (ErrorPage { .. }, NavigationCommitted) => match self.home.clone() {
+                Some(url) => {
+                    self.state = Online { url };
+                    Vec::new()
+                }
+                None => Vec::new(),
+            },
+
+            // Rule 7 (retry failed): another failed load → count it. `n` is the running count of
+            // consecutive failed loads. At `n >= error_max_retries` we give up to the offline
+            // video; below it we re-arm the countdown for another try. The comparison is `>=`
+            // (not `>`): with error_max_retries = 5 the 5th failed load falls to Offline, not
+            // the 6th — a `>` here is a kiosk that retries one time too many.
+            (ErrorPage { attempts }, NavigationFailed) => {
+                let n = attempts + 1;
+                if n >= self.cfg.error_max_retries {
+                    self.go_offline()
+                } else {
+                    self.state = ErrorPage { attempts: n };
+                    vec![Effect::ShowErrorPage {
+                        retry_after_seconds: self.cfg.error_retry_seconds,
+                    }]
+                }
+            }
+
+            // Rule 7 (prober flips offline): the link dropped while on the error page → straight
+            // to the offline video, regardless of remaining retries (spec §3.3: immediate).
+            // Mirrors the rule-3 `Online` arm.
+            (ErrorPage { .. }, LinkChanged(Link::Offline)) => self.go_offline(),
+
+            // Rule 8 + the Task 3 seam: a LinkChanged to the link we are already in is a no-op
+            // (the prober already damped it), and every other unmatched pair is a no-op for now.
             _ => Vec::new(),
         }
     }
@@ -556,5 +612,175 @@ mod tests {
             vec![Effect::Navigate(HOME2.to_string())],
             "reconnect must use the url from the LAST applied config, not the stale original"
         );
+    }
+
+    // ---- Task 2: the ErrorPage retry sub-machine (rules 6, 7) ----
+
+    // Rule 6 (entry) — Online + NavigationFailed with fallback=error_page → ErrorPage{1} +
+    // ShowErrorPage. `attempts` starts at 1 because the triggering failure IS failed-load #1
+    // (see `AppState::ErrorPage`'s doc). The carried retry length is pinned to the configured
+    // value (not just the effect variant), which kills a hardcoded number.
+    #[test]
+    fn online_nav_failed_errorpage_fallback_enters_errorpage() {
+        let mut m = online(Fallback::ErrorPage);
+
+        let fx = m.on(Event::NavigationFailed);
+
+        assert_eq!(
+            fx,
+            vec![Effect::ShowErrorPage {
+                retry_after_seconds: DEFAULT_ERROR_RETRY_SECONDS
+            }],
+            "fallback=error_page: a site failure shows the bundled error page, armed with the \
+             configured retry length"
+        );
+        assert_eq!(
+            m.state(),
+            &AppState::ErrorPage { attempts: 1 },
+            "the triggering failure is failed-load #1, so attempts starts at 1"
+        );
+    }
+
+    // Rule 7 (retry OK) — entry → CountdownExpired re-navigates the remembered home and STAYS
+    // in ErrorPage with attempts unchanged (the retry is in flight) → NavigationCommitted
+    // lands Online with NO further effect. The webview already navigated on CountdownExpired,
+    // so a second Navigate here would loop it (see the module docs' retry-as-effect model).
+    #[test]
+    fn errorpage_retry_commit_returns_online_without_renavigating() {
+        let mut m = online(Fallback::ErrorPage);
+        m.on(Event::NavigationFailed); // -> ErrorPage{1}
+
+        let retry = m.on(Event::CountdownExpired);
+        assert_eq!(
+            retry,
+            vec![Effect::Navigate(HOME.to_string())],
+            "the countdown fires the retry navigation to the remembered home"
+        );
+        assert_eq!(
+            m.state(),
+            &AppState::ErrorPage { attempts: 1 },
+            "the retry is in flight: stay in ErrorPage with attempts unchanged until the result"
+        );
+
+        let committed = m.on(Event::NavigationCommitted);
+        assert!(
+            committed.is_empty(),
+            "the retry already navigated on CountdownExpired; committing must NOT emit another \
+             Navigate (that would loop the webview)"
+        );
+        assert_eq!(
+            m.state(),
+            &AppState::Online {
+                url: HOME.to_string()
+            },
+            "a committed retry returns to Online on the remembered home"
+        );
+    }
+
+    // Rule 7 (retry fails, below the cap) — entry → CountdownExpired → NavigationFailed re-arms
+    // the error page as ErrorPage{2} + ShowErrorPage (attempts incremented, countdown re-armed).
+    #[test]
+    fn errorpage_retry_failure_rearms_and_increments() {
+        let mut m = online(Fallback::ErrorPage);
+        m.on(Event::NavigationFailed); // -> ErrorPage{1}
+        m.on(Event::CountdownExpired); // retry navigation in flight
+
+        let fx = m.on(Event::NavigationFailed);
+
+        assert_eq!(
+            fx,
+            vec![Effect::ShowErrorPage {
+                retry_after_seconds: DEFAULT_ERROR_RETRY_SECONDS
+            }],
+            "a failed retry below the cap re-arms the error-page countdown"
+        );
+        assert_eq!(
+            m.state(),
+            &AppState::ErrorPage { attempts: 2 },
+            "a failed retry increments the consecutive-failure count"
+        );
+    }
+
+    // Rule 7 (THE boundary that matters) — with error_max_retries = 5, the first FOUR failed
+    // loads keep retrying on the error page (ErrorPage{1..=4}) and the FIFTH gives up to
+    // Offline + ShowVideo. This one test pins BOTH load-bearing facts:
+    //   * the comparison is `>=`, not `>`: a `>` mutation keeps the 5th on ErrorPage{5} and
+    //     only gives up on a 6th failure (a kiosk that retries one time too many) → the
+    //     Offline/ShowVideo assertions go RED;
+    //   * the entry value is 1, not 0: an entry of 0 shifts the whole ladder down one, so the
+    //     4th failed load would read ErrorPage{3} and the 5th would still be ErrorPage{4} →
+    //     the ErrorPage{4}/Offline assertions go RED.
+    #[test]
+    fn errorpage_gives_up_to_offline_on_the_fifth_failed_load() {
+        let mut m = online(Fallback::ErrorPage);
+
+        // Failed load #1 (the entry): Online + NavigationFailed -> ErrorPage{1}.
+        m.on(Event::NavigationFailed);
+        assert_eq!(
+            m.state(),
+            &AppState::ErrorPage { attempts: 1 },
+            "entry lands ErrorPage{{1}} (kills entry==0)"
+        );
+
+        // Failed loads #2, #3, #4: each retry (CountdownExpired) then fails, re-arming the page.
+        for expected in 2..=4 {
+            m.on(Event::CountdownExpired); // retry navigation in flight
+            let fx = m.on(Event::NavigationFailed);
+            assert_eq!(
+                fx,
+                vec![Effect::ShowErrorPage {
+                    retry_after_seconds: DEFAULT_ERROR_RETRY_SECONDS
+                }],
+                "a failed load below the cap re-arms the error page"
+            );
+            assert_eq!(
+                m.state(),
+                &AppState::ErrorPage { attempts: expected },
+                "still retrying below the cap"
+            );
+        }
+        // After the 4th failed load we are on ErrorPage{4}, NOT Offline.
+        assert_eq!(
+            m.state(),
+            &AppState::ErrorPage { attempts: 4 },
+            "the 4th failed load must still be retrying (ErrorPage{{4}}), not given up"
+        );
+
+        // Failed load #5: the retry fails again -> n = 5, 5 >= 5 -> give up to the offline video.
+        m.on(Event::CountdownExpired); // 5th retry navigation in flight
+        let fx = m.on(Event::NavigationFailed);
+        assert_eq!(
+            fx,
+            vec![Effect::ShowVideo],
+            "the 5th failed load hits error_max_retries and falls to the offline video"
+        );
+        assert_eq!(
+            m.state(),
+            &AppState::Offline,
+            "at error_max_retries the kiosk gives up to Offline"
+        );
+    }
+
+    // Rule 7 (prober flips offline) — a link drop while on the error page goes straight to the
+    // offline video, regardless of how many retries remain (spec §3.3: immediate). Mirrors the
+    // rule-3 Online arm.
+    #[test]
+    fn errorpage_link_offline_shows_video_immediately() {
+        let mut m = online(Fallback::ErrorPage);
+        m.on(Event::NavigationFailed); // -> ErrorPage{1}
+        assert_eq!(
+            m.state(),
+            &AppState::ErrorPage { attempts: 1 },
+            "premise: on the error page"
+        );
+
+        let fx = m.on(Event::LinkChanged(Link::Offline));
+
+        assert_eq!(
+            fx,
+            vec![Effect::ShowVideo],
+            "a link drop on the error page falls to the offline video immediately"
+        );
+        assert_eq!(m.state(), &AppState::Offline);
     }
 }
