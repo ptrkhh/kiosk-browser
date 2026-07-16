@@ -174,10 +174,26 @@ impl Machine {
             // showing the site → navigate there. `Boot`/`ConfigLoad` are the first-config
             // paths; `Offline` is the recovery path (the no-config boot of rule 2, or a
             // refetch after going Offline) — without it a kiosk that booted with no config
-            // would be stuck on the video forever. `Online + ConfigApplied` is deliberately
-            // NOT here: re-navigating on every 300 s config poll would reload the live page
-            // and lose scroll/form state; change-detection there is a later task's concern.
+            // would be stuck on the video forever. (`Online + ConfigApplied` is the next
+            // arm: it navigates only when the url actually changed.)
             (Boot | ConfigLoad | Offline, ConfigApplied { url }) => self.go_online(url),
+
+            // RT-04 / OD-6 (applied this revision): a config applied while Online that
+            // CHANGES `content.url` must navigate to the new url; the same url re-applied
+            // (the every-300s poll) must NOT reload the live page. `home` is the current
+            // url by the `go_online` invariant, so the equality check gates whether we
+            // navigate — and `go_online` refreshes `home` so a later rule-4 reconnect uses
+            // the new url, never the stale one. (The revert-on-failure half of RT-04 —
+            // fall back to config-lastgood when the post-change load fails while the link is
+            // up — needs the ConfigManager + connectivity signal + telemetry and is P1-D2's;
+            // see the report's handoff note.)
+            (Online { .. }, ConfigApplied { url }) => {
+                if self.home.as_deref() == Some(url.as_str()) {
+                    Vec::new()
+                } else {
+                    self.go_online(url)
+                }
+            }
 
             // Rule 2: no cached config + no network → offline video, and keep probing.
             (Boot | ConfigLoad, ConfigUnavailable) => self.go_offline(),
@@ -464,6 +480,81 @@ mod tests {
             &AppState::Online {
                 url: HOME2.to_string()
             }
+        );
+    }
+
+    // RT-04 / OD-6 — reload-avoidance: a config re-applied with the SAME url while Online
+    // must NOT re-navigate (that is the every-300s-poll case). Goes RED against a table that
+    // re-navigates on every ConfigApplied.
+    #[test]
+    fn online_config_applied_same_url_is_a_noop() {
+        let mut m = online(Fallback::Video); // Online { HOME }, home = HOME
+
+        let fx = m.on(Event::ConfigApplied {
+            url: HOME.to_string(),
+        });
+
+        assert!(
+            fx.is_empty(),
+            "the SAME url re-applied while Online must not reload the live page"
+        );
+        assert_eq!(
+            m.state(),
+            &AppState::Online {
+                url: HOME.to_string()
+            },
+            "state unchanged when the url did not change"
+        );
+    }
+
+    // RT-04 / OD-6 — the url-change gap: an applied config that CHANGES content.url while
+    // Online must navigate to the new url and refresh home. Goes RED against HEAD's
+    // always-ignore behaviour (deviation D2), which is the whole point of this fix.
+    #[test]
+    fn online_config_applied_changed_url_navigates() {
+        let mut m = online(Fallback::Video); // Online { HOME }, home = HOME
+
+        let fx = m.on(Event::ConfigApplied {
+            url: HOME2.to_string(),
+        });
+
+        assert_eq!(
+            fx,
+            vec![Effect::Navigate(HOME2.to_string())],
+            "a changed content.url while Online must navigate to it (RT-04)"
+        );
+        assert_eq!(
+            m.state(),
+            &AppState::Online {
+                url: HOME2.to_string()
+            }
+        );
+    }
+
+    // RT-04 — the changed url must also refresh `home`, so a later reconnect re-navigates
+    // the NEW url, never the stale one. Goes RED against an impl that ignored the Online
+    // ConfigApplied (home would stay stale and reconnect would navigate the old url).
+    #[test]
+    fn changed_url_while_online_refreshes_home_for_reconnect() {
+        let mut m = online(Fallback::Video); // Online { HOME }, home = HOME
+        m.on(Event::ConfigApplied {
+            url: HOME2.to_string(),
+        }); // url changed -> navigate HOME2, home = HOME2
+        assert_eq!(
+            m.state(),
+            &AppState::Online {
+                url: HOME2.to_string()
+            },
+            "premise: navigated to the changed url"
+        );
+
+        m.on(Event::LinkChanged(Link::Offline)); // -> Offline
+        let back = m.on(Event::LinkChanged(Link::Online));
+
+        assert_eq!(
+            back,
+            vec![Effect::Navigate(HOME2.to_string())],
+            "reconnect must use the url from the LAST applied config, not the stale original"
         );
     }
 }
