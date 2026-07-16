@@ -2,6 +2,7 @@
 //! identity. This crate must never depend on Tauri or any per-OS API
 //! (spec §4 layering rule).
 
+pub mod app;
 pub mod config;
 pub mod error;
 pub mod identity;
