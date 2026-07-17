@@ -275,6 +275,51 @@ impl Machine {
             // Mirrors the rule-3 `Online` arm.
             (ErrorPage { .. }, LinkChanged(Link::Offline)) => self.go_offline(),
 
+            // Rule 9 (idle reset, THE PRIVACY GATE, spec §3.5): the idle timer fired while
+            // Online and clear_data_on_reset is set → clear the FULL profile and GATE re-display
+            // behind `Clearing` until the async clear reports back via `ProfileCleared`. We emit
+            // ONLY `ClearProfile` here — NO `Navigate`. Emitting a navigate now would display the
+            // fresh home over un-cleared session data, the exact leak §3.5 exists to prevent; the
+            // re-navigation is deferred to the `ProfileCleared` arm below. `home` is always `Some`
+            // (Online implies config applied), but the machine stays total: no home → no-op.
+            (Online { .. }, IdleExpired) if self.cfg.idle_clear => match self.home.clone() {
+                Some(url) => {
+                    self.state = Clearing {
+                        next: Box::new(Online { url }),
+                    };
+                    vec![Effect::ClearProfile { full: true }]
+                }
+                None => Vec::new(),
+            },
+
+            // Rule 9 (idle reset, no-clear path): the idle timer fired while Online and
+            // clear_data_on_reset is NOT set → just reload home fresh, no clear, no gating.
+            (Online { .. }, IdleExpired) => match self.home.clone() {
+                Some(url) => self.go_online(url),
+                None => Vec::new(),
+            },
+
+            // Rule 9 (clear completed): the async profile clear reported back → release the gate
+            // and resume into the target `next` recorded when we entered `Clearing`. Clone the
+            // boxed target into a local FIRST to release the borrow into `self.state`, then honor
+            // it: an `Online` target navigates home NOW (over the freshly cleared profile); any
+            // other target is set without effect (unreachable in T3, keeps the machine total).
+            (Clearing { next }, ProfileCleared) => {
+                let resume = (**next).clone();
+                match resume {
+                    Online { url } => self.go_online(url),
+                    other => {
+                        self.state = other;
+                        Vec::new()
+                    }
+                }
+            }
+
+            // Rule 10 (reconnect): network returned while Offline → kick a config refetch and
+            // STAY Offline. The resulting `ConfigApplied` drives the nav via the Offline+
+            // ConfigApplied arm above; navigating here would race that fetch on a stale home.
+            (Offline, Reconnected) => vec![Effect::RefetchConfig],
+
             // Rule 8 + the Task 3 seam: a LinkChanged to the link we are already in is a no-op
             // (the prober already damped it), and every other unmatched pair is a no-op for now.
             _ => Vec::new(),
@@ -312,6 +357,14 @@ mod tests {
             error_max_retries: 5,
             idle_clear: true,
             error_retry_seconds: DEFAULT_ERROR_RETRY_SECONDS,
+        }
+    }
+
+    /// Same as [`cfg`] but with `idle_clear: false` — the no-clear idle-reset path (Task 3).
+    fn cfg_no_clear(fallback: Fallback) -> MachineConfig {
+        MachineConfig {
+            idle_clear: false,
+            ..cfg(fallback)
         }
     }
 
@@ -782,5 +835,189 @@ mod tests {
             "a link drop on the error page falls to the offline video immediately"
         );
         assert_eq!(m.state(), &AppState::Offline);
+    }
+
+    // ---- Task 3: idle-reset gating + reconnect (rules 9, 10) ----
+
+    // Rule 9 (THE PRIVACY GATE, spec §3.5) — Online + IdleExpired with clear_data_on_reset=true
+    // must ONLY emit ClearProfile{full:true} and gate re-display behind Clearing{Online{HOME}}.
+    // It must NOT emit any Navigate here: navigating home before the clear completes would
+    // display the fresh session over un-cleared data — the exact leak §3.5 exists to prevent.
+    #[test]
+    fn idle_reset_with_clear_gates_display_behind_clearprofile() {
+        let mut m = online(Fallback::Video); // idle_clear = true
+
+        let fx = m.on(Event::IdleExpired);
+
+        assert_eq!(
+            fx,
+            vec![Effect::ClearProfile { full: true }],
+            "idle reset with clear must emit ONLY the full profile clear"
+        );
+        assert!(
+            !fx.iter().any(|e| matches!(e, Effect::Navigate(_))),
+            "the privacy gate: NO Navigate may be emitted before the clear completes"
+        );
+        assert_eq!(
+            m.state(),
+            &AppState::Clearing {
+                next: Box::new(AppState::Online {
+                    url: HOME.to_string()
+                })
+            },
+            "re-display is gated: the machine parks in Clearing until ProfileCleared"
+        );
+    }
+
+    // Rule 9 (the gate HOLDS) — while Clearing, an event that would normally show content must
+    // NOT re-display. Kills a mutation that lets a stray event navigate before the clear lands.
+    #[test]
+    fn clearing_does_not_redisplay_on_a_stray_event() {
+        let mut m = online(Fallback::Video);
+        m.on(Event::IdleExpired); // -> Clearing{Online{HOME}}
+        let gated = AppState::Clearing {
+            next: Box::new(AppState::Online {
+                url: HOME.to_string(),
+            }),
+        };
+        assert_eq!(m.state(), &gated, "premise: gated in Clearing");
+
+        // A LinkChanged(Online) would normally show content; a second IdleExpired might re-fire.
+        let a = m.on(Event::LinkChanged(Link::Online));
+        assert!(
+            !a.iter().any(|e| matches!(e, Effect::Navigate(_))),
+            "no Navigate may escape the gate while Clearing"
+        );
+        assert_eq!(
+            m.state(),
+            &gated,
+            "state stays Clearing under a stray LinkChanged"
+        );
+
+        let b = m.on(Event::IdleExpired);
+        assert!(
+            !b.iter().any(|e| matches!(e, Effect::Navigate(_))),
+            "no Navigate may escape the gate on a repeated IdleExpired"
+        );
+        assert_eq!(
+            m.state(),
+            &gated,
+            "state stays Clearing under a repeated IdleExpired"
+        );
+    }
+
+    // Rule 9 (resume) — ProfileCleared releases the gate: NOW navigate home over the cleared
+    // profile and return to Online.
+    #[test]
+    fn profile_cleared_resumes_gated_target_online() {
+        let mut m = online(Fallback::Video);
+        m.on(Event::IdleExpired); // -> Clearing{Online{HOME}}
+
+        let fx = m.on(Event::ProfileCleared);
+
+        assert_eq!(
+            fx,
+            vec![Effect::Navigate(HOME.to_string())],
+            "the clear finished: NOW navigate home over the cleared profile"
+        );
+        assert_eq!(
+            m.state(),
+            &AppState::Online {
+                url: HOME.to_string()
+            },
+            "resume into the gated target"
+        );
+    }
+
+    // Rule 9 (no-clear path) — Online + IdleExpired with clear_data_on_reset=false reloads home
+    // directly: Navigate + Online, with NO ClearProfile and without ever entering Clearing.
+    #[test]
+    fn idle_reset_without_clear_reloads_home_directly() {
+        let mut m = Machine::new(cfg_no_clear(Fallback::Video));
+        m.on(Event::ConfigApplied {
+            url: HOME.to_string(),
+        });
+        assert_eq!(
+            m.state(),
+            &AppState::Online {
+                url: HOME.to_string()
+            },
+            "premise: online"
+        );
+
+        let fx = m.on(Event::IdleExpired);
+
+        assert_eq!(
+            fx,
+            vec![Effect::Navigate(HOME.to_string())],
+            "no-clear idle reset reloads home fresh, directly"
+        );
+        assert!(
+            !fx.iter().any(|e| matches!(e, Effect::ClearProfile { .. })),
+            "no-clear path must NOT clear the profile"
+        );
+        assert_eq!(
+            m.state(),
+            &AppState::Online {
+                url: HOME.to_string()
+            },
+            "no-clear idle reset never parks in Clearing"
+        );
+    }
+
+    // Rule 9 (guard) — IdleExpired from a non-Online state is a no-op (no panic, no effect).
+    #[test]
+    fn idle_expired_from_non_online_is_a_noop() {
+        // Fresh Boot.
+        let mut boot = Machine::new(cfg(Fallback::Video));
+        let fx = boot.on(Event::IdleExpired);
+        assert!(fx.is_empty(), "IdleExpired from Boot is a no-op");
+        assert_eq!(boot.state(), &AppState::Boot, "Boot unchanged");
+
+        // Offline.
+        let mut off = online(Fallback::Video);
+        off.on(Event::LinkChanged(Link::Offline));
+        assert_eq!(off.state(), &AppState::Offline, "premise: offline");
+        let fx = off.on(Event::IdleExpired);
+        assert!(fx.is_empty(), "IdleExpired from Offline is a no-op");
+        assert_eq!(off.state(), &AppState::Offline, "Offline unchanged");
+    }
+
+    // Rule 10 (reconnect) — Offline + Reconnected kicks a config refetch and STAYS Offline; the
+    // resulting ConfigApplied drives the nav via the existing Offline+ConfigApplied arm.
+    #[test]
+    fn offline_reconnected_refetches_config_and_stays_offline() {
+        let mut m = online(Fallback::Video);
+        m.on(Event::LinkChanged(Link::Offline));
+        assert_eq!(m.state(), &AppState::Offline, "premise: offline");
+
+        let fx = m.on(Event::Reconnected);
+
+        assert_eq!(
+            fx,
+            vec![Effect::RefetchConfig],
+            "reconnect kicks a config refetch"
+        );
+        assert_eq!(
+            m.state(),
+            &AppState::Offline,
+            "the refetch is in flight: stay Offline until ConfigApplied lands"
+        );
+    }
+
+    // Rule 10 (mirror) — Reconnected while not Offline is a no-op.
+    #[test]
+    fn reconnected_while_online_is_a_noop() {
+        let mut m = online(Fallback::Video);
+
+        let fx = m.on(Event::Reconnected);
+
+        assert!(fx.is_empty(), "Reconnected while Online is a no-op");
+        assert_eq!(
+            m.state(),
+            &AppState::Online {
+                url: HOME.to_string()
+            }
+        );
     }
 }
