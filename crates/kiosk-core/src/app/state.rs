@@ -30,6 +30,17 @@
 //! initial load and an ErrorPage retry are indistinguishable to it. Task 1 defines these
 //! events and handles `NavigationFailed` in `Online` (rule 5); Task 2 adds the `ErrorPage`
 //! arms without reshaping anything.
+//!
+//! # Driver contract: `ConfigApplied` must be level-triggered (a P1-D2 requirement)
+//!
+//! A `ConfigApplied` whose url *changed* is only acted on while `Online` (navigate) or
+//! `Offline` (`go_online`). Delivered while `ErrorPage` or `Clearing`, it is a deliberate
+//! no-op — re-navigating mid-retry or mid-clear would break the retry loop or the privacy
+//! gate. That is safe **only if `kiosk-main` re-emits `ConfigApplied` at level** (idempotent,
+//! on every poll — the same-url `Online` arm already absorbs the repeats), not edge-triggered
+//! (once per change). Under an edge-triggered driver a url change that lands during a retry
+//! or clear would be dropped and never recover; under the level-triggered contract the FSM
+//! converges on the newest url the next time it is back in `Online`/`Offline`.
 
 use crate::config::schema::Fallback;
 use crate::net::prober::Link;
@@ -259,7 +270,7 @@ impl Machine {
             // (not `>`): with error_max_retries = 5 the 5th failed load falls to Offline, not
             // the 6th — a `>` here is a kiosk that retries one time too many.
             (ErrorPage { attempts }, NavigationFailed) => {
-                let n = attempts + 1;
+                let n = attempts.saturating_add(1);
                 if n >= self.cfg.error_max_retries {
                     self.go_offline()
                 } else {
@@ -1018,6 +1029,29 @@ mod tests {
             &AppState::Online {
                 url: HOME.to_string()
             }
+        );
+    }
+
+    // Rule 9 (mirror) — ProfileCleared while NOT in Clearing is a no-op: only the async clear
+    // that entered Clearing can release the gate, so a stray ProfileCleared (e.g. delivered
+    // late, after the machine already resumed) must not re-navigate or change state. Mirror of
+    // reconnected_while_online_is_a_noop; pins the catch-all rather than a stray Clearing arm.
+    #[test]
+    fn profile_cleared_outside_clearing_is_a_noop() {
+        let mut m = online(Fallback::Video);
+
+        let fx = m.on(Event::ProfileCleared);
+
+        assert!(
+            fx.is_empty(),
+            "ProfileCleared while not Clearing must emit nothing"
+        );
+        assert_eq!(
+            m.state(),
+            &AppState::Online {
+                url: HOME.to_string()
+            },
+            "ProfileCleared while not Clearing must not change state"
         );
     }
 }
