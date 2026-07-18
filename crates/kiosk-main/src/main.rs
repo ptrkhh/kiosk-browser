@@ -3,6 +3,7 @@
 mod boot;
 mod cli;
 mod driver;
+mod telemetry;
 
 const HARDCODED_URL: &str = "https://example.com/";
 

@@ -1818,7 +1818,9 @@ name = "kiosk-main"
 version = "0.1.0"
 dependencies = [
  "kiosk-core",
+ "rand 0.8.7",
  "reqwest 0.12.28",
+ "rsa",
  "serde_json",
  "tauri",
  "tauri-build",
