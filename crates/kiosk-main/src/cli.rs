@@ -1,11 +1,10 @@
 //! Minimal hand-rolled CLI (YAGNI: no clap). Replaced by kiosk.ini in the
-//! config plan; --windowed and --spike-input remain dev/diagnostic flags.
+//! config plan; --windowed remains a dev/diagnostic flag.
 
 #[derive(Debug, Default, PartialEq)]
 pub struct Args {
     pub url: Option<String>,
     pub windowed: bool,
-    pub spike_input: bool,
 }
 
 impl Args {
@@ -16,7 +15,6 @@ impl Args {
             match item.as_str() {
                 "--url" => args.url = items.next(),
                 "--windowed" => args.windowed = true,
-                "--spike-input" => args.spike_input = true,
                 "--version" => {
                     println!("kiosk-main {}", kiosk_core::app_version());
                     std::process::exit(0);
@@ -38,19 +36,12 @@ mod tests {
 
     #[test]
     fn parses_all_flags() {
-        let a = parse(&[
-            "kiosk-main",
-            "--url",
-            "https://x.test/a",
-            "--windowed",
-            "--spike-input",
-        ]);
+        let a = parse(&["kiosk-main", "--url", "https://x.test/a", "--windowed"]);
         assert_eq!(
             a,
             Args {
                 url: Some("https://x.test/a".into()),
                 windowed: true,
-                spike_input: true
             }
         );
     }

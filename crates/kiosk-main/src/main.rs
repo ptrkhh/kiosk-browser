@@ -1,7 +1,7 @@
 #![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
 
 mod cli;
-mod spike;
+mod driver;
 
 const HARDCODED_URL: &str = "https://example.com/";
 
@@ -30,10 +30,7 @@ fn main() {
                     .always_on_top(true)
                     .focused(true)
             };
-            let window = builder.build()?;
-            if args.spike_input {
-                spike::install(&window);
-            }
+            builder.build()?;
             Ok(())
         })
         .run(tauri::generate_context!())
