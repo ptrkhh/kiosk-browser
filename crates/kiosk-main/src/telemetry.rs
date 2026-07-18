@@ -48,6 +48,16 @@ pub struct Telemetry {
 }
 
 impl Telemetry {
+    /// A telemetry handle that silently drops everything. Used when [`build`] fails
+    /// (missing/malformed credential) so the kiosk still shows content — telemetry is
+    /// never worth a black screen. The receiver is dropped immediately, so every
+    /// `emit`/`try_send` returns `Err(Closed)` and is discarded, exactly like a full
+    /// queue. No logger task is spawned for this handle.
+    pub fn disabled() -> Telemetry {
+        let (tx, _rx) = mpsc::channel(1);
+        Telemetry { tx }
+    }
+
     /// `try_send`, never `send().await`: telemetry must never block or panic
     /// the caller. A full queue silently drops the event — the Logger's own
     /// spool is telemetry's durability layer, not this in-memory hop.
@@ -386,5 +396,19 @@ mod tests {
         let posted: Value = serde_json::from_str(&writes[0]).unwrap();
         assert_eq!(posted["entries"][0]["jsonPayload"]["event"], "nav.error");
         assert_eq!(posted["entries"][0]["severity"], "WARNING");
+    }
+
+    /// The disabled handle (used when telemetry init fails) must swallow every helper
+    /// call with no panic and no logger task — its receiver is already dropped.
+    #[test]
+    fn disabled_telemetry_swallows_calls_without_panicking() {
+        let telem = Telemetry::disabled();
+        telem.app_start();
+        telem.net_offline();
+        telem.config_applied(Some(7), &["w".into()]);
+        telem.nav_error("boom");
+        telem.panic("boom");
+        // No assertion beyond "did not panic": the whole contract is that a dropped
+        // receiver turns every `try_send` into a discarded `Err(Closed)`.
     }
 }

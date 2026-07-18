@@ -214,25 +214,36 @@ async fn main() {
     // Date-header bootstrap.
     let clock = TrustedClock::new();
 
-    let (telem, logger, log_rx) = telemetry::build(
-        &bootstrap,
-        &credential_path,
-        &device_id,
-        clock.clone(),
-        kiosk_core::app_version().to_string(),
-        revision,
-        &data_dir,
-    )
-    .unwrap_or_else(|e| panic!("kiosk-main: telemetry stack failed to initialize: {e}"));
-
-    install_panic_hook(telem.clone());
-
     let (tx, rx) = mpsc::channel::<AppEvent>(EVENT_CHANNEL_CAPACITY);
     let refetch = Arc::new(Notify::new());
     let cancel = CancellationToken::new();
-    let prober = Prober::new(clock);
+    let prober = Prober::new(clock.clone());
 
-    tokio::spawn(telemetry::run(logger, log_rx, cancel.clone()));
+    // A telemetry-init failure (missing/malformed kiosk-credential.json) must NOT stop
+    // the kiosk from showing content — the whole point of the device is the screen. On
+    // error we log to stderr and run WITHOUT telemetry: `Telemetry::disabled()` is a
+    // handle whose every helper silently no-ops, so every clone handed to
+    // fetch/probe/driver/TauriSink/nav keeps working unchanged.
+    let telem = match telemetry::build(
+        &bootstrap,
+        &credential_path,
+        &device_id,
+        clock,
+        kiosk_core::app_version().to_string(),
+        revision,
+        &data_dir,
+    ) {
+        Ok((telem, logger, log_rx)) => {
+            tokio::spawn(telemetry::run(logger, log_rx, cancel.clone()));
+            telem
+        }
+        Err(e) => {
+            eprintln!("kiosk-main: telemetry disabled ({e}); continuing without it");
+            telemetry::Telemetry::disabled()
+        }
+    };
+
+    install_panic_hook(telem.clone());
     telem.app_start();
     telem.config_applied(revision, &warnings);
 
@@ -261,6 +272,28 @@ async fn main() {
     let cancel_setup = cancel.clone();
 
     tauri::Builder::default()
+        // Serve the runtime, user-replaceable `kiosk-offline.mp4` (spec §3.4: sits next
+        // to the binaries, NOT build-embedded) to the bundled offline.html at a fixed
+        // origin. A custom scheme rather than the built-in asset protocol because the
+        // latter's `scope` is static config and cannot cleanly cover a runtime install
+        // dir. Windows origin form is `http://<scheme>.localhost/<path>` (tauri
+        // 2.11.5 `Builder::register_uri_scheme_protocol` doc + `AppManager`'s own
+        // `tauri.localhost` derivation) → `http://kioskasset.localhost/kiosk-offline.mp4`.
+        .register_uri_scheme_protocol("kioskasset", move |_ctx, _req| {
+            let mp4 = config_dir.join("kiosk-offline.mp4");
+            match std::fs::read(&mp4) {
+                Ok(bytes) => tauri::http::Response::builder()
+                    .header(tauri::http::header::CONTENT_TYPE, "video/mp4")
+                    .body(bytes)
+                    .expect("static video/mp4 response builds"),
+                // Absent/unreadable → 404; offline.html's arch-09 handlers degrade to
+                // the black splash rather than hanging.
+                Err(_) => tauri::http::Response::builder()
+                    .status(tauri::http::StatusCode::NOT_FOUND)
+                    .body(Vec::new())
+                    .expect("static 404 response builds"),
+            }
+        })
         .setup(move |app| {
             let mut builder = tauri::WebviewWindowBuilder::new(
                 app,
@@ -303,13 +336,16 @@ async fn main() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("kiosk-main: failed to start");
-
-    telem.app_stop();
-    cancel.cancel();
-    // Best-effort grace window for the logger task's shutdown flush (TEL-10) to run
-    // before the process exits; every WARNING+ entry logged up to now is already
-    // durable regardless (see `install_panic_hook`'s doc comment).
-    tokio::time::sleep(Duration::from_millis(300)).await;
+        .build(tauri::generate_context!())
+        .expect("kiosk-main: failed to start")
+        // The graceful-exit path: on a locked-down kiosk tao usually tears the process
+        // down without ever reaching here, so this is best-effort only — WARNING+
+        // durability already rests on `Spool::append`'s synchronous fsync (see
+        // `install_panic_hook`), not on this `app.stop`.
+        .run(move |_app, event| {
+            if let tauri::RunEvent::Exit = event {
+                telem.app_stop();
+                cancel.cancel();
+            }
+        });
 }
