@@ -3,7 +3,7 @@
   "productName": "kiosk",
   "identifier": "io.github.ptrkhh.kiosk",
   "build": {
-    "frontendDist": "./assets"
+    "frontendDist": "./bundled"
   },
   "app": {
     "withGlobalTauri": false,

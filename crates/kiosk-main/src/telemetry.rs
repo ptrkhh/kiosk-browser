@@ -6,10 +6,8 @@
 //! batching, retry, rate-limiting) already lives in `kiosk_core::logging` and is
 //! not reimplemented here.
 //!
-//! Not yet wired into `main.rs` — Task 6 constructs the handle from a real
-//! `Booted` and spawns [`run`]. Until then this module's public surface has no
-//! caller outside its own tests (mirrors `driver.rs`/`boot.rs`'s Task 1/2 note).
-#![allow(dead_code)]
+//! Wired into `main.rs` (Task 6): `main` calls [`build`] from a real `Booted` and
+//! spawns [`run`].
 
 use std::path::Path;
 use std::sync::Arc;
@@ -95,6 +93,15 @@ impl Telemetry {
         let mut f = Map::new();
         f.insert("message".into(), Value::from(msg));
         self.emit(LogEvent::CrashPanic, f);
+    }
+
+    /// A navigation failed to load (spec §6 taxonomy: `nav.error`, WARNING, rate-capped
+    /// at 10/min burst 20). `reason` is a short diagnostic (Task 6's `nav` module passes
+    /// WebView2's `WebErrorStatus`) — never the full page body or headers.
+    pub fn nav_error(&self, reason: &str) {
+        let mut f = Map::new();
+        f.insert("error".into(), Value::from(reason));
+        self.emit(LogEvent::NavError, f);
     }
 }
 
@@ -343,6 +350,41 @@ mod tests {
         );
         let posted: Value = serde_json::from_str(&writes[0]).unwrap();
         assert_eq!(posted["entries"][0]["jsonPayload"]["event"], "net.offline");
+        assert_eq!(posted["entries"][0]["severity"], "WARNING");
+    }
+
+    /// Same shape as `net_offline_helper_emits_a_net_offline_event`, for the helper
+    /// Task 6 added: `nav::install`'s `NavigationCompleted` handler is the only caller
+    /// that can ever observe a failed navigation, so this pins the mapping onto the
+    /// `nav.error` taxonomy entry (spec §6) it must reach.
+    #[tokio::test]
+    async fn nav_error_helper_emits_a_nav_error_event_with_the_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = FakeTransport::new();
+        let mut logger = logger_with(dir.path(), transport.clone());
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let telemetry = Telemetry { tx };
+        telemetry.nav_error("COREWEBVIEW2_WEB_ERROR_STATUS(12)");
+
+        let req = rx
+            .try_recv()
+            .expect("nav_error() must hand the logger task a LogReq");
+        assert_eq!(req.event, LogEvent::NavError);
+        assert_eq!(
+            req.fields["error"],
+            Value::from("COREWEBVIEW2_WEB_ERROR_STATUS(12)")
+        );
+
+        logger.log(req.event, req.fields);
+        logger
+            .flush()
+            .expect("flush against the fake transport must succeed");
+
+        let writes = transport.writes.lock().unwrap();
+        assert_eq!(writes.len(), 1, "nav.error must have reached entries:write");
+        let posted: Value = serde_json::from_str(&writes[0]).unwrap();
+        assert_eq!(posted["entries"][0]["jsonPayload"]["event"], "nav.error");
         assert_eq!(posted["entries"][0]["severity"], "WARNING");
     }
 }

@@ -4,10 +4,8 @@
 //! itself (parse, signature, device binding, anti-rollback, schema/ranges) lives entirely in
 //! kiosk-core; this module never reimplements it.
 //!
-//! Not yet wired into `main.rs` — Task 6 constructs the real `ConfigManager`/URL/`poll_s`
-//! from a `Booted` and spawns [`run`]. Until then this module's public surface has no caller
-//! outside its own tests (mirrors `driver.rs`/`boot.rs`/`telemetry.rs`'s Task 1/2/5 note).
-#![allow(dead_code)]
+//! Wired into `main.rs` (Task 6): `main` extracts the real `ConfigManager`/URL/`poll_s`
+//! from a `Booted` and spawns [`run`].
 
 use std::sync::Arc;
 use std::time::Duration;

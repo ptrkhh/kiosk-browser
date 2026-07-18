@@ -6,11 +6,9 @@
 //! reimplements it, and it never hand-parses the `Date` header — `Prober::record`
 //! harvests it into its own `TrustedClock` internally (TEL-01).
 //!
-//! Not yet wired into `main.rs` — Task 6 constructs the real `Prober`/`Network`/resolved
-//! probe URL from a `Booted` and spawns [`run`]. Until then this module's public surface
-//! has no caller outside its own tests (mirrors `driver.rs`/`boot.rs`/`telemetry.rs`/
-//! `fetch.rs`'s Task 1/2/5/3 note).
-#![allow(dead_code)]
+//! Wired into `main.rs` (Task 6): `main` builds the real `Prober`/`Network`/resolved
+//! probe URL (`reach::resolve_probe_url`, sharing the SAME `TrustedClock` telemetry
+//! uses — TEL-01) from a `Booted` and spawns [`run`].
 
 use kiosk_core::app::state::Event as AppEvent;
 use kiosk_core::config::schema::Network;

@@ -1,10 +1,16 @@
-//! Minimal hand-rolled CLI (YAGNI: no clap). Replaced by kiosk.ini in the
-//! config plan; --windowed remains a dev/diagnostic flag.
+//! Minimal hand-rolled CLI (YAGNI: no clap). `kiosk.ini` (spec §5.1) is now the real
+//! configuration source; `--windowed` remains a dev/diagnostic flag and `--config`
+//! overrides the install dir it (and the credential/mp4 next to it) is read from
+//! (spec §4 "File & directory conventions": "next to binaries (override: --config
+//! <path>)").
 
 #[derive(Debug, Default, PartialEq)]
 pub struct Args {
-    pub url: Option<String>,
     pub windowed: bool,
+    /// Overrides the install dir `kiosk.ini`/the credential file/the offline mp4 are
+    /// read from (default: the running exe's own directory). Spec §4's `--config
+    /// <path>` names a DIRECTORY, not the ini file itself — `kiosk.ini` inside it.
+    pub config: Option<String>,
 }
 
 impl Args {
@@ -13,8 +19,8 @@ impl Args {
         let _argv0 = items.next();
         while let Some(item) = items.next() {
             match item.as_str() {
-                "--url" => args.url = items.next(),
                 "--windowed" => args.windowed = true,
+                "--config" => args.config = items.next(),
                 "--version" => {
                     println!("kiosk-main {}", kiosk_core::app_version());
                     std::process::exit(0);
@@ -36,12 +42,12 @@ mod tests {
 
     #[test]
     fn parses_all_flags() {
-        let a = parse(&["kiosk-main", "--url", "https://x.test/a", "--windowed"]);
+        let a = parse(&["kiosk-main", "--config", "D:\\kiosk", "--windowed"]);
         assert_eq!(
             a,
             Args {
-                url: Some("https://x.test/a".into()),
                 windowed: true,
+                config: Some("D:\\kiosk".into()),
             }
         );
     }
@@ -52,7 +58,7 @@ mod tests {
     }
 
     #[test]
-    fn url_without_value_is_ignored() {
-        assert_eq!(parse(&["kiosk-main", "--url"]), Args::default());
+    fn config_without_value_is_ignored() {
+        assert_eq!(parse(&["kiosk-main", "--config"]), Args::default());
     }
 }

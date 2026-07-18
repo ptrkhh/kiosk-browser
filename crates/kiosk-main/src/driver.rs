@@ -1,7 +1,6 @@
-//! The driver actor + `EffectSink` seam: executes the FSM's effects. Not yet wired into
-//! `main.rs` — Task 6 constructs a `Driver`, a production `TauriSink`, and spawns [`run`].
-//! Until then this module's public surface has no caller outside its own tests.
-#![allow(dead_code)]
+//! The driver actor + `EffectSink` seam: executes the FSM's effects. Wired into
+//! `main.rs` (Task 6): `TauriSink` is the production `EffectSink`, constructed there
+//! together with a `Driver` and spawned via [`run`].
 
 use kiosk_core::app::state::{Effect, Event as AppEvent, Machine};
 use tokio::sync::mpsc;

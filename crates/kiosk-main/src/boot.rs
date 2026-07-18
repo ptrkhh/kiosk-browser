@@ -3,10 +3,8 @@
 //! marshalling only — parsing, signature verification, defaults and validation all live in
 //! kiosk-core; this module never reimplements them.
 //!
-//! Not yet wired into `main.rs` — a later task (the actor spine, Task 6) constructs the
-//! `Driver`/`TauriSink` from a `Booted`. Until then this module's public surface has no
-//! caller outside its own tests (mirrors `driver.rs`'s Task 1 note).
-#![allow(dead_code)]
+//! Wired into `main.rs` (Task 6): `main` calls [`boot`] and builds the `Driver`/
+//! `TauriSink` from the returned `Booted`.
 
 use std::path::Path;
 
