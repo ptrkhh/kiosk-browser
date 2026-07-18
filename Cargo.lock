@@ -1822,6 +1822,7 @@ dependencies = [
  "serde_json",
  "tauri",
  "tauri-build",
+ "tempfile",
  "tokio",
  "tokio-util",
  "webview2-com",

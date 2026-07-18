@@ -1,5 +1,6 @@
 #![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
 
+mod boot;
 mod cli;
 mod driver;
 
