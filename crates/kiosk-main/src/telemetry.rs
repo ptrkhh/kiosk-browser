@@ -7,11 +7,12 @@
 //! not reimplemented here.
 //!
 //! Wired into `main.rs` (Task 6): `main` calls [`build`] from a real `Booted` and
-//! spawns [`run`].
+//! runs [`run`] on a dedicated OS thread (the blocking `reqwest` transport cannot
+//! live on the tokio runtime — see [`run`]).
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kiosk_core::config::bootstrap::BootstrapConfig;
 use kiosk_core::config::schema::Logging;
@@ -193,15 +194,36 @@ pub fn build(
 /// its own `FLUSH_INTERVAL` (spec TEL-07) when idle. Shutdown is best-effort: a
 /// cancel or a disconnected channel flushes and exits (WARNING+ entries are already
 /// fsynced synchronously as logged, so durability never depends on this flush).
+///
+/// The tick is DEADLINE-based, not a fresh `recv_timeout(FLUSH_INTERVAL)` per message.
+/// `Logger::tick` is the only path that delivers batched entries and emits the
+/// rate-limit summaries (TEL-07/TEL-09); `Logger::log` only appends. A naive
+/// `recv_timeout(FLUSH_INTERVAL)` resets on every message, so a steady sub-interval
+/// stream (e.g. a nav-error flood) would starve the tick forever — nothing delivered,
+/// `pending` growing until the ring evicts it, no flood summary. Ticking on a fixed
+/// `next_tick` deadline fires ~every FLUSH_INTERVAL regardless of load, matching the
+/// old `tokio::time::interval` cadence.
 pub fn run(mut logger: Logger, rx: Receiver<LogReq>, cancel: CancellationToken) {
+    let mut next_tick = Instant::now() + FLUSH_INTERVAL;
     loop {
         if cancel.is_cancelled() {
             let _ = logger.flush();
             break;
         }
-        match rx.recv_timeout(FLUSH_INTERVAL) {
-            Ok(req) => logger.log(req.event, req.fields), // infallible; WARNING+ fsynced
-            Err(RecvTimeoutError::Timeout) => logger.tick(),
+        match rx.recv_timeout(next_tick.saturating_duration_since(Instant::now())) {
+            Ok(req) => {
+                logger.log(req.event, req.fields); // infallible; WARNING+ fsynced
+                                                   // A relentless flood keeps `recv_timeout(0)` returning `Ok`; tick on
+                                                   // the deadline anyway so delivery/summaries never starve.
+                if Instant::now() >= next_tick {
+                    logger.tick();
+                    next_tick = Instant::now() + FLUSH_INTERVAL;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                logger.tick();
+                next_tick = Instant::now() + FLUSH_INTERVAL;
+            }
             Err(RecvTimeoutError::Disconnected) => {
                 let _ = logger.flush();
                 break;
