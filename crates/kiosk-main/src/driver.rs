@@ -101,6 +101,10 @@ mod tests {
         assert_eq!(sink.effects, vec![Effect::ShowVideo]);
     }
 
+    // I1: pins the FSM/driver contract for `Reconnected`, NOT a runtime event — D2a's
+    // probe emits only `LinkChanged`, never `Reconnected`, so this path is dormant at
+    // runtime (see `probe::run`/`main.rs` refetch note). Kept so a later sub-plan that
+    // adds a `Reconnected` producer inherits a proven driver seam.
     #[test]
     fn offline_then_reconnect_refetches_then_navigates() {
         let mut d = Driver {

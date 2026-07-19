@@ -65,6 +65,14 @@ pub async fn probe_once(url: &str) -> ProbeOutcome {
 /// unset check-url + private content host → probe the content origin instead) BEFORE
 /// this task is spawned — a one-time decision keyed off the operator's config, not
 /// something re-resolved probe to probe.
+///
+/// I1 (D2a scope): this task emits ONLY `LinkChanged`, never `AppEvent::Reconnected`. So
+/// FSM rule 10 `(Offline, Reconnected) → RefetchConfig` (kiosk-core `state.rs:332`) and
+/// the `RefetchConfig → Notify → fetch::run` immediate-refetch path it drives are
+/// forward-wired but DORMANT in D2a — deliberately, not dead code. Reconnect recovery
+/// still works: rule 4 (`LinkChanged(Online)` → immediate re-nav to the remembered home)
+/// plus the periodic config poll cover it; only the *immediate* refetch-on-reconnect is
+/// deferred, to a later sub-plan that adds a `Reconnected` producer here.
 pub async fn run(
     mut prober: Prober,
     network: Network,

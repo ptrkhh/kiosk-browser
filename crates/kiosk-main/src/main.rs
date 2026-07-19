@@ -215,6 +215,11 @@ async fn main() {
     let clock = TrustedClock::new();
 
     let (tx, rx) = mpsc::channel::<AppEvent>(EVENT_CHANNEL_CAPACITY);
+    // `refetch` carries `Effect::RefetchConfig` (TauriSink `notify_one`) → `fetch::run`'s
+    // immediate poll. I1: in D2a that effect only ever comes from FSM rule 10
+    // `(Offline, Reconnected)`, and nothing emits `Reconnected` (the probe emits only
+    // `LinkChanged` — see `probe::run`). So this handle is forward-wired but dormant;
+    // reconnect recovery runs via rule 4 + the periodic poll. Not dead code.
     let refetch = Arc::new(Notify::new());
     let cancel = CancellationToken::new();
     let prober = Prober::new(clock.clone());
