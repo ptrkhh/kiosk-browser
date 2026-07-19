@@ -7,11 +7,12 @@
 //! not reimplemented here.
 //!
 //! Wired into `main.rs` (Task 6): `main` calls [`build`] from a real `Booted` and
-//! spawns [`run`].
+//! runs [`run`] on a dedicated OS thread (the blocking `reqwest` transport cannot
+//! live on the tokio runtime — see [`run`]).
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kiosk_core::config::bootstrap::BootstrapConfig;
 use kiosk_core::config::schema::Logging;
@@ -25,7 +26,7 @@ use kiosk_core::logging::time::TrustedClock;
 use kiosk_core::logging::transport::{ReqwestTransport, Transport};
 use kiosk_core::logging::{Logger, FLUSH_INTERVAL};
 use serde_json::{Map, Value};
-use tokio::sync::mpsc;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use tokio_util::sync::CancellationToken;
 
 /// How many in-flight requests the handle-to-task channel holds before
@@ -44,7 +45,7 @@ pub struct LogReq {
 /// is fire-and-forget.
 #[derive(Clone)]
 pub struct Telemetry {
-    tx: mpsc::Sender<LogReq>,
+    tx: SyncSender<LogReq>,
 }
 
 impl Telemetry {
@@ -54,7 +55,7 @@ impl Telemetry {
     /// `emit`/`try_send` returns `Err(Closed)` and is discarded, exactly like a full
     /// queue. No logger task is spawned for this handle.
     pub fn disabled() -> Telemetry {
-        let (tx, _rx) = mpsc::channel(1);
+        let (tx, _rx) = mpsc::sync_channel(1);
         Telemetry { tx }
     }
 
@@ -145,7 +146,7 @@ pub fn build(
     app_version: String,
     revision: Option<i64>,
     data_dir: &Path,
-) -> Result<(Telemetry, Logger, mpsc::Receiver<LogReq>), Box<dyn std::error::Error>> {
+) -> Result<(Telemetry, Logger, Receiver<LogReq>), Box<dyn std::error::Error>> {
     let credential_json = std::fs::read_to_string(credential_path)?;
     let service_account = ServiceAccount::from_json(&credential_json)?;
 
@@ -179,29 +180,54 @@ pub fn build(
     };
 
     let logger = Logger::new(ctx, spool, client, limiter, clock);
-    let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+    let (tx, rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
     Ok((Telemetry { tx }, logger, rx))
 }
 
-/// The logger task: owns the `Logger`, drains `LogReq`s, and ticks it on the
-/// logger's own `FLUSH_INTERVAL` (spec TEL-07) so a steady trickle of events
-/// still flushes on schedule even when nothing new arrives.
-pub async fn run(mut logger: Logger, mut rx: mpsc::Receiver<LogReq>, cancel: CancellationToken) {
-    let mut tick = tokio::time::interval(FLUSH_INTERVAL);
+/// The logger loop — run on a DEDICATED OS THREAD (`std::thread`), never a tokio
+/// task. The P1-B `Transport` is `reqwest::blocking`, which panics if it is built
+/// OR driven inside a tokio runtime: `reqwest::blocking` stands up and tears down
+/// its own internal runtime, and dropping a runtime inside an async context is
+/// forbidden ("Cannot drop a runtime in a context where blocking is not allowed").
+/// So the whole logger stays off the async runtime: this is a plain blocking loop
+/// over a `std::sync::mpsc` channel, draining `LogReq`s and ticking the logger on
+/// its own `FLUSH_INTERVAL` (spec TEL-07) when idle. Shutdown is best-effort: a
+/// cancel or a disconnected channel flushes and exits (WARNING+ entries are already
+/// fsynced synchronously as logged, so durability never depends on this flush).
+///
+/// The tick is DEADLINE-based, not a fresh `recv_timeout(FLUSH_INTERVAL)` per message.
+/// `Logger::tick` is the only path that delivers batched entries and emits the
+/// rate-limit summaries (TEL-07/TEL-09); `Logger::log` only appends. A naive
+/// `recv_timeout(FLUSH_INTERVAL)` resets on every message, so a steady sub-interval
+/// stream (e.g. a nav-error flood) would starve the tick forever — nothing delivered,
+/// `pending` growing until the ring evicts it, no flood summary. Ticking on a fixed
+/// `next_tick` deadline fires ~every FLUSH_INTERVAL regardless of load, matching the
+/// old `tokio::time::interval` cadence.
+pub fn run(mut logger: Logger, rx: Receiver<LogReq>, cancel: CancellationToken) {
+    let mut next_tick = Instant::now() + FLUSH_INTERVAL;
     loop {
-        tokio::select! {
-            _ = cancel.cancelled() => {
+        if cancel.is_cancelled() {
+            let _ = logger.flush();
+            break;
+        }
+        match rx.recv_timeout(next_tick.saturating_duration_since(Instant::now())) {
+            Ok(req) => {
+                logger.log(req.event, req.fields); // infallible; WARNING+ fsynced
+                                                   // A relentless flood keeps `recv_timeout(0)` returning `Ok`; tick on
+                                                   // the deadline anyway so delivery/summaries never starve.
+                if Instant::now() >= next_tick {
+                    logger.tick();
+                    next_tick = Instant::now() + FLUSH_INTERVAL;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                logger.tick();
+                next_tick = Instant::now() + FLUSH_INTERVAL;
+            }
+            Err(RecvTimeoutError::Disconnected) => {
                 let _ = logger.flush();
                 break;
             }
-            _ = tick.tick() => logger.tick(),
-            maybe = rx.recv() => match maybe {
-                Some(req) => logger.log(req.event, req.fields), // infallible; WARNING+ fsynced
-                None => {
-                    let _ = logger.flush();
-                    break;
-                }
-            },
         }
     }
 }
@@ -331,13 +357,13 @@ mod tests {
     /// 10 s have elapsed or 100 entries are pending (spec TEL-07), so calling
     /// it immediately after `Logger::new` would not actually attempt a flush
     /// and the assertion below would be vacuous.
-    #[tokio::test]
-    async fn net_offline_helper_emits_a_net_offline_event() {
+    #[test]
+    fn net_offline_helper_emits_a_net_offline_event() {
         let dir = tempfile::tempdir().unwrap();
         let transport = FakeTransport::new();
         let mut logger = logger_with(dir.path(), transport.clone());
 
-        let (tx, mut rx) = mpsc::channel(8);
+        let (tx, rx) = mpsc::sync_channel(8);
         let telemetry = Telemetry { tx };
         telemetry.net_offline();
 
@@ -367,13 +393,13 @@ mod tests {
     /// Task 6 added: `nav::install`'s `NavigationCompleted` handler is the only caller
     /// that can ever observe a failed navigation, so this pins the mapping onto the
     /// `nav.error` taxonomy entry (spec §6) it must reach.
-    #[tokio::test]
-    async fn nav_error_helper_emits_a_nav_error_event_with_the_reason() {
+    #[test]
+    fn nav_error_helper_emits_a_nav_error_event_with_the_reason() {
         let dir = tempfile::tempdir().unwrap();
         let transport = FakeTransport::new();
         let mut logger = logger_with(dir.path(), transport.clone());
 
-        let (tx, mut rx) = mpsc::channel(8);
+        let (tx, rx) = mpsc::sync_channel(8);
         let telemetry = Telemetry { tx };
         telemetry.nav_error("COREWEBVIEW2_WEB_ERROR_STATUS(12)");
 

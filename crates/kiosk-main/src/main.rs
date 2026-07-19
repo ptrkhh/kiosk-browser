@@ -66,9 +66,9 @@ fn resolve_data_dir() -> PathBuf {
 
 /// Best-effort crash telemetry (spec TEL-10, brief step 4).
 ///
-/// The async `Logger` is owned by the logger task (`telemetry::run`); a
+/// The async `Logger` is owned by the logger thread (`telemetry::run`); a
 /// `std::panic::set_hook` closure runs synchronously on the panicking thread and
-/// cannot reach into another task to call it directly. `Telemetry::panic` is the one
+/// cannot reach into that thread to call it directly. `Telemetry::panic` is the one
 /// channel this closure CAN safely reach: `try_send` never blocks and never panics,
 /// so installing this hook cannot itself become a second panic.
 ///
@@ -79,11 +79,11 @@ fn resolve_data_dir() -> PathBuf {
 /// leaves is narrow: the crash entry itself is only enqueued, not yet fsynced, at the
 /// moment this hook returns. In the common case — a panic inside one `tokio::spawn`ed
 /// task, caught by that task's own unwind boundary — the process keeps running and the
-/// still-alive logger task drains and fsyncs it on its very next scheduling. The
+/// still-alive logger thread drains and fsyncs it on its very next scheduling. The
 /// entry is genuinely at risk only if the panic unwinds out of `main` itself (e.g. from
-/// inside `.setup()`), tearing the whole runtime down before the logger task gets that
+/// inside `.setup()`), tearing the whole runtime down before the logger thread gets that
 /// next turn. Documented here rather than solved: a synchronous, reentrant-safe spool
-/// write from inside a panic hook (racing the very same spool the logger task also
+/// write from inside a panic hook (racing the very same spool the logger thread also
 /// holds open, violating the "one writer per segment" invariant — spec arch-01) would
 /// be the "fragile mechanism" the brief warns against, not a fix.
 fn install_panic_hook(telem: telemetry::Telemetry) {
@@ -224,29 +224,55 @@ async fn main() {
     let cancel = CancellationToken::new();
     let prober = Prober::new(clock.clone());
 
+    // The P1-B logger `Transport` is `reqwest::blocking`, which panics if it is built
+    // OR driven inside a tokio runtime (it stands up and drops its own internal
+    // runtime, forbidden in an async context). So the ENTIRE logger stack — `build`
+    // (which constructs the blocking client) and the drain loop `run` — lives on a
+    // DEDICATED OS THREAD, off this `#[tokio::main]` runtime, talking over a
+    // `std::sync::mpsc` channel. The thread hands the `Telemetry` handle back for the
+    // async tasks to clone.
+    //
     // A telemetry-init failure (missing/malformed kiosk-credential.json) must NOT stop
     // the kiosk from showing content — the whole point of the device is the screen. On
     // error we log to stderr and run WITHOUT telemetry: `Telemetry::disabled()` is a
     // handle whose every helper silently no-ops, so every clone handed to
     // fetch/probe/driver/TauriSink/nav keeps working unchanged.
-    let telem = match telemetry::build(
-        &bootstrap,
-        &credential_path,
-        &device_id,
-        clock,
-        kiosk_core::app_version().to_string(),
-        revision,
-        &data_dir,
-    ) {
-        Ok((telem, logger, log_rx)) => {
-            tokio::spawn(telemetry::run(logger, log_rx, cancel.clone()));
-            telem
-        }
-        Err(e) => {
-            eprintln!("kiosk-main: telemetry disabled ({e}); continuing without it");
-            telemetry::Telemetry::disabled()
-        }
-    };
+    let app_version = kiosk_core::app_version().to_string();
+    let cancel_log = cancel.clone();
+    let (handle_tx, handle_rx) = std::sync::mpsc::channel::<Option<telemetry::Telemetry>>();
+    let spawned = std::thread::Builder::new()
+        .name("telemetry".into())
+        .spawn(move || {
+            match telemetry::build(
+                &bootstrap,
+                &credential_path,
+                &device_id,
+                clock,
+                app_version,
+                revision,
+                &data_dir,
+            ) {
+                Ok((telem, logger, log_rx)) => {
+                    let _ = handle_tx.send(Some(telem));
+                    telemetry::run(logger, log_rx, cancel_log);
+                }
+                Err(e) => {
+                    eprintln!("kiosk-main: telemetry disabled ({e}); continuing without it");
+                    let _ = handle_tx.send(None);
+                }
+            }
+        });
+    // A thread-spawn failure must not black-screen the kiosk either: the moved
+    // `handle_tx` drops with the un-spawned closure, so `handle_rx.recv()` below fails
+    // through to `Telemetry::disabled()`. Same degrade as a build failure.
+    if let Err(e) = spawned {
+        eprintln!("kiosk-main: telemetry thread spawn failed ({e}); continuing without it");
+    }
+    let telem = handle_rx
+        .recv()
+        .ok()
+        .flatten()
+        .unwrap_or_else(telemetry::Telemetry::disabled);
 
     install_panic_hook(telem.clone());
     telem.app_start();
