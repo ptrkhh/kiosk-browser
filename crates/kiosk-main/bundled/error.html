@@ -1,0 +1,26 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>kiosk — unavailable</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #000;
+        color: #ccc;
+        font: 16px sans-serif;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        text-align: center;
+      }
+    </style>
+  </head>
+  <body>
+    <!-- Static message only: the retry countdown is driven by the FSM (ShowErrorPage's
+         retry_after_seconds -> a CountdownExpired timer in TauriSink), never by JS here. -->
+    <p>This site is temporarily unavailable. Retrying shortly&hellip;</p>
+  </body>
+</html>

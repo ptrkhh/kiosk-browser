@@ -1,0 +1,72 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>kiosk — offline</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #000;
+        overflow: hidden;
+      }
+      video {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+      }
+    </style>
+  </head>
+  <body>
+    <!-- kiosk-offline.mp4 is a runtime deployment asset placed next to kiosk.ini (spec
+         §3.4), served by kiosk-main's `kioskasset` custom URI scheme (NOT embedded in
+         this bundle). Windows origin form: http://<scheme>.localhost/<path>. -->
+    <video
+      loop
+      autoplay
+      muted
+      playsinline
+      src="http://kioskasset.localhost/kiosk-offline.mp4"
+    ></video>
+    <script>
+      // arch-09 decode-failure robustness (spec §3.4): a corrupt/incompatible codec, a
+      // missing platform decoder, or a missing file must degrade to the black "offline"
+      // splash — this page's own black background — never a hung/frozen frame. The
+      // <video> is simply hidden; the body stays black.
+      (function () {
+        var v = document.querySelector("video");
+        var degraded = false;
+        function fallback(why) {
+          if (degraded) return;
+          degraded = true;
+          v.style.display = "none";
+          // Durable media.error telemetry from the page needs an IPC command bridge
+          // (not wired in D2a — app-origin pages get no custom IPC yet); the console
+          // marker is the honest minimal signal until that lands.
+          console.error("media.error:", why);
+        }
+        v.addEventListener("error", function () {
+          fallback("video error event");
+        });
+        v.addEventListener("stalled", function () {
+          fallback("video stalled");
+        });
+        v.addEventListener("emptied", function () {
+          fallback("video emptied");
+        });
+        // Autoplay policy is satisfied by muted+playsinline, but honor the rejection.
+        var p = v.play();
+        if (p && typeof p.catch === "function") {
+          p.catch(function (e) {
+            fallback("play() rejected: " + e);
+          });
+        }
+        // Watchdog: currentTime must advance within 3 s of load, else assume no decode.
+        setTimeout(function () {
+          if (!degraded && v.currentTime === 0) fallback("no playback progress in 3s");
+        }, 3000);
+      })();
+    </script>
+  </body>
+</html>
