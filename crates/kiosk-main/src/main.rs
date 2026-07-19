@@ -224,29 +224,50 @@ async fn main() {
     let cancel = CancellationToken::new();
     let prober = Prober::new(clock.clone());
 
+    // The P1-B logger `Transport` is `reqwest::blocking`, which panics if it is built
+    // OR driven inside a tokio runtime (it stands up and drops its own internal
+    // runtime, forbidden in an async context). So the ENTIRE logger stack — `build`
+    // (which constructs the blocking client) and the drain loop `run` — lives on a
+    // DEDICATED OS THREAD, off this `#[tokio::main]` runtime, talking over a
+    // `std::sync::mpsc` channel. The thread hands the `Telemetry` handle back for the
+    // async tasks to clone.
+    //
     // A telemetry-init failure (missing/malformed kiosk-credential.json) must NOT stop
     // the kiosk from showing content — the whole point of the device is the screen. On
     // error we log to stderr and run WITHOUT telemetry: `Telemetry::disabled()` is a
     // handle whose every helper silently no-ops, so every clone handed to
     // fetch/probe/driver/TauriSink/nav keeps working unchanged.
-    let telem = match telemetry::build(
-        &bootstrap,
-        &credential_path,
-        &device_id,
-        clock,
-        kiosk_core::app_version().to_string(),
-        revision,
-        &data_dir,
-    ) {
-        Ok((telem, logger, log_rx)) => {
-            tokio::spawn(telemetry::run(logger, log_rx, cancel.clone()));
-            telem
-        }
-        Err(e) => {
-            eprintln!("kiosk-main: telemetry disabled ({e}); continuing without it");
-            telemetry::Telemetry::disabled()
-        }
-    };
+    let app_version = kiosk_core::app_version().to_string();
+    let cancel_log = cancel.clone();
+    let (handle_tx, handle_rx) = std::sync::mpsc::channel::<Option<telemetry::Telemetry>>();
+    std::thread::Builder::new()
+        .name("telemetry".into())
+        .spawn(move || {
+            match telemetry::build(
+                &bootstrap,
+                &credential_path,
+                &device_id,
+                clock,
+                app_version,
+                revision,
+                &data_dir,
+            ) {
+                Ok((telem, logger, log_rx)) => {
+                    let _ = handle_tx.send(Some(telem));
+                    telemetry::run(logger, log_rx, cancel_log);
+                }
+                Err(e) => {
+                    eprintln!("kiosk-main: telemetry disabled ({e}); continuing without it");
+                    let _ = handle_tx.send(None);
+                }
+            }
+        })
+        .expect("spawn telemetry thread");
+    let telem = handle_rx
+        .recv()
+        .ok()
+        .flatten()
+        .unwrap_or_else(telemetry::Telemetry::disabled);
 
     install_panic_hook(telem.clone());
     telem.app_start();
