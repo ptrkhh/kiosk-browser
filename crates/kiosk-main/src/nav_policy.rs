@@ -80,6 +80,86 @@ impl NavPolicy {
             is_remote_origin(url),
         )
     }
+
+    /// May a **subresource** (image/CSS/script/fetch/websocket/…) load `url` (P1-D2b
+    /// Task 4, spec SEC-10)? This is the exfiltration boundary `decision_for` is NOT —
+    /// see `kiosk_core::nav`'s own module doc ("This is NOT an exfiltration boundary").
+    ///
+    /// Two rules:
+    ///
+    /// 1. **Inline / app-origin is always allowed.** `is_remote_origin` returns `false`
+    ///    for both a `tauri.localhost`/`kioskasset.localhost` host AND for any hostless
+    ///    URL (`data:`, `blob:`, `about:`…). For a main-frame *navigation* that hostless
+    ///    case is irrelevant (`decide` default-denies unparseable/non-http schemes
+    ///    outright); here it is the point — an inline `data:` image or `blob:` object URL
+    ///    never leaves the process, so blocking it would only break legitimate bundled
+    ///    assets for zero egress benefit. This is the deliberate OPPOSITE of the
+    ///    main-frame case, not an oversight.
+    /// 2. **A remote resource must match the allowlist**, checked directly against
+    ///    [`Allowlist::allows`] — **not** `decide`/`decision_for`. Judgment call: `decide`
+    ///    routes every non-http(s) scheme (a `wss://` subresource included) through
+    ///    `scheme::scheme_decision` against `scheme_allowlist`, which is the operator's
+    ///    *external protocol launch* list (`mailto`, `tel`, …), a different concept from
+    ///    "which remote hosts may this page talk to". Routing subresources through it
+    ///    would require operators to double-list every websocket host in
+    ///    `scheme_allowlist` just to keep `decide`'s composition, or silently block a
+    ///    legitimate `wss://` to an already-allowlisted host. Matching the allowlist
+    ///    patterns directly, scheme included, keeps one authority ("is this host/scheme
+    ///    on the list") for both `https://` fetches and `wss://` sockets: an operator who
+    ///    wants websocket egress to a host simply lists a `wss://host/*` pattern, exactly
+    ///    like any other scheme-specific allowlist entry.
+    pub fn resource_allowed(&self, url: &str) -> bool {
+        if !is_remote_origin(url) {
+            return true;
+        }
+        self.allowlist.allows(url).is_allowed()
+    }
+}
+
+/// A restrictive Content-Security-Policy value for the injected document-start bundle
+/// (P1-D2b Task 4, spec SEC-10 / §7) — belt-and-suspenders alongside the native
+/// `WebResourceRequested` filter (`crate::egress`), which is the primary enforcement
+/// point. `content_origin` is the active remote content's origin (scheme+host+port,
+/// e.g. `https://home.test`); bundled assets always load from `http://tauri.localhost`
+/// so that origin is always admitted too.
+///
+/// Pure and host-tested here; **not injected by this function**. `initialization_script`
+/// may only be called once per webview (a second caller clobbers the first), and P1-D2b
+/// Task 6 owns the single document-start bundle — that task must consume
+/// `csp_policy(active_origin)` inside its `build_injection`, not call
+/// `initialization_script` a second time.
+///
+/// # Residual gaps (document per spec)
+///
+/// A CSP is a renderer-enforced, same-document policy. It does not close everything
+/// `WebResourceRequested` does:
+/// - **Service workers** registered before this CSP was in force (or from a
+///   previously-cached response) keep their own fetch/cache policy; a CSP header on a
+///   later navigation does not retroactively constrain an already-installed worker.
+/// - **Preload/prefetch paths** (`<link rel=preload>`/browser speculative loads) are
+///   sometimes issued before the CSP meta tag is parsed, depending on injection timing.
+/// - It says nothing about **main-frame navigation** — that boundary is `nav.rs`/
+///   `NavPolicy::decision_for`, wholly separate.
+///
+/// The native `WebResourceRequested` filter in `crate::egress` is not subject to any of
+/// these gaps (it inspects every request before the renderer ever sees a response,
+/// regardless of service workers or preload timing), which is why it is the primary
+/// control and this CSP is the secondary one.
+///
+/// ponytail: not called from any COM callsite yet — T6 (the document-start injection
+/// bundle) is the intended, not-yet-written caller. Host-tested below regardless, same
+/// convention as `scheme_guard::pdf_decision`.
+#[allow(dead_code)]
+pub fn csp_policy(content_origin: &str) -> String {
+    format!(
+        "default-src {content_origin} http://tauri.localhost; \
+         img-src {content_origin} http://tauri.localhost data:; \
+         style-src {content_origin} http://tauri.localhost 'unsafe-inline'; \
+         font-src {content_origin} http://tauri.localhost data:; \
+         connect-src {content_origin} http://tauri.localhost; \
+         media-src {content_origin} http://tauri.localhost; \
+         object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+    )
 }
 
 /// App-origin (bundled pages / mp4) vs remote content. Single source of truth;
@@ -162,5 +242,66 @@ mod tests {
             is_remote_origin("http://tauri.localhost.evil.com/"),
             "host-match not prefix"
         );
+    }
+
+    // ---- resource_allowed (P1-D2b Task 4, SEC-10) -------------------------------------
+
+    #[test]
+    fn off_allowlist_remote_subresource_is_blocked() {
+        let p = NavPolicy::from_config(
+            &content(&["https://home.test/*"], &[]),
+            "https://home.test/app",
+        );
+        assert!(!p.resource_allowed("https://evil/a"));
+    }
+
+    #[test]
+    fn in_allowlist_subresource_is_allowed() {
+        let p = NavPolicy::from_config(
+            &content(&["https://cdn.test/*"], &[]),
+            "https://home.test/app",
+        );
+        assert!(p.resource_allowed("https://cdn.test/assets/logo.png"));
+    }
+
+    #[test]
+    fn app_origin_subresource_is_always_allowed() {
+        let p = NavPolicy::from_config(
+            &content(&["https://home.test/*"], &[]),
+            "https://home.test/app",
+        );
+        assert!(p.resource_allowed("http://tauri.localhost/bundle.js"));
+    }
+
+    #[test]
+    fn inline_data_uri_subresource_is_always_allowed() {
+        // Inline data never leaves the process -- blocking it would only break bundled
+        // assets for zero egress benefit. Opposite of the main-frame nav case, on purpose.
+        let p = NavPolicy::from_config(
+            &content(&["https://home.test/*"], &[]),
+            "https://home.test/app",
+        );
+        assert!(p.resource_allowed("data:image/png;base64,AAAA"));
+    }
+
+    #[test]
+    fn a_remote_websocket_to_an_allowlisted_scheme_specific_pattern_is_allowed() {
+        // The judgment call documented on `resource_allowed`: matched directly against the
+        // allowlist (scheme included), not routed through `scheme_allowlist`.
+        let p = NavPolicy::from_config(
+            &content(&["wss://home.test/*"], &[]),
+            "https://home.test/app",
+        );
+        assert!(p.resource_allowed("wss://home.test/socket"));
+    }
+
+    // ---- csp_policy (P1-D2b Task 4) ---------------------------------------------------
+
+    #[test]
+    fn csp_policy_scopes_default_src_to_the_content_origin_and_tauri_localhost() {
+        let csp = csp_policy("https://home.test");
+        assert!(csp.contains("default-src"));
+        assert!(csp.contains("https://home.test"));
+        assert!(csp.contains("http://tauri.localhost"));
     }
 }
