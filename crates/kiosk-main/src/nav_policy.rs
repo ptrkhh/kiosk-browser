@@ -26,6 +26,11 @@ pub type SharedNavPolicy = Arc<ArcSwap<NavPolicy>>;
 /// mutated) on every config apply, including the very first one at boot.
 pub struct NavPolicy {
     allowlist: Allowlist,
+    /// The live, already-expanded home URL (`active_url` in [`from_config`]). Read by
+    /// `recovery`'s `ProcessFailed` handler so crash-recovery navigates to the CURRENT
+    /// operator-pushed home, not a stale boot snapshot — rebuilt on every config apply
+    /// (fetch.rs re-stores the policy), so it tracks automatically.
+    home: String,
     scheme_allowlist: Vec<String>,
     // ponytail: see `pdf_view()`'s doc comment — read by no COM callsite yet.
     #[allow(dead_code)]
@@ -43,10 +48,16 @@ impl NavPolicy {
             // `Allowlist::new` itself implements cfg-02 (implicit home allow) and
             // arch-08 (empty-list origin lock) — nothing here reimplements either.
             allowlist: Allowlist::new(&content.allowlist, active_url),
+            home: active_url.to_string(),
             scheme_allowlist: content.scheme_allowlist.clone(),
             pdf_view: content.pdf_view,
             permissions: content.permissions.clone(),
         }
+    }
+
+    /// The live home URL (already expanded), for `recovery`'s crash-recovery Navigate.
+    pub fn home(&self) -> &str {
+        &self.home
     }
 
     /// The operator-configured external-scheme allowlist (P1-D2b Task 3, spec §3.6

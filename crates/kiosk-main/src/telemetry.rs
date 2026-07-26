@@ -136,6 +136,16 @@ impl Telemetry {
     pub fn focus_lost(&self) {
         self.emit(LogEvent::FocusLost, Map::new());
     }
+
+    /// The renderer process failed (spec §6 taxonomy: `webview.crash`, ERROR,
+    /// rate-capped like every other event). `kind` is `recovery::kind_label`'s stable,
+    /// greppable label (e.g. `render_process_unresponsive`) — never a raw WebView2 enum
+    /// debug-format, which isn't guaranteed stable across `webview2-com-sys` versions.
+    pub fn webview_crash(&self, kind: &str) {
+        let mut f = Map::new();
+        f.insert("kind".into(), Value::from(kind));
+        self.emit(LogEvent::WebviewCrash, f);
+    }
 }
 
 /// Assembles the P1-B logger stack for this device.
@@ -485,6 +495,47 @@ mod tests {
             !writes[0].contains("token"),
             "raw query string must never reach the wire"
         );
+    }
+
+    /// Same shape as `nav_error_helper_emits_a_nav_error_event_with_the_reason`: pins
+    /// `webview_crash`'s mapping onto the `webview.crash` taxonomy entry (spec §6,
+    /// ERROR severity) that `recovery::install`'s `ProcessFailed` handler reaches.
+    #[test]
+    fn webview_crash_helper_emits_a_webview_crash_event_with_the_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = FakeTransport::new();
+        let mut logger = logger_with(dir.path(), transport.clone());
+
+        let (tx, rx) = mpsc::sync_channel(8);
+        let telemetry = Telemetry { tx };
+        telemetry.webview_crash("render_process_unresponsive");
+
+        let req = rx
+            .try_recv()
+            .expect("webview_crash() must hand the logger task a LogReq");
+        assert_eq!(req.event, LogEvent::WebviewCrash);
+        assert_eq!(
+            req.fields["kind"],
+            Value::from("render_process_unresponsive")
+        );
+
+        logger.log(req.event, req.fields);
+        logger
+            .flush()
+            .expect("flush against the fake transport must succeed");
+
+        let writes = transport.writes.lock().unwrap();
+        assert_eq!(
+            writes.len(),
+            1,
+            "webview.crash must have reached entries:write"
+        );
+        let posted: Value = serde_json::from_str(&writes[0]).unwrap();
+        assert_eq!(
+            posted["entries"][0]["jsonPayload"]["event"],
+            "webview.crash"
+        );
+        assert_eq!(posted["entries"][0]["severity"], "ERROR");
     }
 
     /// The disabled handle (used when telemetry init fails) must swallow every helper

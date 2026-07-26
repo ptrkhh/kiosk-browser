@@ -11,7 +11,9 @@ mod inject;
 mod nav;
 mod nav_policy;
 mod probe;
+mod recovery;
 mod scheme_guard;
+mod shortcuts;
 mod telemetry;
 
 use std::path::{Path, PathBuf};
@@ -405,6 +407,8 @@ async fn main() {
             scheme_guard::install(&window, telem_setup.clone(), nav_policy_setup.clone());
             egress::install(&window, telem_setup.clone(), nav_policy_setup.clone());
             hardening::apply(&window, nav_policy_setup.clone(), content_zoom);
+            shortcuts::install(&window, telem_setup.clone());
+            recovery::install(&window, telem_setup.clone(), nav_policy_setup.clone());
 
             // focus.lost (spec §7): best-effort, not a security boundary — a kiosk
             // that gets alt-tabbed away logs it (spec taxonomy `focus.lost`, WARNING)
