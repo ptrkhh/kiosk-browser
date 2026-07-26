@@ -27,6 +27,9 @@ pub type SharedNavPolicy = Arc<ArcSwap<NavPolicy>>;
 pub struct NavPolicy {
     allowlist: Allowlist,
     scheme_allowlist: Vec<String>,
+    // ponytail: see `pdf_view()`'s doc comment — read by no COM callsite yet.
+    #[allow(dead_code)]
+    pdf_view: bool,
 }
 
 impl NavPolicy {
@@ -40,7 +43,30 @@ impl NavPolicy {
             // arch-08 (empty-list origin lock) — nothing here reimplements either.
             allowlist: Allowlist::new(&content.allowlist, active_url),
             scheme_allowlist: content.scheme_allowlist.clone(),
+            pdf_view: content.pdf_view,
         }
+    }
+
+    /// The operator-configured external-scheme allowlist (P1-D2b Task 3, spec §3.6
+    /// H2) — read by the `LaunchingExternalUriScheme` guard, which is a separate
+    /// WebView2 event from `NavigationStarting` and so needs its own read access
+    /// (`decision_for` already covers it for main-frame navigations, but external
+    /// schemes never reach `NavigationStarting`).
+    pub fn scheme_allowlist(&self) -> &[String] {
+        &self.scheme_allowlist
+    }
+
+    /// `content.pdf_view` (spec M4): `false` ⇒ a main-frame `application/pdf`
+    /// response is blocked; `true` ⇒ allowed (the bundled pdf.js viewer route is a
+    /// later phase — this only means "don't block here").
+    ///
+    /// ponytail: not called from any COM callsite yet — P1-D2b Task 3 found no
+    /// cancel-capable pre-render content-type signal in webview2-com-sys 0.38.2 to
+    /// hang PDF enforcement on (see `scheme_guard`'s module doc). Kept (not deleted)
+    /// so the live-config plumbing is ready the moment such a signal exists.
+    #[allow(dead_code)]
+    pub fn pdf_view(&self) -> bool {
+        self.pdf_view
     }
 
     /// The single per-navigation verdict, routed through `kiosk_core::nav::decide` —

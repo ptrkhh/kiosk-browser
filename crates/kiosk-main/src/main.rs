@@ -8,6 +8,7 @@ mod fetch;
 mod nav;
 mod nav_policy;
 mod probe;
+mod scheme_guard;
 mod telemetry;
 
 use std::path::{Path, PathBuf};
@@ -363,6 +364,7 @@ async fn main() {
                 telem_setup.clone(),
                 nav_policy_setup.clone(),
             );
+            scheme_guard::install(&window, telem_setup.clone(), nav_policy_setup.clone());
 
             let sink = TauriSink {
                 app: app.handle().clone(),
