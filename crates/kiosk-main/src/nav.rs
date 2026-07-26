@@ -33,14 +33,12 @@ use crate::telemetry::Telemetry;
 /// FSM? `false` for the app origins that serve bundled pages / the offline mp4
 /// (`http://tauri.localhost`, `http://kioskasset.localhost`) — those are internal, not
 /// content — and for anything unparseable/host-less; `true` for genuine remote content.
+///
+/// Delegates to `nav_policy::is_remote_origin` — the single source of truth shared with
+/// the nav guard (P1-D2b), so the FSM-feed filter and the guard can never disagree on
+/// what counts as "remote".
 fn feeds_fsm(url: &str) -> bool {
-    let Ok(parsed) = tauri::Url::parse(url) else {
-        return false;
-    };
-    match parsed.host_str() {
-        Some(host) => host != "tauri.localhost" && host != "kioskasset.localhost",
-        None => false,
-    }
+    crate::nav_policy::is_remote_origin(url)
 }
 
 /// Installs the outcome handlers on `window`'s live `ICoreWebView2`, forwarding every

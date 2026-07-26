@@ -15,6 +15,8 @@ use kiosk_core::config::ConfigManager;
 use tokio::sync::{mpsc, Notify};
 use tokio_util::sync::CancellationToken;
 
+use crate::nav_policy::{NavPolicy, SharedNavPolicy};
+
 /// The result of one fetch-and-apply attempt.
 #[derive(Debug)]
 pub enum FetchOutcome {
@@ -65,6 +67,9 @@ pub async fn fetch_bytes(url: &str) -> Result<Vec<u8>, ()> {
 /// Emits `AppEvent::ConfigApplied{url}` AT LEVEL on every successful apply — re-sent every
 /// poll, even when the url is unchanged; the FSM handles a repeated or changed url naturally.
 /// `Unreachable` is silently ignored: the prober (not this task) owns connectivity signaling.
+// One param over clippy's 7-arg threshold since the live nav policy was threaded in; a
+// struct wrapper is out of scope for T1 and would obscure the call site.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     mut manager: ConfigManager,
     url: String,
@@ -73,6 +78,7 @@ pub async fn run(
     telem: crate::telemetry::Telemetry,
     refetch: Arc<Notify>,
     cancel: CancellationToken,
+    nav_policy: SharedNavPolicy,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(poll_s.max(1)));
     loop {
@@ -88,6 +94,14 @@ pub async fn run(
                 warnings,
             } => {
                 telem.config_applied(revision, &warnings);
+                // Store the new policy BEFORE the FSM (and thus any navigation it
+                // triggers) hears about the applied config — so a navigation kicked off
+                // by this very apply is judged against the new allowlist, never the
+                // stale one.
+                nav_policy.store(Arc::new(NavPolicy::from_config(
+                    &manager.current().content,
+                    &home_url,
+                )));
                 let _ = tx.send(AppEvent::ConfigApplied { url: home_url }).await;
             }
             FetchOutcome::Rejected(reason) => telem.config_error(&reason),

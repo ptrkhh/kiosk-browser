@@ -6,6 +6,7 @@ mod driver;
 mod effect;
 mod fetch;
 mod nav;
+mod nav_policy;
 mod probe;
 mod telemetry;
 
@@ -13,12 +14,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use driver::{Driver, EffectSink};
 use effect::PageTarget;
 use kiosk_core::app::state::{Effect, Event as AppEvent, Machine};
 use kiosk_core::logging::time::TrustedClock;
 use kiosk_core::net::prober::Prober;
 use kiosk_core::net::reach::resolve_probe_url;
+use nav_policy::{NavPolicy, SharedNavPolicy};
 use tauri::{AppHandle, Manager};
 use tokio::sync::{mpsc, Notify};
 use tokio_util::sync::CancellationToken;
@@ -209,6 +212,16 @@ async fn main() {
     let first_event = booted.first_event;
     let warnings = booted.warnings;
 
+    // Live-swappable nav policy (P1-D2b Task 1): built from the just-booted config so
+    // the very first navigation is already judged by it. `fetch::run` (below) stores a
+    // fresh one on every successful config apply; the guard install (Task 2) reads it
+    // lock-free via `nav_policy.load()`.
+    let nav_policy: SharedNavPolicy = Arc::new(ArcSwap::from_pointee(NavPolicy::from_config(
+        &booted.manager.current().content,
+        &home_url,
+    )));
+    let nav_policy_fetch = nav_policy.clone();
+
     // TEL-01: ONE clock, cloned into both the logger stack and the prober. Two
     // independent clocks would give each its own, disagreeing view of the
     // Date-header bootstrap.
@@ -286,6 +299,7 @@ async fn main() {
         telem.clone(),
         refetch.clone(),
         cancel.clone(),
+        nav_policy_fetch,
     ));
     tokio::spawn(probe::run(
         prober,
@@ -301,6 +315,7 @@ async fn main() {
     let refetch_setup = refetch.clone();
     let telem_setup = telem.clone();
     let cancel_setup = cancel.clone();
+    let nav_policy_setup = nav_policy.clone();
 
     tauri::Builder::default()
         // Serve the runtime, user-replaceable `kiosk-offline.mp4` (spec §3.4: sits next
@@ -343,6 +358,12 @@ async fn main() {
             let window = builder.build()?;
 
             nav::install(&window, tx_setup.clone(), telem_setup.clone());
+
+            // Managed state, not yet consumed: the nav guard (P1-D2b Task 2) reads it
+            // via `app.state::<SharedNavPolicy>()` for the WebView2 `NavigationStarting`
+            // intercept. Stashing it here rather than leaving it as an unused local
+            // avoids inventing a second wiring path once Task 2 lands.
+            app.manage(nav_policy_setup.clone());
 
             let sink = TauriSink {
                 app: app.handle().clone(),
