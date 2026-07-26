@@ -155,9 +155,22 @@ impl NavPolicy {
 /// regardless of service workers or preload timing), which is why it is the primary
 /// control and this CSP is the secondary one.
 ///
-/// ponytail: not called from any COM callsite yet — T6 (the document-start injection
-/// bundle) is the intended, not-yet-written caller. Host-tested below regardless, same
-/// convention as `scheme_guard::pdf_decision`.
+/// ponytail: not called from any COM callsite yet. T6 (the document-start injection
+/// bundle) considered wiring this in and explicitly DECIDED NOT TO for P1: this
+/// function's source list is `content_origin` + `tauri.localhost` only, while the
+/// real egress boundary (`crate::egress`'s `WebResourceRequested` filter) admits
+/// every operator-ALLOWLISTED remote host (e.g. a CDN). Injecting this as-is would
+/// make a legitimately-allowlisted subresource pass the native filter and then get
+/// silently blocked by this CSP — a real deployment breaking with no clear signal.
+/// Deriving CSP source origins from `content.allowlist` patterns to reconcile the two
+/// would be a lossy pattern→origin conversion (allowlist patterns are globs over
+/// scheme+host+path; CSP sources are origins) done under time pressure, and shipping
+/// a CSP that can silently break allowlisted content is worse than shipping no CSP
+/// when the native filter already fully enforces egress. So: native filter is the
+/// sole egress boundary for P1; this stays unused (host-tested regardless, same
+/// convention as `scheme_guard::pdf_decision`) as future belt-and-suspenders work,
+/// with the allowlist-derivation left for whoever picks it up to do carefully rather
+/// than guessed here.
 #[allow(dead_code)]
 pub fn csp_policy(content_origin: &str) -> String {
     format!(

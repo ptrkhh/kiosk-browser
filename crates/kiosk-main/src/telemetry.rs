@@ -129,6 +129,13 @@ impl Telemetry {
         f.insert("url_sha256".into(), hash.into());
         self.emit(LogEvent::NavBlocked, f);
     }
+
+    /// The kiosk window lost OS focus (spec §6 taxonomy: `focus.lost`, WARNING) — e.g.
+    /// an alt-tab or a system dialog stealing the foreground. Not a security boundary;
+    /// `main.rs`'s handler that calls this also re-asserts focus immediately after.
+    pub fn focus_lost(&self) {
+        self.emit(LogEvent::FocusLost, Map::new());
+    }
 }
 
 /// Assembles the P1-B logger stack for this device.

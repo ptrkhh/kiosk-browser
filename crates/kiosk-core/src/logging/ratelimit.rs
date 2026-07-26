@@ -54,6 +54,11 @@ pub fn caps() -> &'static [(Event, u32, u32)] {
         (Event::NavBlocked, 10, 20),
         (Event::NavError, 10, 20),
         (Event::WebviewCrash, 6, 6),
+        // focus.lost is OS/window-manager-driven (alt-tab, an always-on-top window,
+        // a UAC prompt): a real focus-fight would otherwise emit unbounded WARNING
+        // entries and unbounded disk-spool writes. Capped at its WARNING siblings'
+        // rate (10/min, burst 20).
+        (Event::FocusLost, 10, 20),
     ]
 }
 

@@ -41,12 +41,12 @@
 use crate::nav_policy::{PermissionKind, SharedNavPolicy};
 
 #[cfg(windows)]
-pub fn apply(window: &tauri::WebviewWindow, nav_policy: SharedNavPolicy) {
-    windows_impl::apply(window, nav_policy);
+pub fn apply(window: &tauri::WebviewWindow, nav_policy: SharedNavPolicy, zoom: f64) {
+    windows_impl::apply(window, nav_policy, zoom);
 }
 
 #[cfg(not(windows))]
-pub fn apply(_window: &tauri::WebviewWindow, _nav_policy: SharedNavPolicy) {
+pub fn apply(_window: &tauri::WebviewWindow, _nav_policy: SharedNavPolicy, _zoom: f64) {
     eprintln!(
         "hardening: only implemented on Windows; settings flags/script-dialog/permission policy will never apply"
     );
@@ -89,7 +89,7 @@ mod windows_impl {
     /// broken/hostile page trying to wedge the kiosk behind an unbounded dialog stack.
     const SCRIPT_DIALOG_BUDGET: u32 = 20;
 
-    pub fn apply(window: &tauri::WebviewWindow, nav_policy: SharedNavPolicy) {
+    pub fn apply(window: &tauri::WebviewWindow, nav_policy: SharedNavPolicy, zoom: f64) {
         let result = window.with_webview(move |platform_webview| unsafe {
             use webview2_com::Microsoft::Web::WebView2::Win32::{
                 ICoreWebView2PermissionRequestedEventArgs, ICoreWebView2ScriptDialogOpeningEventArgs,
@@ -99,6 +99,20 @@ mod windows_impl {
             use webview2_com::{PermissionRequestedEventHandler, ScriptDialogOpeningEventHandler};
 
             let controller = platform_webview.controller();
+
+            // ---- Task 6 Step 3: fixed zoom factor ---------------------------------
+            //
+            // `SetZoomFactor` lives on `ICoreWebView2Controller` itself (confirmed
+            // against webview2-com-sys 0.38.2 bindings.rs:8920 `impl
+            // ICoreWebView2Controller`, method at bindings.rs:8972) — not on
+            // `Settings`/`Settings4`/`Settings5`. `SetIsZoomControlEnabled(false)`
+            // above (Task 5) only stops the OPERATOR from changing zoom (ctrl+wheel,
+            // pinch, ctrl+/-); it does not touch this fixed factor, which is why both
+            // can coexist: one fixes the value, the other locks it from being moved.
+            if let Err(e) = controller.SetZoomFactor(zoom) {
+                eprintln!("hardening: SetZoomFactor({zoom}) failed: {e}");
+            }
+
             let webview2 = match controller.CoreWebView2() {
                 Ok(w) => w,
                 Err(e) => {
