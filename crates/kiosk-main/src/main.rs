@@ -6,6 +6,7 @@ mod driver;
 mod effect;
 mod egress;
 mod fetch;
+mod hardening;
 mod nav;
 mod nav_policy;
 mod probe;
@@ -367,6 +368,7 @@ async fn main() {
             );
             scheme_guard::install(&window, telem_setup.clone(), nav_policy_setup.clone());
             egress::install(&window, telem_setup.clone(), nav_policy_setup.clone());
+            hardening::apply(&window, nav_policy_setup.clone());
 
             let sink = TauriSink {
                 app: app.handle().clone(),

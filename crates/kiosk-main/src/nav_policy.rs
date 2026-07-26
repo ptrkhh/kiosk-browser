@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use kiosk_core::config::schema::Content;
+use kiosk_core::config::schema::{Content, Permissions};
 use kiosk_core::nav::allowlist::Allowlist;
 use kiosk_core::nav::{decide, Decision};
 
@@ -30,6 +30,7 @@ pub struct NavPolicy {
     // ponytail: see `pdf_view()`'s doc comment — read by no COM callsite yet.
     #[allow(dead_code)]
     pdf_view: bool,
+    permissions: Permissions,
 }
 
 impl NavPolicy {
@@ -44,6 +45,7 @@ impl NavPolicy {
             allowlist: Allowlist::new(&content.allowlist, active_url),
             scheme_allowlist: content.scheme_allowlist.clone(),
             pdf_view: content.pdf_view,
+            permissions: content.permissions.clone(),
         }
     }
 
@@ -67,6 +69,13 @@ impl NavPolicy {
     #[allow(dead_code)]
     pub fn pdf_view(&self) -> bool {
         self.pdf_view
+    }
+
+    /// The live `[content.permissions]` (spec M9, default-deny) — read by
+    /// `hardening`'s `PermissionRequested` handler via `permission_allowed`, never
+    /// consulted directly (that would let a callsite skip the default-deny mapping).
+    pub fn permissions(&self) -> &Permissions {
+        &self.permissions
     }
 
     /// The single per-navigation verdict, routed through `kiosk_core::nav::decide` —
@@ -160,6 +169,38 @@ pub fn csp_policy(content_origin: &str) -> String {
          media-src {content_origin} http://tauri.localhost; \
          object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
     )
+}
+
+/// A LOCAL mirror of the WebView2 `COREWEBVIEW2_PERMISSION_KIND` values `hardening`'s
+/// `PermissionRequested` handler actually maps (P1-D2b Task 5, spec M9) — never the
+/// full webview2-com-sys enum (autoplay/file-read-write/local-fonts/MIDI-sysex/
+/// window-management have no `Permissions` field to map to and fall into `Other`,
+/// same as anything genuinely unrecognized). Pure and host-tested here so the
+/// default-deny mapping is checkable without a live WebView2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionKind {
+    Camera,
+    Microphone,
+    Geolocation,
+    Notifications,
+    ClipboardRead,
+    /// Every WebView2 permission kind this crate does not explicitly map — always
+    /// denied (default-deny, spec M9), never a silent allow.
+    Other,
+}
+
+/// Default-deny permission policy (spec M9): allowed iff `kind` maps to a `Permissions`
+/// field AND that field is `true`; every unmapped `kind` (`Other`) is always denied,
+/// regardless of `perms`.
+pub fn permission_allowed(kind: PermissionKind, perms: &Permissions) -> bool {
+    match kind {
+        PermissionKind::Camera => perms.camera,
+        PermissionKind::Microphone => perms.microphone,
+        PermissionKind::Geolocation => perms.geolocation,
+        PermissionKind::Notifications => perms.notifications,
+        PermissionKind::ClipboardRead => perms.clipboard_read,
+        PermissionKind::Other => false,
+    }
 }
 
 /// App-origin (bundled pages / mp4) vs remote content. Single source of truth;
@@ -303,5 +344,50 @@ mod tests {
         assert!(csp.contains("default-src"));
         assert!(csp.contains("https://home.test"));
         assert!(csp.contains("http://tauri.localhost"));
+    }
+
+    // ---- permission_allowed (P1-D2b Task 5, spec M9 default-deny) --------------------
+
+    #[test]
+    fn camera_is_denied_by_default() {
+        assert!(!permission_allowed(
+            PermissionKind::Camera,
+            &Permissions::default()
+        ));
+    }
+
+    #[test]
+    fn camera_is_allowed_when_operator_grants_it() {
+        let perms = Permissions {
+            camera: true,
+            ..Permissions::default()
+        };
+        assert!(permission_allowed(PermissionKind::Camera, &perms));
+    }
+
+    #[test]
+    fn an_unmapped_kind_is_always_denied_even_if_everything_else_is_granted() {
+        let perms = Permissions {
+            camera: true,
+            microphone: true,
+            geolocation: true,
+            notifications: true,
+            clipboard_read: true,
+            ..Permissions::default()
+        };
+        assert!(!permission_allowed(PermissionKind::Other, &perms));
+    }
+
+    #[test]
+    fn every_mapped_kind_reads_its_own_field_only() {
+        let perms = Permissions {
+            microphone: true,
+            ..Permissions::default()
+        };
+        assert!(!permission_allowed(PermissionKind::Camera, &perms));
+        assert!(permission_allowed(PermissionKind::Microphone, &perms));
+        assert!(!permission_allowed(PermissionKind::Geolocation, &perms));
+        assert!(!permission_allowed(PermissionKind::Notifications, &perms));
+        assert!(!permission_allowed(PermissionKind::ClipboardRead, &perms));
     }
 }
