@@ -25,10 +25,7 @@ pub type SharedNavPolicy = Arc<ArcSwap<NavPolicy>>;
 /// The navigation inputs derived from the currently-applied config. Rebuilt (never
 /// mutated) on every config apply, including the very first one at boot.
 pub struct NavPolicy {
-    // Consumed by the navigation guard in Task 2 (via `decision_for`); dead until then.
-    #[allow(dead_code)]
     allowlist: Allowlist,
-    #[allow(dead_code)]
     scheme_allowlist: Vec<String>,
 }
 
@@ -49,8 +46,6 @@ impl NavPolicy {
     /// The single per-navigation verdict, routed through `kiosk_core::nav::decide` —
     /// never `Allowlist::allows` directly (that would bypass the `kiosk://`-from-remote
     /// guard; see `decide`'s own docs).
-    // Consumed by the navigation guard in Task 2; dead until then.
-    #[allow(dead_code)]
     pub fn decision_for(&self, url: &str) -> Decision {
         decide(
             url,

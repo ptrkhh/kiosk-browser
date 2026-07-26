@@ -357,13 +357,12 @@ async fn main() {
             };
             let window = builder.build()?;
 
-            nav::install(&window, tx_setup.clone(), telem_setup.clone());
-
-            // Managed state, not yet consumed: the nav guard (P1-D2b Task 2) reads it
-            // via `app.state::<SharedNavPolicy>()` for the WebView2 `NavigationStarting`
-            // intercept. Stashing it here rather than leaving it as an unused local
-            // avoids inventing a second wiring path once Task 2 lands.
-            app.manage(nav_policy_setup.clone());
+            nav::install(
+                &window,
+                tx_setup.clone(),
+                telem_setup.clone(),
+                nav_policy_setup.clone(),
+            );
 
             let sink = TauriSink {
                 app: app.handle().clone(),
