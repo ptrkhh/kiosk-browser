@@ -8,6 +8,7 @@ pub mod error;
 pub mod exit;
 pub mod identity;
 pub mod logging;
+pub mod metrics;
 pub mod nav;
 pub mod net;
 
