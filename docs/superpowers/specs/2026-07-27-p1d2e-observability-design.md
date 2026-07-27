@@ -86,6 +86,16 @@ event) with the specific control left un-hardened (e.g. `autofill_stays_on`,
 `pinch_zoom_stays_on`). `try_send`, never panics. Does not change behaviour — just makes the
 silent downgrade visible.
 
+### kiosk-main: egress allow the IPC origin (D2c smoke follow-up)
+The D2c smoke found the egress guard (D2b) reporting
+`nav.blocked{reason:egress, url:"http://ipc.localhost"}` — Tauri's own IPC custom-protocol
+origin on Windows. Nothing user-visible broke (IPC still works), but the app's internal
+origin must not be classified as remote/off-list egress. Fix in the single shared classifier
+`nav_policy::is_remote_origin` (used by both the nav-guard FSM feed and the egress
+`resource_allowed`): add `ipc.localhost` to the app-origin set alongside `tauri.localhost`
+and `kioskasset.localhost`. One place, so the nav guard and egress filter agree by
+construction; a host-test pins that `http://ipc.localhost/...` is app-origin (not remote).
+
 ## Data flow
 
 - **health:** every `health_sample_s` → sample → `HealthSample` INFO entry (batched by the

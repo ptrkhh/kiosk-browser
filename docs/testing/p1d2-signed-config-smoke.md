@@ -37,6 +37,38 @@ testable with just a local `kiosk.ini` — no signed config, no GCP.
      reloads home; if `clear_data_on_reset`, a cookie/autofill entry set beforehand is gone
      and the screen does NOT flash home before the clear completes (the privacy gate).
 
+### Run log — 2026-07-27 (Windows 11 ARM64 dev host, x64 build, no GCP)
+
+Setup: `D:\kiosk-smoke\kiosk.ini` (device_id `lobby-01`, bootstrap url `https://example.com/`,
+PIN `4291`), `kiosk-main.exe --config D:/kiosk-smoke`, telemetry disabled (no credential).
+
+| Step | Result |
+|---|---|
+| PIN pad opens; `4291` → exit code | **PASS** — `EXITCODE=86` |
+| Lockout survives restart (SEC-05) | **PASS** — `exit-lockout.json` `failures:3 → 4` across restart; wait 5 s → 10 s (`BACKOFF_BASE_S` doubling), so the counter came off disk |
+| No `pin_hash` ⇒ gesture disabled (cfg-12) | **PASS** — `gesture: … not configured (cfg-12); tap capture disabled` + `open_pin_pad no-op`; neither 7 taps nor Ctrl+Alt+Shift+K opened the pad |
+| Idle reset (180 s default) | **PASS** — reloaded home |
+| Off-allowlist nav (`example.com` → `iana.org`) | **PASS** — with telemetry on, `spool/high` shows `nav.blocked{reason:not_allowlisted}` AND `nav.blocked{reason:egress}` for `https://iana.org` (WARNING events go to `spool/high`, not `low`) |
+| Telemetry upload (real GCP key, project `ubm-gen-ai`) | **PASS** — `logName projects/ubm-gen-ai/logs/kiosk`, `generic_node/lobby-01`; `app.start`/`config.applied`/`net.online`/`app.stop` written, cursor `committed` advances to full count. Entries pending at exit are drained on the next boot (spool replay), `dropped:0` |
+
+Open finding — the egress guard blocks the app's OWN IPC origin:
+`nav.blocked{reason:egress, url:"http://ipc.localhost"}`. Nothing user-visible broke (the PIN
+pad IPC still worked), but the internal origin should not be reported as blocked egress —
+check the egress allow list against `APP_ORIGIN`/`ipc.localhost`.
+
+Open finding — WebView2 hardening degraded on this host, logged every boot:
+```
+hardening: CoreWebView2Settings does not implement Settings4, autofill/password-autosave will stay on: Access is denied. (0x80004002)
+hardening: CoreWebView2Settings does not implement Settings5, pinch zoom will stay on: No such interface supported (0x80004002)
+```
+⇒ autofill/password-save and pinch zoom remain ON. Check the WebView2 Runtime version on the
+deployment image before shipping; re-run this on real kiosk hardware.
+
+Host prerequisites learned: VS BuildTools needs the **VCTools** workload; this ARM64 dev host has
+no ARM64 MSVC target toolset, so the repo is pinned via `rustup override set
+stable-x86_64-pc-windows-msvc` and cargo must run inside
+`vcvarsall.bat arm64_x64` (plain `cargo` fails with `cl.exe: program not found`).
+
 ## 1. Keys (once)
 ```
 cargo run -p kiosk-core --example kioskctl -- keygen
