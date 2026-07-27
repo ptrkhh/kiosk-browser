@@ -85,12 +85,12 @@ pub fn should_swallow(vk: u32, mods: Modifiers) -> bool {
 }
 
 #[cfg(windows)]
-pub fn install(window: &tauri::WebviewWindow, telem: crate::telemetry::Telemetry) {
-    windows_impl::install(window, telem);
+pub fn install(window: &tauri::WebviewWindow) {
+    windows_impl::install(window);
 }
 
 #[cfg(not(windows))]
-pub fn install(_window: &tauri::WebviewWindow, _telem: crate::telemetry::Telemetry) {
+pub fn install(_window: &tauri::WebviewWindow) {
     eprintln!("shortcuts: only implemented on Windows; nothing will be swallowed");
 }
 
@@ -101,7 +101,6 @@ mod windows_impl {
     };
 
     use super::Modifiers;
-    use crate::telemetry::Telemetry;
 
     /// High bit of `GetKeyState` set = key currently down. A synchronous, per-call
     /// Win32 query (not `GetAsyncKeyState`'s "since last call" semantics) — correct
@@ -182,19 +181,11 @@ mod windows_impl {
     // accelerator pipeline runs at all). §7.2 OS lockdown (Assigned Access / Shell
     // Launcher) is the real, covering boundary.
 
-    use std::sync::OnceLock;
     use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, DispatchMessageW, GetMessageW, SetWindowsHookExW, TranslateMessage,
         KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN,
     };
-
-    /// The telemetry handle the hook callback reaches into. Set once, before the
-    /// hook is installed, by the dedicated hook thread itself — never mutated again,
-    /// so a plain `OnceLock` (no `Mutex`) is enough; the `extern "system"` callback
-    /// cannot capture state directly (`SetWindowsHookExW` takes a bare fn pointer,
-    /// not a closure).
-    static HOOK_TELEM: OnceLock<Telemetry> = OnceLock::new();
 
     unsafe extern "system" fn kb_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         if code >= 0 && (wparam.0 as u32 == WM_KEYDOWN || wparam.0 as u32 == WM_SYSKEYDOWN) {
@@ -210,8 +201,7 @@ mod windows_impl {
     /// low-level hook's callbacks are delivered by pumping messages on the
     /// installing thread, so it must never share the Tauri/WebView2 UI thread's
     /// pump (spec §3.1 M2 / the P0 spike's own doc comment on this exact point).
-    fn install_ll_hook(telem: Telemetry) {
-        let _ = HOOK_TELEM.set(telem);
+    fn install_ll_hook() {
         let spawned = std::thread::Builder::new()
             .name("shortcuts-ll-hook".into())
             .spawn(|| unsafe {
@@ -231,9 +221,9 @@ mod windows_impl {
         }
     }
 
-    pub fn install(window: &tauri::WebviewWindow, telem: Telemetry) {
+    pub fn install(window: &tauri::WebviewWindow) {
         install_accelerator_handler(window);
-        install_ll_hook(telem);
+        install_ll_hook();
     }
 }
 

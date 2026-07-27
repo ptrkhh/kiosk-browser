@@ -116,24 +116,25 @@ mod windows_impl {
                     // then emits a suppressed-summary (shared with `nav.rs`/`scheme_guard`'s
                     // own blocked events); a second bucket would just double-count the same
                     // burst under a different key.
+                    // Emit `nav.blocked{egress}` ONLY when the substitution actually
+                    // took — a failed 403 substitution is fail-open (the data egressed),
+                    // so logging "blocked" there would make the dashboard lie.
                     match environment.CreateWebResourceResponse(
                         None::<&windows::Win32::System::Com::IStream>,
                         403,
                         &HSTRING::from("Forbidden"),
                         &HSTRING::from(""),
                     ) {
-                        Ok(response) => {
-                            if let Err(e) = args.SetResponse(&response) {
-                                eprintln!(
-                                    "egress: SetResponse failed, request left un-substituted: {e}"
-                                );
-                            }
-                        }
+                        Ok(response) => match args.SetResponse(&response) {
+                            Ok(()) => telem.nav_blocked(super::REASON_EGRESS, &uri),
+                            Err(e) => eprintln!(
+                                "egress: SetResponse failed, request left un-substituted (fail-open): {e}"
+                            ),
+                        },
                         Err(e) => eprintln!(
-                            "egress: CreateWebResourceResponse failed, request left un-substituted: {e}"
+                            "egress: CreateWebResourceResponse failed, request left un-substituted (fail-open): {e}"
                         ),
                     }
-                    telem.nav_blocked(super::REASON_EGRESS, &uri);
                     Ok(())
                 },
             ));

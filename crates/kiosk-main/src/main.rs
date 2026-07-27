@@ -407,7 +407,7 @@ async fn main() {
             scheme_guard::install(&window, telem_setup.clone(), nav_policy_setup.clone());
             egress::install(&window, telem_setup.clone(), nav_policy_setup.clone());
             hardening::apply(&window, nav_policy_setup.clone(), content_zoom);
-            shortcuts::install(&window, telem_setup.clone());
+            shortcuts::install(&window);
             recovery::install(&window, telem_setup.clone(), nav_policy_setup.clone());
 
             // focus.lost (spec §7): best-effort, not a security boundary — a kiosk
