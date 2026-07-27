@@ -1882,6 +1882,7 @@ dependencies = [
  "rsa",
  "serde",
  "serde_json",
+ "sysinfo",
  "tauri",
  "tauri-build",
  "tempfile",

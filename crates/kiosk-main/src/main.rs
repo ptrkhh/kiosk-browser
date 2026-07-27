@@ -9,6 +9,7 @@ mod egress;
 mod fetch;
 mod gesture;
 mod hardening;
+mod health;
 mod idle;
 mod inject;
 mod nav;
@@ -22,7 +23,7 @@ mod telemetry;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use driver::{Driver, EffectSink};
@@ -32,6 +33,7 @@ use kiosk_core::logging::time::TrustedClock;
 use kiosk_core::net::prober::Prober;
 use kiosk_core::net::reach::resolve_probe_url;
 use nav_policy::{NavPolicy, SharedNavPolicy};
+use sysinfo::{Disks, System};
 use tauri::{AppHandle, Manager};
 use tokio::sync::{mpsc, Notify};
 use tokio_util::sync::CancellationToken;
@@ -194,6 +196,10 @@ impl EffectSink for TauriSink {
 
 #[tokio::main]
 async fn main() {
+    // P1-D2e Task 2: process-start instant for `health.sample`'s `uptime_secs` —
+    // taken as early as possible so uptime reflects the whole process lifetime,
+    // not just the time since the health task was spawned.
+    let process_started = Instant::now();
     let args = cli::Args::parse(std::env::args());
     let config_dir = resolve_config_dir(args.config.as_deref());
     let ini_path = config_dir.join("kiosk.ini");
@@ -230,6 +236,10 @@ async fn main() {
     // process restart (this loop is spawned once, below, and never re-reads config).
     let idle_reset_seconds = booted.manager.current().content.idle_reset_seconds;
     let allow_text_selection = booted.manager.current().input.allow_text_selection;
+    // P1-D2e Task 2: same "read once, next-restart to change" convention as the
+    // fields above — the health-sample timer is spawned once, below, and never
+    // re-reads config.
+    let health_sample_s = booted.manager.current().logging.health_sample_s;
     // P1-D2c Task 4: same "read once, next-restart to change" convention as the
     // three fields above — remote `input.exit_gesture` wins over bootstrap
     // `[exit_gesture]` (cfg-12), resolved once here via `gesture::effective_gesture`
@@ -287,6 +297,13 @@ async fn main() {
     // fetch/probe/driver/TauriSink/nav keeps working unchanged.
     let app_version = kiosk_core::app_version().to_string();
     let cancel_log = cancel.clone();
+    // Published by `telemetry::run` on the logger thread, read by `health::run`
+    // (spawned below) — see `telemetry::run`'s doc comment for why this atomic,
+    // rather than a direct cross-thread `Logger::dropped_expired()` call, is the
+    // plumbing: the `Logger` lives on this dedicated OS thread and is never `Sync`
+    // across it.
+    let dropped_expired = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let dropped_expired_log = dropped_expired.clone();
     let (handle_tx, handle_rx) = std::sync::mpsc::channel::<Option<telemetry::Telemetry>>();
     let spawned = std::thread::Builder::new()
         .name("telemetry".into())
@@ -302,7 +319,7 @@ async fn main() {
             ) {
                 Ok((telem, logger, log_rx)) => {
                     let _ = handle_tx.send(Some(telem));
-                    telemetry::run(logger, log_rx, cancel_log);
+                    telemetry::run(logger, log_rx, cancel_log, dropped_expired_log);
                 }
                 Err(e) => {
                     eprintln!("kiosk-main: telemetry disabled ({e}); continuing without it");
@@ -347,6 +364,21 @@ async fn main() {
     // P1-D2c Task 3: emits `IdleExpired` UNCONDITIONALLY — the FSM (rule 9) already
     // no-ops it outside `Online`, so no state check belongs here too.
     tokio::spawn(idle::run(idle_reset_seconds, tx.clone(), cancel.clone()));
+
+    // P1-D2e Task 2: periodic `health.sample`. `resolve_data_dir()` is a pure
+    // function of `%ProgramData%`, cheap to call again here — the `data_dir` bound
+    // at the top of `main` was already moved into the telemetry thread's closure
+    // above (same pattern as `pinpad_state` below).
+    tokio::spawn(health::run(
+        System::new(),
+        Disks::new_with_refreshed_list(),
+        resolve_data_dir(),
+        process_started,
+        health_sample_s,
+        Arc::new(move || dropped_expired.load(std::sync::atomic::Ordering::Relaxed)),
+        telem.clone(),
+        cancel.clone(),
+    ));
 
     // Keep-awake (spec §7, display.keep_awake): asserted once at startup, for the
     // life of the process — WebView2/tao has no per-window "don't sleep" flag, so

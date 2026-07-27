@@ -11,6 +11,7 @@
 //! live on the tokio runtime — see [`run`]).
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -146,6 +147,12 @@ impl Telemetry {
         f.insert("kind".into(), Value::from(kind));
         self.emit(LogEvent::WebviewCrash, f);
     }
+
+    /// A periodic `health.sample` (spec §6, P1-D2e Task 2): BASIC host metrics
+    /// (`kiosk_core::metrics::sample`/`to_fields`) — no free-form content.
+    pub fn health(&self, fields: Map<String, Value>) {
+        self.emit(LogEvent::HealthSample, fields);
+    }
 }
 
 /// Assembles the P1-B logger stack for this device.
@@ -235,9 +242,23 @@ pub fn build(
 /// `pending` growing until the ring evicts it, no flood summary. Ticking on a fixed
 /// `next_tick` deadline fires ~every FLUSH_INTERVAL regardless of load, matching the
 /// old `tokio::time::interval` cadence.
-pub fn run(mut logger: Logger, rx: Receiver<LogReq>, cancel: CancellationToken) {
+///
+/// `dropped_expired` is published here, into a shared atomic, on every pass: the
+/// `Logger` lives on this dedicated thread and is never reachable from another
+/// thread (see the doc above), so `health::run` (P1-D2e Task 2, a tokio task on
+/// the async runtime) cannot call `Logger::dropped_expired(&self)` directly. This
+/// is the smallest correct plumbing — reusing the existing counter rather than
+/// inventing a second one — at the cost of the health sample reading a value that
+/// is at most one loop-iteration stale, which is fine for a 10s+ heartbeat metric.
+pub fn run(
+    mut logger: Logger,
+    rx: Receiver<LogReq>,
+    cancel: CancellationToken,
+    dropped_expired: Arc<AtomicU64>,
+) {
     let mut next_tick = Instant::now() + FLUSH_INTERVAL;
     loop {
+        dropped_expired.store(logger.dropped_expired(), Ordering::Relaxed);
         if cancel.is_cancelled() {
             let _ = logger.flush();
             break;
