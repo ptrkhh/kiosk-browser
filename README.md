@@ -51,6 +51,22 @@ cargo +stable-x86_64-pc-windows-msvc build -p kiosk-main
 The resulting x64 binary runs under emulation; WebView2 and the Win32 input hooks behave
 identically (the P0 gate below was validated this way).
 
+## Runtime controls (spec §3.5, §7)
+
+All of these are **native** (Windows, P1) — no page-world JavaScript drives them, so
+remote content cannot neutralize them (spec §8).
+
+| Control | Behaviour | Configured by |
+|---|---|---|
+| **Idle-session reset** | After no user input for `idle_reset_seconds`, the kiosk reloads the home URL. If `clear_data_on_reset`, the **full profile is cleared first** — cookies, storage, IndexedDB, autofill/Web-Data, Login-Data — and re-display is gated until the async clear completes (no next session sees the last one's data). `0` = off. | remote `content.idle_reset_seconds` / `content.clear_data_on_reset` |
+| **Exit gesture** | A technician exit. **Two triggers, both open the PIN pad:** (1) `taps` rapid taps in the configured screen `region` (top-left/…/center); (2) a reserved keyboard chord as a fallback (kept because native tap-capture over a focused WebView2 is not universally guaranteed — spec §3.5). | remote `input.exit_gesture` → `kiosk.ini [exit_gesture]` |
+| **PIN pad** | A bundled app-origin page. The PIN is verified with **argon2id** against the per-device `pin_hash` (a PHC string). Correct PIN → the process exits with **code 86** (the launcher treats 86 as an intentional technician exit, not a crash). Wrong PINs trigger an on-device lockout with exponential backoff that **survives a restart** (SEC-05); the backoff is held in memory so a disk-write failure can't erode it. | `pin_hash`, `taps`, `region` in the gesture config |
+
+**No `pin_hash` configured (neither remote nor `[exit_gesture]`) ⇒ the exit gesture is
+disabled** (cfg-12) — there is no no-PIN escape. On such a device the only exit is the
+OS-level lockdown layer below. Generate a `pin_hash` and sign per-device config with
+`cargo run -p kiosk-core --example kioskctl` (see `docs/testing/p1d2-signed-config-smoke.md`).
+
 ## Security & deployment: OS-level lockdown is **mandatory**
 
 **The application cannot enforce OS security boundaries. A device that is not locked down
@@ -113,5 +129,6 @@ WebView2 window. Full results and evidence:
   Center, bottom→Start) bypass the mouse hook entirely.
 - ➡️ Therefore **Alt+F4 / Alt+Tab / Win / edge-gesture containment must come from Assigned
   Access / Shell Launcher**, not from the app (spec §12/OD-5).
-- ✅ **Pointer capture works:** the native top-left corner-tap exit gesture (spec §3.5) is
-  reliably seen over the focused webview — no fallback chord needed.
+- ✅ **Pointer capture works:** the native corner-tap exit gesture (spec §3.5) is seen over
+  the focused webview. A keyboard-chord trigger ships alongside it as belt-and-suspenders
+  (spec §3.5), so a locked device is never unexitable even where tap-capture is unreliable.
