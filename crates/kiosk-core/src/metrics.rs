@@ -76,6 +76,24 @@ mod tests {
     }
 
     #[test]
+    fn sample_selects_a_real_mount_for_an_absolute_data_dir() {
+        let mut sys = sysinfo::System::new();
+        let mut disks = sysinfo::Disks::new_with_refreshed_list();
+        if disks.list().is_empty() {
+            eprintln!("skipping: no disks reported on this host");
+            return;
+        }
+        // An absolute cwd is guaranteed to live under some real mount point, unlike "." which
+        // never satisfies `data_dir.starts_with(mount_point)` and always falls through to 0.
+        let data_dir = std::env::current_dir().expect("cwd must be readable");
+        let s = sample(&mut sys, &mut disks, &data_dir, Instant::now());
+        assert!(
+            s.disk_free_mb > 0,
+            "expected the disk-selection filter to match a real mount for an absolute path"
+        );
+    }
+
+    #[test]
     fn to_fields_has_the_enumerated_keys_plus_dropped_expired() {
         let s = HealthSample {
             cpu_percent: 1.0,
