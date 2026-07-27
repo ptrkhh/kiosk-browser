@@ -1,0 +1,104 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>kiosk — technician exit</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #000;
+        color: #ccc;
+        font: 16px sans-serif;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 12px;
+      }
+      #pin {
+        font-size: 24px;
+        letter-spacing: 6px;
+        min-height: 1.5em;
+      }
+      #pad {
+        display: grid;
+        grid-template-columns: repeat(3, 64px);
+        gap: 8px;
+      }
+      button {
+        font-size: 20px;
+        padding: 12px 0;
+      }
+      #msg {
+        min-height: 1.2em;
+        color: #f66;
+      }
+    </style>
+  </head>
+  <body>
+    <!-- D2c ships the minimal functional pad; D2d polishes styling/assets. -->
+    <div id="pin"></div>
+    <div id="pad">
+      <button data-d="1">1</button>
+      <button data-d="2">2</button>
+      <button data-d="3">3</button>
+      <button data-d="4">4</button>
+      <button data-d="5">5</button>
+      <button data-d="6">6</button>
+      <button data-d="7">7</button>
+      <button data-d="8">8</button>
+      <button data-d="9">9</button>
+      <button id="clear">C</button>
+      <button data-d="0">0</button>
+      <button id="ok">OK</button>
+    </div>
+    <div id="msg"></div>
+    <script>
+      let pin = '';
+      const pinEl = document.getElementById('pin');
+      const msgEl = document.getElementById('msg');
+
+      function render() {
+        pinEl.textContent = '*'.repeat(pin.length);
+      }
+
+      document.getElementById('clear').addEventListener('click', () => {
+        pin = '';
+        msgEl.textContent = '';
+        render();
+      });
+
+      document.querySelectorAll('#pad button[data-d]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          pin += btn.dataset.d;
+          render();
+        });
+      });
+
+      document.getElementById('ok').addEventListener('click', async () => {
+        msgEl.textContent = '';
+        try {
+          const result = await window.__TAURI__.core.invoke('verify_pin', { pin });
+          // `Ok` means the process is already exiting (exit code 86) — nothing
+          // left to render. `Blocked`/`Rejected` are the only results this page
+          // ever actually shows.
+          if (result === 'Ok' || result?.result === 'Ok') {
+            return;
+          }
+          if (result?.result === 'Blocked') {
+            const until = new Date(result.until * 1000).toLocaleTimeString();
+            msgEl.textContent = `Blocked until ${until}`;
+          } else {
+            msgEl.textContent = 'Rejected';
+          }
+        } catch (e) {
+          msgEl.textContent = 'Rejected';
+        }
+        pin = '';
+        render();
+      });
+    </script>
+  </body>
+</html>

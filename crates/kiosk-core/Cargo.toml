@@ -21,6 +21,7 @@ url = "2"
 urlpattern = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 jsonwebtoken = "9"
+argon2 = "0.5"
 
 [dev-dependencies]
 tempfile = "3"

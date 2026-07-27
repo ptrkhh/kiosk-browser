@@ -1,15 +1,19 @@
 #![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
 
 mod boot;
+mod clear;
 mod cli;
 mod driver;
 mod effect;
 mod egress;
 mod fetch;
+mod gesture;
 mod hardening;
+mod idle;
 mod inject;
 mod nav;
 mod nav_policy;
+mod pinpad;
 mod probe;
 mod recovery;
 mod scheme_guard;
@@ -165,16 +169,21 @@ impl EffectSink for TauriSink {
         }
         match effect {
             Effect::RefetchConfig => self.refetch.notify_one(),
-            // D2c: profile clearing is not implemented yet. D2a never arms the idle
-            // timer that would emit this in practice (plan's "deferred effects" note),
-            // so this is a documented no-op, not a placeholder oversight. No `Telemetry`
-            // helper names this event (D2c's job to add one) — a bare warning is the
-            // honest signal without inventing a Cloud Logging taxonomy entry early.
-            Effect::ClearProfile { full } => {
-                eprintln!(
-                    "TauriSink: Effect::ClearProfile{{full:{full}}} not implemented (D2c) — no-op"
-                );
-                let _ = &self.telem; // kept for the D2c implementer; unused today.
+            // D2c: executes the real WebView2 clear (see `crate::clear`) and always
+            // sends `AppEvent::ProfileCleared` back, releasing the P1-D1 `Clearing`
+            // privacy gate — on the success path AND on any cast/call failure (never
+            // strand the kiosk on the gate). `full` has no partial-clear counterpart in
+            // the FSM (rule 9 only ever emits `{full: true}`), so it is intentionally
+            // unused here rather than threaded into a data-kind choice that has no
+            // caller.
+            Effect::ClearProfile { full: _ } => {
+                let Some(window) = self.app.get_webview_window(WINDOW_LABEL) else {
+                    eprintln!("TauriSink: window {WINDOW_LABEL:?} missing, cannot clear profile");
+                    // Never strand the Clearing gate even when the window is gone.
+                    let _ = self.tx.try_send(AppEvent::ProfileCleared);
+                    return;
+                };
+                clear::clear(&window, self.tx.clone(), self.telem.clone());
             }
             other => unreachable!(
                 "effect::page_for only returns None for RefetchConfig/ClearProfile, got {other:?}"
@@ -216,7 +225,20 @@ async fn main() {
     // does NOT take effect until the next process restart (see `inject`'s module doc).
     let display = booted.manager.current().display.clone();
     let content_zoom = booted.manager.current().content.zoom;
+    // P1-D2c Task 3: read once, at boot, like the zoom/injection fields above — a
+    // later config fetch changing `idle_reset_seconds` takes effect only on the next
+    // process restart (this loop is spawned once, below, and never re-reads config).
+    let idle_reset_seconds = booted.manager.current().content.idle_reset_seconds;
     let allow_text_selection = booted.manager.current().input.allow_text_selection;
+    // P1-D2c Task 4: same "read once, next-restart to change" convention as the
+    // three fields above — remote `input.exit_gesture` wins over bootstrap
+    // `[exit_gesture]` (cfg-12), resolved once here via `gesture::effective_gesture`
+    // and handed to both trigger paths (`shortcuts::install`'s chord,
+    // `gesture::install`'s tap capture) below.
+    let exit_gesture = gesture::effective_gesture(
+        booted.manager.current().input.exit_gesture.as_ref(),
+        bootstrap.exit_gesture.as_ref(),
+    );
     let credential_path = config_dir.join(&bootstrap.credential);
     let config_url = bootstrap.config_url.clone();
     let poll_s = network.config_poll_s;
@@ -322,6 +344,9 @@ async fn main() {
         telem.clone(),
         cancel.clone(),
     ));
+    // P1-D2c Task 3: emits `IdleExpired` UNCONDITIONALLY — the FSM (rule 9) already
+    // no-ops it outside `Online`, so no state check belongs here too.
+    tokio::spawn(idle::run(idle_reset_seconds, tx.clone(), cancel.clone()));
 
     // Keep-awake (spec §7, display.keep_awake): asserted once at startup, for the
     // life of the process — WebView2/tao has no per-window "don't sleep" flag, so
@@ -348,8 +373,21 @@ async fn main() {
     let telem_setup = telem.clone();
     let cancel_setup = cancel.clone();
     let nav_policy_setup = nav_policy.clone();
+    let exit_gesture_setup = exit_gesture.clone();
+
+    // P1-D2c Task 5: the `verify_pin` command's state. `resolve_data_dir()` is a
+    // pure function of `%ProgramData%`, cheap to call again here — the `data_dir`
+    // bound at the top of `main` was already moved into the telemetry thread's
+    // closure above. `PinPadState::new` seeds the authoritative in-memory lockout
+    // from disk once, here at startup.
+    let pinpad_state = pinpad::PinPadState::new(
+        exit_gesture.as_ref().map(|g| g.pin_hash.clone()),
+        resolve_data_dir(),
+    );
 
     tauri::Builder::default()
+        .manage(pinpad_state)
+        .invoke_handler(tauri::generate_handler![pinpad::verify_pin])
         // Serve the runtime, user-replaceable `kiosk-offline.mp4` (spec §3.4: sits next
         // to the binaries, NOT build-embedded) to the bundled offline.html at a fixed
         // origin. A custom scheme rather than the built-in asset protocol because the
@@ -407,7 +445,8 @@ async fn main() {
             scheme_guard::install(&window, telem_setup.clone(), nav_policy_setup.clone());
             egress::install(&window, telem_setup.clone(), nav_policy_setup.clone());
             hardening::apply(&window, nav_policy_setup.clone(), content_zoom);
-            shortcuts::install(&window);
+            shortcuts::install(&window, app.handle().clone(), exit_gesture_setup.clone());
+            gesture::install(&window, app.handle().clone(), exit_gesture_setup.clone());
             recovery::install(&window, telem_setup.clone(), nav_policy_setup.clone());
 
             // focus.lost (spec §7): best-effort, not a security boundary — a kiosk
