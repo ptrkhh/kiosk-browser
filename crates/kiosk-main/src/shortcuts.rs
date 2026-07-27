@@ -54,6 +54,8 @@ const VK_ESCAPE: u32 = 0x1B;
 /// The "Menu"/"Apps" key (the one between right-Alt and right-Ctrl on a full
 /// keyboard) — `windows` crate's `VK_APPS`.
 const VK_APPS: u32 = 0x5D;
+/// `K`, for the technician exit-gesture chord below.
+const VK_K: u32 = 0x4B;
 
 /// The pure classification behind both swallow vectors (spec §7's explicit list):
 /// Ctrl+W/N/T/P, F5, F11, the standalone Menu/App key, Alt+F4/Tab/Esc, Ctrl+Esc,
@@ -84,13 +86,35 @@ pub fn should_swallow(vk: u32, mods: Modifiers) -> bool {
     }
 }
 
+/// Reserved technician exit-gesture fallback (Ctrl+Alt+Shift+K, spec §3.5). The
+/// tap-capture trigger (`gesture::install`) rests on a P0-UNCONFIRMED substitute
+/// for a WebView2 pointer-observation API that does not exist in webview2-com-sys
+/// 0.38.2 (see that module's doc comment) — this chord is the guaranteed,
+/// always-available fallback so a locked-down kiosk is never unexitable even if
+/// tap capture silently fails to fire. Deliberately checked INDEPENDENTLY of
+/// [`should_swallow`] (never folded into that table): matching here must not
+/// swallow the key (a swallow would call `SetHandled` and stop there), and
+/// `should_swallow` swallowing it would prevent this from ever being observed at
+/// all — the two decisions must never be layered on the same key.
+pub fn is_technician_chord(vk: u32, mods: Modifiers) -> bool {
+    vk == VK_K && mods.ctrl && mods.alt && mods.shift
+}
+
 #[cfg(windows)]
-pub fn install(window: &tauri::WebviewWindow) {
-    windows_impl::install(window);
+pub fn install(
+    window: &tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    gesture: Option<crate::gesture::EffectiveGesture>,
+) {
+    windows_impl::install(window, app, gesture);
 }
 
 #[cfg(not(windows))]
-pub fn install(_window: &tauri::WebviewWindow) {
+pub fn install(
+    _window: &tauri::WebviewWindow,
+    _app: tauri::AppHandle,
+    _gesture: Option<crate::gesture::EffectiveGesture>,
+) {
     eprintln!("shortcuts: only implemented on Windows; nothing will be swallowed");
 }
 
@@ -129,8 +153,12 @@ mod windows_impl {
     /// `Handled` are its only members — `PhysicalKeyStatus.IsMenuKeyDown` reports Alt,
     /// but nothing reports Ctrl/Shift/Win), so those three still need the same Win32
     /// query the LL hook (below) already needs.
-    fn install_accelerator_handler(window: &tauri::WebviewWindow) {
-        let result = window.with_webview(|platform_webview| unsafe {
+    fn install_accelerator_handler(
+        window: &tauri::WebviewWindow,
+        app: tauri::AppHandle,
+        gesture: Option<crate::gesture::EffectiveGesture>,
+    ) {
+        let result = window.with_webview(move |platform_webview| unsafe {
             use webview2_com::AcceleratorKeyPressedEventHandler;
             use webview2_com::Microsoft::Web::WebView2::Win32::{
                 ICoreWebView2AcceleratorKeyPressedEventArgs, COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN,
@@ -152,8 +180,14 @@ mod windows_impl {
                     }
                     let mut vk: u32 = 0;
                     args.VirtualKey(&mut vk)?;
-                    if super::should_swallow(vk, current_modifiers()) {
+                    let mods = current_modifiers();
+                    if super::should_swallow(vk, mods) {
                         args.SetHandled(true)?;
+                    } else if super::is_technician_chord(vk, mods) {
+                        // Deliberately NOT `SetHandled` — see `is_technician_chord`'s
+                        // doc comment on why this must stay independent of the
+                        // swallow table.
+                        crate::gesture::open_pin_pad(&app, gesture.as_ref());
                     }
                     Ok(())
                 },
@@ -221,8 +255,12 @@ mod windows_impl {
         }
     }
 
-    pub fn install(window: &tauri::WebviewWindow) {
-        install_accelerator_handler(window);
+    pub fn install(
+        window: &tauri::WebviewWindow,
+        app: tauri::AppHandle,
+        gesture: Option<crate::gesture::EffectiveGesture>,
+    ) {
+        install_accelerator_handler(window, app, gesture);
         install_ll_hook();
     }
 }
@@ -349,5 +387,45 @@ mod tests {
     #[test]
     fn plain_escape_with_no_modifiers_is_not_swallowed() {
         assert!(!should_swallow(0x1B, none()));
+    }
+
+    // ---- technician exit-gesture chord (P1-D2c Task 4, spec §3.5) ------------------
+
+    #[test]
+    fn ctrl_alt_shift_k_is_the_technician_chord() {
+        assert!(super::is_technician_chord(
+            0x4B,
+            mods(true, true, true, false)
+        ));
+    }
+
+    #[test]
+    fn technician_chord_is_matched_but_never_swallowed() {
+        // The two decisions are deliberately independent (see `is_technician_chord`'s
+        // doc comment) — this pins that a device is never locked out of BOTH at once.
+        let m = mods(true, true, true, false);
+        assert!(super::is_technician_chord(0x4B, m));
+        assert!(!should_swallow(0x4B, m));
+    }
+
+    #[test]
+    fn missing_a_modifier_is_not_the_technician_chord() {
+        assert!(!super::is_technician_chord(
+            0x4B,
+            mods(true, true, false, false)
+        ));
+        assert!(!super::is_technician_chord(
+            0x4B,
+            mods(false, true, true, false)
+        ));
+        assert!(!super::is_technician_chord(
+            0x4B,
+            mods(true, false, true, false)
+        ));
+    }
+
+    #[test]
+    fn plain_k_is_not_the_technician_chord() {
+        assert!(!super::is_technician_chord(0x4B, none()));
     }
 }

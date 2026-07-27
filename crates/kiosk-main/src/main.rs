@@ -7,6 +7,7 @@ mod driver;
 mod effect;
 mod egress;
 mod fetch;
+mod gesture;
 mod hardening;
 mod idle;
 mod inject;
@@ -228,6 +229,15 @@ async fn main() {
     // process restart (this loop is spawned once, below, and never re-reads config).
     let idle_reset_seconds = booted.manager.current().content.idle_reset_seconds;
     let allow_text_selection = booted.manager.current().input.allow_text_selection;
+    // P1-D2c Task 4: same "read once, next-restart to change" convention as the
+    // three fields above — remote `input.exit_gesture` wins over bootstrap
+    // `[exit_gesture]` (cfg-12), resolved once here via `gesture::effective_gesture`
+    // and handed to both trigger paths (`shortcuts::install`'s chord,
+    // `gesture::install`'s tap capture) below.
+    let exit_gesture = gesture::effective_gesture(
+        booted.manager.current().input.exit_gesture.as_ref(),
+        bootstrap.exit_gesture.as_ref(),
+    );
     let credential_path = config_dir.join(&bootstrap.credential);
     let config_url = bootstrap.config_url.clone();
     let poll_s = network.config_poll_s;
@@ -362,6 +372,7 @@ async fn main() {
     let telem_setup = telem.clone();
     let cancel_setup = cancel.clone();
     let nav_policy_setup = nav_policy.clone();
+    let exit_gesture_setup = exit_gesture.clone();
 
     tauri::Builder::default()
         // Serve the runtime, user-replaceable `kiosk-offline.mp4` (spec §3.4: sits next
@@ -421,7 +432,8 @@ async fn main() {
             scheme_guard::install(&window, telem_setup.clone(), nav_policy_setup.clone());
             egress::install(&window, telem_setup.clone(), nav_policy_setup.clone());
             hardening::apply(&window, nav_policy_setup.clone(), content_zoom);
-            shortcuts::install(&window);
+            shortcuts::install(&window, app.handle().clone(), exit_gesture_setup.clone());
+            gesture::install(&window, app.handle().clone(), exit_gesture_setup.clone());
             recovery::install(&window, telem_setup.clone(), nav_policy_setup.clone());
 
             // focus.lost (spec §7): best-effort, not a security boundary — a kiosk
