@@ -1,6 +1,7 @@
 #![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
 
 mod boot;
+mod clear;
 mod cli;
 mod driver;
 mod effect;
@@ -165,16 +166,21 @@ impl EffectSink for TauriSink {
         }
         match effect {
             Effect::RefetchConfig => self.refetch.notify_one(),
-            // D2c: profile clearing is not implemented yet. D2a never arms the idle
-            // timer that would emit this in practice (plan's "deferred effects" note),
-            // so this is a documented no-op, not a placeholder oversight. No `Telemetry`
-            // helper names this event (D2c's job to add one) — a bare warning is the
-            // honest signal without inventing a Cloud Logging taxonomy entry early.
-            Effect::ClearProfile { full } => {
-                eprintln!(
-                    "TauriSink: Effect::ClearProfile{{full:{full}}} not implemented (D2c) — no-op"
-                );
-                let _ = &self.telem; // kept for the D2c implementer; unused today.
+            // D2c: executes the real WebView2 clear (see `crate::clear`) and always
+            // sends `AppEvent::ProfileCleared` back, releasing the P1-D1 `Clearing`
+            // privacy gate — on the success path AND on any cast/call failure (never
+            // strand the kiosk on the gate). `full` has no partial-clear counterpart in
+            // the FSM (rule 9 only ever emits `{full: true}`), so it is intentionally
+            // unused here rather than threaded into a data-kind choice that has no
+            // caller.
+            Effect::ClearProfile { full: _ } => {
+                let Some(window) = self.app.get_webview_window(WINDOW_LABEL) else {
+                    eprintln!("TauriSink: window {WINDOW_LABEL:?} missing, cannot clear profile");
+                    // Never strand the Clearing gate even when the window is gone.
+                    let _ = self.tx.try_send(AppEvent::ProfileCleared);
+                    return;
+                };
+                clear::clear(&window, self.tx.clone(), self.telem.clone());
             }
             other => unreachable!(
                 "effect::page_for only returns None for RefetchConfig/ClearProfile, got {other:?}"
