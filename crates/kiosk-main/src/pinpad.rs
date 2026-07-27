@@ -1,12 +1,22 @@
 //! Technician PIN pad IPC + exit (P1-D2c Task 5, spec §3.5/§5.2): the Tauri command
 //! the bundled `pinpad.html` calls. Adjudication itself ([`adjudicate`]) is pure and
 //! host-tested; the security core (argon2id verify + the persisted backoff curve)
-//! is Task 1's `kiosk_core::exit` — this module only wires it to the on-disk
-//! `Lockout` file and, on a correct PIN, the sanctioned technician exit
-//! (`std::process::exit(86)`, spec exit-code-86).
+//! is Task 1's `kiosk_core::exit` — this module only wires it to an in-memory
+//! `Lockout` (loaded from disk once at startup) and, on a correct PIN, the
+//! sanctioned technician exit (`std::process::exit(86)`, spec exit-code-86).
+//!
+//! **In-memory `Lockout` is authoritative within a run; disk is only cross-restart
+//! durability.** The command locks the managed `Mutex<Lockout>`, adjudicates against
+//! THAT (never a fresh disk read), then persists best-effort. So a failing disk
+//! write (full/locked `%ProgramData%` volume) still increments the in-memory
+//! failure counter and engages backoff — SEC-05's brute-force protection cannot be
+//! eroded by re-reading a stale pre-failure state off disk on the next attempt. The
+//! `Mutex` also serializes Tauri's worker-pool-dispatched invokes, so two
+//! near-simultaneous attempts can't both slip past the same counter value.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use kiosk_core::exit::{Gate, Lockout};
@@ -30,6 +40,23 @@ pub struct PinPadState {
     /// its own (no-fail-open: a missing/empty hash must never grant a no-PIN exit).
     pub pin_hash: Option<String>,
     pub data_dir: PathBuf,
+    /// The AUTHORITATIVE lockout for this process run, seeded from disk once at
+    /// construction. Every invoke adjudicates against this in-memory value (not a
+    /// fresh disk read), so a failed persist can't roll the failure counter back.
+    pub lockout: Mutex<Lockout>,
+}
+
+impl PinPadState {
+    /// Build the managed state, seeding the in-memory lockout from disk ONCE
+    /// (missing/corrupt → default, per [`load_lockout`]).
+    pub fn new(pin_hash: Option<String>, data_dir: PathBuf) -> Self {
+        let lockout = load_lockout(&data_dir);
+        Self {
+            pin_hash,
+            data_dir,
+            lockout: Mutex::new(lockout),
+        }
+    }
 }
 
 /// Pure adjudication (host-tested, TDD Step 1): the lockout gate is checked BEFORE
@@ -105,15 +132,25 @@ pub fn verify_pin(pin: String, state: tauri::State<PinPadState>) -> PinResult {
         return PinResult::Rejected;
     };
 
-    let mut lockout = load_lockout(&state.data_dir);
+    // Lock the AUTHORITATIVE in-memory lockout for the whole adjudicate+persist —
+    // this both serializes concurrent invokes and keeps disk out of the decision.
+    // A poisoned mutex (a prior invoke panicked mid-critical-section) must never
+    // fail-open into unlimited attempts, so recover the inner value and keep going.
+    let mut lockout = state
+        .lockout
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let now = now_unix();
     let result = adjudicate(&mut lockout, &pin, phc, now);
 
+    // Best-effort persist for cross-restart durability only; in-memory `lockout` is
+    // authoritative within this run, so a failed write does NOT roll back the
+    // counter we just advanced (that's the SEC-05 erosion this design closes).
     if let Err(e) = save_lockout(&state.data_dir, &lockout) {
         eprintln!("pinpad: failed to persist lockout: {e}");
     }
 
-    // Exit AFTER the persist above: the success-reset lockout must be durable on
+    // Exit AFTER the persist above: the success-reset lockout should be durable on
     // disk before the process that reset it goes away (spec exit-code-86 + SEC-05).
     if matches!(result, PinResult::Ok) {
         std::process::exit(86);
@@ -182,5 +219,35 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let l = load_lockout(dir.path());
         assert!(matches!(l.check(0), Gate::Allowed));
+    }
+
+    // The core of the Important review fix: one Lockout held ACROSS attempts (as
+    // PinPadState's Mutex<Lockout> does per run) engages the lockout with NO disk
+    // involved. If the command instead reloaded a stale state from disk each time
+    // (the eroded design), the counter would never climb and this would stay
+    // Rejected forever — unlimited brute force. The command's `state.lockout.lock()`
+    // hands `adjudicate` this same persistent `&mut Lockout`; asserting it at the
+    // state level is the cleanest host-testable proof without a full Tauri harness
+    // (the `#[tauri::command]` wrapper + `tauri::State` extraction are not
+    // unit-testable off a live app — see the report's manual-check note).
+    #[test]
+    fn in_memory_lockout_held_across_attempts_engages_backoff_without_disk() {
+        let mut lockout = Lockout::default();
+        // Wrong PIN, repeated, against the SAME in-memory Lockout — no persist, no reload.
+        for _ in 0..kiosk_core::exit::FREE_ATTEMPTS {
+            assert!(matches!(
+                adjudicate(&mut lockout, "0000", PHC_1234, 0),
+                PinResult::Rejected
+            ));
+        }
+        // Once the free attempts are spent, the same held Lockout now blocks — even a
+        // CORRECT PIN — purely from in-memory state.
+        assert!(
+            matches!(
+                adjudicate(&mut lockout, "1234", PHC_1234, 0),
+                PinResult::Blocked { .. }
+            ),
+            "an in-memory lockout held across attempts must engage backoff with no disk read"
+        );
     }
 }
