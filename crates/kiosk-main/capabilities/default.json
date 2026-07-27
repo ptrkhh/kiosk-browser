@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "App-origin pages only; remote origins get no IPC (spec §8)",
   "windows": ["kiosk"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "allow-verify-pin"]
 }

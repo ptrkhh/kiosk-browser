@@ -13,6 +13,7 @@ mod idle;
 mod inject;
 mod nav;
 mod nav_policy;
+mod pinpad;
 mod probe;
 mod recovery;
 mod scheme_guard;
@@ -374,7 +375,18 @@ async fn main() {
     let nav_policy_setup = nav_policy.clone();
     let exit_gesture_setup = exit_gesture.clone();
 
+    // P1-D2c Task 5: the `verify_pin` command's state. `resolve_data_dir()` is a
+    // pure function of `%ProgramData%`, cheap to call again here — the `data_dir`
+    // bound at the top of `main` was already moved into the telemetry thread's
+    // closure above.
+    let pinpad_state = pinpad::PinPadState {
+        pin_hash: exit_gesture.as_ref().map(|g| g.pin_hash.clone()),
+        data_dir: resolve_data_dir(),
+    };
+
     tauri::Builder::default()
+        .manage(pinpad_state)
+        .invoke_handler(tauri::generate_handler![pinpad::verify_pin])
         // Serve the runtime, user-replaceable `kiosk-offline.mp4` (spec §3.4: sits next
         // to the binaries, NOT build-embedded) to the bundled offline.html at a fixed
         // origin. A custom scheme rather than the built-in asset protocol because the
