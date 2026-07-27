@@ -55,6 +55,17 @@ fn sign_doc(doc: &Value, sk: &SigningKey) -> Value {
     Value::Object(obj)
 }
 
+/// argon2id PHC hash of a PIN — the `pin_hash` the device verifies with `exit::verify_pin`.
+fn hash_pin(pin: &str) -> String {
+    use argon2::password_hash::{PasswordHasher, SaltString};
+    use argon2::Argon2;
+    let salt = SaltString::generate(&mut rand::rngs::OsRng);
+    Argon2::default()
+        .hash_password(pin.as_bytes(), &salt)
+        .expect("argon2 hash")
+        .to_string()
+}
+
 fn keygen() -> (SigningKey, String, String) {
     use rand::RngCore;
     let mut seed = [0u8; 32];
@@ -78,6 +89,15 @@ fn main() {
             println!("KIOSK_SIGNING_KEY_B64={seed_b64}");
             eprintln!("# PUBLIC pinned key — bake into the build:");
             println!("KIOSK_CONFIG_PUBKEY_B64={pub_b64}");
+        }
+        Some("hash-pin") => {
+            let pin = args
+                .get(1)
+                .expect("usage: hash-pin <pin>  (prints a PHC string for pin_hash)");
+            eprintln!(
+                "# argon2id PHC — put in kiosk.ini [exit_gesture] pin_hash or the signed config:"
+            );
+            println!("{}", hash_pin(pin));
         }
         Some("sign") => {
             let path = args
@@ -112,10 +132,21 @@ fn main() {
                 kiosk_core::config::signature::verify_signed(&Value::Object(bad), &vk).is_err(),
                 "a tampered body must fail verification"
             );
-            println!("selftest OK — sign→verify_signed roundtrip green, tamper rejected");
+            let phc = hash_pin("1234");
+            assert!(
+                kiosk_core::exit::verify_pin("1234", &phc),
+                "hash-pin output must verify against the device verifier"
+            );
+            assert!(
+                !kiosk_core::exit::verify_pin("9999", &phc),
+                "a wrong PIN must not verify"
+            );
+            println!(
+                "selftest OK — sign→verify_signed + hash-pin→verify_pin green; tamper + wrong-PIN rejected"
+            );
         }
         _ => {
-            eprintln!("usage: kioskctl <keygen|sign <config.json>|selftest>");
+            eprintln!("usage: kioskctl <keygen|sign <config.json>|hash-pin <pin>|selftest>");
             std::process::exit(2);
         }
     }

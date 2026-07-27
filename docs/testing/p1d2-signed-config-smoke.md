@@ -9,6 +9,34 @@ Signing tool: `crates/kiosk-core/examples/kioskctl.rs` (Linux-runnable; reuses t
 JCS+Ed25519 recipe `signature::verify_signed` checks — `kioskctl selftest` proves the
 roundtrip).
 
+## D2c native-input smoke (PIN pad / exit gesture / idle reset) — NO GCP, NO signing needed
+
+The exit gesture reads `pin_hash` from `kiosk.ini [exit_gesture]`, so PIN/exit/lockout are
+testable with just a local `kiosk.ini` — no signed config, no GCP.
+
+1. Make a PIN hash: `cargo run -p kiosk-core --example kioskctl -- hash-pin 4291`
+   → paste the `$argon2id$…` line into `kiosk.ini`:
+   ```ini
+   [exit_gesture]
+   pin_hash = $argon2id$v=19$m=19456,t=2,p=1$...   ; from hash-pin
+   taps     = 7
+   region   = top-left
+   ```
+2. Build + run the kiosk (see below). Then, at the device:
+   - **Exit gesture (tap):** 7 fast taps in the top-left corner → PIN pad opens. Record
+     whether tap-capture worked over the focused webview (the P0-unconfirmed question). If
+     it does NOT open, use the **technician chord** (the reserved combo wired in D2c/T4) —
+     one of the two must open it.
+   - **PIN → exit 86:** type `4291` → the process exits. Confirm `echo %ERRORLEVEL%` = `86`.
+   - **Lockout survives restart:** type a wrong PIN 4+ times → "blocked until …"; kill +
+     relaunch the app → still blocked (reads the persisted lockout, SEC-05).
+   - **No pin_hash ⇒ disabled:** remove the `[exit_gesture]` section → the gesture never
+     opens the pad (cfg-12; the device is exitable only via §7.2 OS lockdown).
+   - **Idle reset:** with defaults the reset fires after 180 s idle (or set a shorter
+     `idle_reset_seconds` via a signed config, below). Leave the kiosk untouched → it
+     reloads home; if `clear_data_on_reset`, a cookie/autofill entry set beforehand is gone
+     and the screen does NOT flash home before the clear completes (the privacy gate).
+
 ## 1. Keys (once)
 ```
 cargo run -p kiosk-core --example kioskctl -- keygen
