@@ -15,10 +15,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kiosk_core::config::bootstrap::BootstrapConfig;
-use kiosk_core::config::schema::Logging;
+use kiosk_core::config::schema::{Logging, UrlDetail};
 use kiosk_core::logging::auth::{ServiceAccount, TokenSource};
 use kiosk_core::logging::client::GclClient;
-use kiosk_core::logging::entry::EntryContext;
+use kiosk_core::logging::entry::{redact_url, EntryContext};
 use kiosk_core::logging::event::Event as LogEvent;
 use kiosk_core::logging::ratelimit::RateLimiter;
 use kiosk_core::logging::spool::{Spool, SpoolConfig};
@@ -113,6 +113,38 @@ impl Telemetry {
         let mut f = Map::new();
         f.insert("error".into(), Value::from(reason));
         self.emit(LogEvent::NavError, f);
+    }
+
+    /// A main-frame navigation was cancelled by the native guard (spec §3.6/§6:
+    /// `nav.blocked`, WARNING, rate-capped by the same Logger bucket as every other
+    /// event — no second limiter here). `reason` is `BlockReason::as_str()` (a stable,
+    /// greppable label); `url` is the navigation that got cancelled, redacted via
+    /// `UrlDetail::Host` — never logged raw. `url_sha256` lets an operator correlate
+    /// repeated blocks of the same URL without ever seeing the URL itself.
+    pub fn nav_blocked(&self, reason: &str, url: &str) {
+        let (redacted, hash) = redact_url(url, UrlDetail::Host);
+        let mut f = Map::new();
+        f.insert("reason".into(), reason.into());
+        f.insert("url".into(), redacted.into());
+        f.insert("url_sha256".into(), hash.into());
+        self.emit(LogEvent::NavBlocked, f);
+    }
+
+    /// The kiosk window lost OS focus (spec §6 taxonomy: `focus.lost`, WARNING) — e.g.
+    /// an alt-tab or a system dialog stealing the foreground. Not a security boundary;
+    /// `main.rs`'s handler that calls this also re-asserts focus immediately after.
+    pub fn focus_lost(&self) {
+        self.emit(LogEvent::FocusLost, Map::new());
+    }
+
+    /// The renderer process failed (spec §6 taxonomy: `webview.crash`, ERROR,
+    /// rate-capped like every other event). `kind` is `recovery::kind_label`'s stable,
+    /// greppable label (e.g. `render_process_unresponsive`) — never a raw WebView2 enum
+    /// debug-format, which isn't guaranteed stable across `webview2-com-sys` versions.
+    pub fn webview_crash(&self, kind: &str) {
+        let mut f = Map::new();
+        f.insert("kind".into(), Value::from(kind));
+        self.emit(LogEvent::WebviewCrash, f);
     }
 }
 
@@ -422,6 +454,88 @@ mod tests {
         let posted: Value = serde_json::from_str(&writes[0]).unwrap();
         assert_eq!(posted["entries"][0]["jsonPayload"]["event"], "nav.error");
         assert_eq!(posted["entries"][0]["severity"], "WARNING");
+    }
+
+    /// Same shape as `nav_error_helper_emits_a_nav_error_event_with_the_reason`: pins
+    /// `nav_blocked`'s mapping onto the `nav.blocked` taxonomy entry (spec §6) and
+    /// checks the URL actually reaching the fake transport is redacted, never raw.
+    #[test]
+    fn nav_blocked_helper_emits_a_nav_blocked_event_with_reason_and_redacted_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = FakeTransport::new();
+        let mut logger = logger_with(dir.path(), transport.clone());
+
+        let (tx, rx) = mpsc::sync_channel(8);
+        let telemetry = Telemetry { tx };
+        telemetry.nav_blocked("not_allowlisted", "https://evil.test/steal?token=secret");
+
+        let req = rx
+            .try_recv()
+            .expect("nav_blocked() must hand the logger task a LogReq");
+        assert_eq!(req.event, LogEvent::NavBlocked);
+        assert_eq!(req.fields["reason"], Value::from("not_allowlisted"));
+        assert_eq!(req.fields["url"], Value::from("https://evil.test"));
+        assert!(!req.fields["url"].as_str().unwrap().contains("token"));
+
+        logger.log(req.event, req.fields);
+        logger
+            .flush()
+            .expect("flush against the fake transport must succeed");
+
+        let writes = transport.writes.lock().unwrap();
+        assert_eq!(
+            writes.len(),
+            1,
+            "nav.blocked must have reached entries:write"
+        );
+        let posted: Value = serde_json::from_str(&writes[0]).unwrap();
+        assert_eq!(posted["entries"][0]["jsonPayload"]["event"], "nav.blocked");
+        assert_eq!(posted["entries"][0]["severity"], "WARNING");
+        assert!(
+            !writes[0].contains("token"),
+            "raw query string must never reach the wire"
+        );
+    }
+
+    /// Same shape as `nav_error_helper_emits_a_nav_error_event_with_the_reason`: pins
+    /// `webview_crash`'s mapping onto the `webview.crash` taxonomy entry (spec §6,
+    /// ERROR severity) that `recovery::install`'s `ProcessFailed` handler reaches.
+    #[test]
+    fn webview_crash_helper_emits_a_webview_crash_event_with_the_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = FakeTransport::new();
+        let mut logger = logger_with(dir.path(), transport.clone());
+
+        let (tx, rx) = mpsc::sync_channel(8);
+        let telemetry = Telemetry { tx };
+        telemetry.webview_crash("render_process_unresponsive");
+
+        let req = rx
+            .try_recv()
+            .expect("webview_crash() must hand the logger task a LogReq");
+        assert_eq!(req.event, LogEvent::WebviewCrash);
+        assert_eq!(
+            req.fields["kind"],
+            Value::from("render_process_unresponsive")
+        );
+
+        logger.log(req.event, req.fields);
+        logger
+            .flush()
+            .expect("flush against the fake transport must succeed");
+
+        let writes = transport.writes.lock().unwrap();
+        assert_eq!(
+            writes.len(),
+            1,
+            "webview.crash must have reached entries:write"
+        );
+        let posted: Value = serde_json::from_str(&writes[0]).unwrap();
+        assert_eq!(
+            posted["entries"][0]["jsonPayload"]["event"],
+            "webview.crash"
+        );
+        assert_eq!(posted["entries"][0]["severity"], "ERROR");
     }
 
     /// The disabled handle (used when telemetry init fails) must swallow every helper

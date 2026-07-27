@@ -4,21 +4,30 @@ mod boot;
 mod cli;
 mod driver;
 mod effect;
+mod egress;
 mod fetch;
+mod hardening;
+mod inject;
 mod nav;
+mod nav_policy;
 mod probe;
+mod recovery;
+mod scheme_guard;
+mod shortcuts;
 mod telemetry;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use driver::{Driver, EffectSink};
 use effect::PageTarget;
 use kiosk_core::app::state::{Effect, Event as AppEvent, Machine};
 use kiosk_core::logging::time::TrustedClock;
 use kiosk_core::net::prober::Prober;
 use kiosk_core::net::reach::resolve_probe_url;
+use nav_policy::{NavPolicy, SharedNavPolicy};
 use tauri::{AppHandle, Manager};
 use tokio::sync::{mpsc, Notify};
 use tokio_util::sync::CancellationToken;
@@ -201,6 +210,13 @@ async fn main() {
     let revision = booted.manager.revision();
     let home_url = booted.manager.home_url();
     let network = booted.manager.current().network.clone();
+    // P1-D2b Task 6: read once, at boot, for the document-start injection + zoom lock.
+    // These are baked into the webview at BUILD time (`initialization_script`/
+    // `SetZoomFactor` below) — a later config fetch that changes any of the three
+    // does NOT take effect until the next process restart (see `inject`'s module doc).
+    let display = booted.manager.current().display.clone();
+    let content_zoom = booted.manager.current().content.zoom;
+    let allow_text_selection = booted.manager.current().input.allow_text_selection;
     let credential_path = config_dir.join(&bootstrap.credential);
     let config_url = bootstrap.config_url.clone();
     let poll_s = network.config_poll_s;
@@ -208,6 +224,16 @@ async fn main() {
     let machine_cfg = booted.machine_cfg;
     let first_event = booted.first_event;
     let warnings = booted.warnings;
+
+    // Live-swappable nav policy (P1-D2b Task 1): built from the just-booted config so
+    // the very first navigation is already judged by it. `fetch::run` (below) stores a
+    // fresh one on every successful config apply; the guard install (Task 2) reads it
+    // lock-free via `nav_policy.load()`.
+    let nav_policy: SharedNavPolicy = Arc::new(ArcSwap::from_pointee(NavPolicy::from_config(
+        &booted.manager.current().content,
+        &home_url,
+    )));
+    let nav_policy_fetch = nav_policy.clone();
 
     // TEL-01: ONE clock, cloned into both the logger stack and the prober. Two
     // independent clocks would give each its own, disagreeing view of the
@@ -286,6 +312,7 @@ async fn main() {
         telem.clone(),
         refetch.clone(),
         cancel.clone(),
+        nav_policy_fetch,
     ));
     tokio::spawn(probe::run(
         prober,
@@ -296,11 +323,31 @@ async fn main() {
         cancel.clone(),
     ));
 
+    // Keep-awake (spec §7, display.keep_awake): asserted once at startup, for the
+    // life of the process — WebView2/tao has no per-window "don't sleep" flag, so
+    // this is the process-wide Win32 mechanism instead. `ES_CONTINUOUS` makes the
+    // state persist until explicitly cleared or the process exits; there is no
+    // matching "undo" call because the kiosk process is expected to hold this for
+    // its entire lifetime (Windows itself resets a thread's execution state to
+    // `ES_CONTINUOUS`-off when the thread exits).
+    #[cfg(windows)]
+    if display.keep_awake {
+        use windows::Win32::System::Power::{
+            SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED,
+        };
+        // Safety: `SetThreadExecutionState` is a plain Win32 call with no invariants
+        // beyond a valid flags value, which the three constants above are.
+        unsafe {
+            SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
+        }
+    }
+
     let windowed = args.windowed;
     let tx_setup = tx.clone();
     let refetch_setup = refetch.clone();
     let telem_setup = telem.clone();
     let cancel_setup = cancel.clone();
+    let nav_policy_setup = nav_policy.clone();
 
     tauri::Builder::default()
         // Serve the runtime, user-replaceable `kiosk-offline.mp4` (spec §3.4: sits next
@@ -340,9 +387,45 @@ async fn main() {
                     .always_on_top(true)
                     .focused(true)
             };
+            // P1-D2b Task 6: the ONE `initialization_script` call for this webview
+            // (a second call elsewhere would clobber this one — see
+            // `nav_policy::csp_policy`'s doc comment on why CSP is NOT injected here,
+            // and `inject`'s module doc on why this is build-time-only, next-restart
+            // to change).
+            builder = builder.initialization_script(inject::build_injection(
+                display.cursor_autohide_seconds,
+                allow_text_selection,
+            ));
             let window = builder.build()?;
 
-            nav::install(&window, tx_setup.clone(), telem_setup.clone());
+            nav::install(
+                &window,
+                tx_setup.clone(),
+                telem_setup.clone(),
+                nav_policy_setup.clone(),
+            );
+            scheme_guard::install(&window, telem_setup.clone(), nav_policy_setup.clone());
+            egress::install(&window, telem_setup.clone(), nav_policy_setup.clone());
+            hardening::apply(&window, nav_policy_setup.clone(), content_zoom);
+            shortcuts::install(&window);
+            recovery::install(&window, telem_setup.clone(), nav_policy_setup.clone());
+
+            // focus.lost (spec §7): best-effort, not a security boundary — a kiosk
+            // that gets alt-tabbed away logs it (spec taxonomy `focus.lost`, WARNING)
+            // and immediately asks the window manager to give it the foreground back.
+            // `set_focus` here can itself lose again (e.g. a genuinely modal system
+            // dialog); that just re-fires this same handler, which tries again on the
+            // next loss — no special-casing needed.
+            let window_focus = window.clone();
+            let telem_focus = telem_setup.clone();
+            window.on_window_event(move |event| {
+                if let tauri::WindowEvent::Focused(false) = event {
+                    telem_focus.focus_lost();
+                    if let Err(e) = window_focus.set_focus() {
+                        eprintln!("kiosk-main: set_focus (focus.lost reassert) failed: {e}");
+                    }
+                }
+            });
 
             let sink = TauriSink {
                 app: app.handle().clone(),
