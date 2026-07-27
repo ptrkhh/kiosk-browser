@@ -146,6 +146,26 @@ mod tests {
         );
     }
     #[test]
+    fn no_overflow_bypass_at_extreme_failure_counts() {
+        // Seed just below u32::MAX so record_failure's saturating_add is exercised and `over`
+        // (= failures - FREE_ATTEMPTS) lands far past the 20-bit shl guard.
+        let mut l = Lockout {
+            consecutive_failures: u32::MAX - 1,
+            blocked_until: None,
+        };
+        l.record_failure(0); // `1i64 << shift` must not overflow/panic
+        l.record_failure(0); // saturates at u32::MAX, still no panic
+        match l.check(0) {
+            // Without `.min(20)` the shl panics; without `.min(BACKOFF_CAP_S)` `until` would be
+            // 5<<20 s, not the cap. Either regression fails this exact-equality assert.
+            Gate::Blocked { until } => assert_eq!(
+                until, BACKOFF_CAP_S,
+                "backoff must clamp to the cap, not overflow"
+            ),
+            Gate::Allowed => panic!("extreme failure count must block"),
+        }
+    }
+    #[test]
     fn survives_a_restart_via_serde() {
         let mut l = Lockout::default();
         for _ in 0..=FREE_ATTEMPTS {
