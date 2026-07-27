@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sysinfo::{Disks, System};
-use tokio::time::interval;
+use tokio::time::{interval, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
 use crate::telemetry::Telemetry;
@@ -32,6 +32,9 @@ pub async fn run(
     cancel: CancellationToken,
 ) {
     let mut tick = interval(Duration::from_secs(period_s.clamp(10, 3600)));
+    // A heartbeat wants a steady cadence, not catch-up: after a suspend/resume or
+    // runtime stall, fire one tick and resync rather than bursting every missed one.
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -40,5 +43,29 @@ pub async fn run(
                 telem.health(kiosk_core::metrics::to_fields(&s, dropped()));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn run_exits_promptly_on_cancel() {
+        let cancel = CancellationToken::new();
+        cancel.cancel(); // already cancelled before the task ever ticks
+        let task = run(
+            System::new(),
+            Disks::new(),
+            std::path::PathBuf::from("."),
+            Instant::now(),
+            10,
+            Arc::new(|| 0),
+            Telemetry::disabled(),
+            cancel,
+        );
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("health::run should exit as soon as the token is cancelled, not hang");
     }
 }
