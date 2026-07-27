@@ -109,6 +109,15 @@ pub fn effective_gesture(
     bootstrap: Option<&BootstrapExitGesture>,
 ) -> Option<EffectiveGesture> {
     if let Some(g) = remote {
+        // An empty/whitespace remote pin_hash is a misconfiguration, not a reason to
+        // fall through to bootstrap: cfg-12 says a source with no usable pin_hash
+        // DISABLES the gesture (→ None), logged — the pad must never open with an
+        // unverifiable hash. Remote-present still "wins" over bootstrap; it just wins
+        // by disabling.
+        if g.pin_hash.trim().is_empty() {
+            eprintln!("gesture: remote input.exit_gesture has an empty pin_hash (cfg-12: disabled)");
+            return None;
+        }
         return Some(EffectiveGesture {
             taps: g.taps,
             region: g.region,
@@ -118,6 +127,12 @@ pub fn effective_gesture(
         });
     }
     let g = bootstrap?;
+    // Bootstrap's own parser already drops the section when pin_hash is absent, but an
+    // explicitly-empty value would still reach here — same cfg-12 rule applies.
+    if g.pin_hash.trim().is_empty() {
+        eprintln!("gesture: bootstrap [exit_gesture] has an empty pin_hash (cfg-12: disabled)");
+        return None;
+    }
     Some(EffectiveGesture {
         taps: g.taps,
         region: parse_bootstrap_region(&g.region),
@@ -485,6 +500,27 @@ mod tests {
     #[test]
     fn neither_present_disables_the_gesture() {
         assert!(effective_gesture(None, None).is_none());
+    }
+
+    #[test]
+    fn empty_remote_pin_hash_disables_the_gesture_and_does_not_fall_through() {
+        // cfg-12: a present-but-unusable pin_hash DISABLES the gesture (the pad must
+        // never open with an unverifiable hash), and remote-present must not fall
+        // through to bootstrap.
+        let empty = ExitGesture {
+            pin_hash: "  ".to_string(),
+            ..remote_gesture()
+        };
+        assert!(effective_gesture(Some(&empty), Some(&bootstrap_gesture())).is_none());
+    }
+
+    #[test]
+    fn empty_bootstrap_pin_hash_disables_the_gesture() {
+        let empty = BootstrapExitGesture {
+            pin_hash: "".to_string(),
+            ..bootstrap_gesture()
+        };
+        assert!(effective_gesture(None, Some(&empty)).is_none());
     }
 
     // ---- open_pin_pad's no-fail-open guard ----------------------------------------
