@@ -8,6 +8,7 @@ mod effect;
 mod egress;
 mod fetch;
 mod hardening;
+mod idle;
 mod inject;
 mod nav;
 mod nav_policy;
@@ -222,6 +223,10 @@ async fn main() {
     // does NOT take effect until the next process restart (see `inject`'s module doc).
     let display = booted.manager.current().display.clone();
     let content_zoom = booted.manager.current().content.zoom;
+    // P1-D2c Task 3: read once, at boot, like the zoom/injection fields above — a
+    // later config fetch changing `idle_reset_seconds` takes effect only on the next
+    // process restart (this loop is spawned once, below, and never re-reads config).
+    let idle_reset_seconds = booted.manager.current().content.idle_reset_seconds;
     let allow_text_selection = booted.manager.current().input.allow_text_selection;
     let credential_path = config_dir.join(&bootstrap.credential);
     let config_url = bootstrap.config_url.clone();
@@ -328,6 +333,9 @@ async fn main() {
         telem.clone(),
         cancel.clone(),
     ));
+    // P1-D2c Task 3: emits `IdleExpired` UNCONDITIONALLY — the FSM (rule 9) already
+    // no-ops it outside `Online`, so no state check belongs here too.
+    tokio::spawn(idle::run(idle_reset_seconds, tx.clone(), cancel.clone()));
 
     // Keep-awake (spec §7, display.keep_awake): asserted once at startup, for the
     // life of the process — WebView2/tao has no per-window "don't sleep" flag, so
