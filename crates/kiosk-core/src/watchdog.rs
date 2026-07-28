@@ -2,11 +2,12 @@
 //! clock — time is injected via event fields (`at`/`now`). The launcher shell
 //! (a later plan) feeds this real events and executes the `Action`s returned.
 //!
-//! This task implements rules 1-3 + 9 (READY arming, heartbeat/miss
-//! disambiguation, channel-fault grace, exit-86). Rules 4-8 (backoff
-//! doubling, respawn-on-tick, crash-loop -> safe mode) are Tasks 3-4; the
-//! state fields they need are declared now so those tasks are purely
-//! additive.
+//! Rules 1-3 + 9 (READY arming, heartbeat/miss disambiguation, channel-fault
+//! grace, exit-86) plus rules 4-6 (backoff doubling with a 60s ceiling,
+//! respawn-on-tick, healthy_run_s backoff/crash-loop-window reset) are
+//! implemented here. Crash-loop -> safe mode (rules 7-8) is Task 4; the
+//! `safe`/`safe_fails` fields it needs are declared now so that task is
+//! purely additive.
 
 use crate::logging::event::Event as LogEvent;
 
@@ -85,9 +86,7 @@ pub struct Watchdog {
     safe: bool, // running --safe
     spawned_at: u64,
     last_heartbeat: u64,
-    #[allow(dead_code)] // Tasks 3/4
-    backoff_s: u64, // current backoff (Task 3)
-    #[allow(dead_code)] // Tasks 3/4
+    backoff_s: u64,     // current backoff (Task 3)
     restarts: Vec<u64>, // restart timestamps, sliding window (Task 4)
     #[allow(dead_code)] // Tasks 3/4
     safe_fails: u32, // consecutive --safe fails within healthy_run_s (Task 4)
@@ -116,14 +115,17 @@ impl Watchdog {
         self.phase = Phase::BackingOff {
             until: at + self.backoff_s,
         };
-        vec![
+        let fx = vec![
             Action::DrainOrphanedSpool,
             Action::Log(WatchdogEvent::Restart {
                 code,
                 backoff_s: self.backoff_s,
                 cause,
             }),
-        ]
+        ];
+        self.restarts.push(at);
+        self.backoff_s = self.backoff_s.saturating_mul(2).min(60);
+        fx
     }
 
     pub fn on(&mut self, event: Event) -> Vec<Action> {
@@ -166,23 +168,45 @@ impl Watchdog {
                     Phase::Spawning { grace_until } if now > grace_until => {
                         self.restart(0, now, "no_ready")
                     }
-                    Phase::Armed if now.saturating_sub(self.last_heartbeat) >= MISS_LIMIT_S => {
-                        match self.channel_grace_until {
-                            Some(grace_until) if now <= grace_until => {
-                                // channel fault still within grace: wait, no restart yet.
-                                Vec::new()
+                    Phase::Armed => {
+                        let fx = if now.saturating_sub(self.last_heartbeat) >= MISS_LIMIT_S {
+                            match self.channel_grace_until {
+                                Some(grace_until) if now <= grace_until => {
+                                    // channel fault still within grace: wait, no restart yet.
+                                    Vec::new()
+                                }
+                                Some(_) => {
+                                    // channel grace expired: restart.
+                                    self.restart(0, now, "hang")
+                                }
+                                None => {
+                                    // healthy channel, missed heartbeats: confirmed hang.
+                                    let mut fx = vec![Action::Log(WatchdogEvent::Hang)];
+                                    fx.extend(self.restart(0, now, "hang"));
+                                    fx
+                                }
                             }
-                            Some(_) => {
-                                // channel grace expired: restart.
-                                self.restart(0, now, "hang")
-                            }
-                            None => {
-                                // healthy channel, missed heartbeats: confirmed hang.
-                                let mut fx = vec![Action::Log(WatchdogEvent::Hang)];
-                                fx.extend(self.restart(0, now, "hang"));
-                                fx
-                            }
+                        } else {
+                            Vec::new()
+                        };
+                        // rule 6: a run past healthy_run_s clears backoff + the
+                        // crash-loop window. Idempotent; applied after the miss
+                        // check above so a same-tick restart still emits the
+                        // pre-reset backoff_s, and this only resets state for
+                        // next time.
+                        if now.saturating_sub(self.spawned_at) >= self.cfg.healthy_run_s {
+                            self.backoff_s = 1;
+                            self.restarts.clear();
                         }
+                        fx
+                    }
+                    Phase::BackingOff { until } if now >= until => {
+                        self.spawned_at = now;
+                        self.last_heartbeat = now;
+                        self.phase = Phase::Spawning {
+                            grace_until: now + self.cfg.startup_grace_s,
+                        };
+                        vec![Action::SpawnMain]
                     }
                     _ => Vec::new(),
                 }
@@ -302,6 +326,52 @@ mod tests {
         assert!(
             !fx.contains(&Action::SpawnMain),
             "a reconnected channel must NOT restart"
+        );
+    }
+
+    /// Feeds a `ChildExited` and returns the `backoff_s` of the resulting
+    /// `Restart` log action, if any.
+    fn restart_backoff(w: &mut Watchdog, at: u64) -> Option<u64> {
+        w.on(Event::ChildExited { code: 1, at })
+            .into_iter()
+            .find_map(|a| match a {
+                Action::Log(WatchdogEvent::Restart { backoff_s, .. }) => Some(backoff_s),
+                _ => None,
+            })
+    }
+
+    #[test]
+    fn backoff_doubles_from_1_to_the_60s_ceiling() {
+        let (mut w, _) = Watchdog::new(cfg());
+        let mut seen = vec![];
+        let mut t = 0;
+        for _ in 0..10 {
+            w.on(Event::Spawned { at: t });
+            w.on(Event::Ready);
+            if let Some(b) = restart_backoff(&mut w, t + 1) {
+                seen.push(b);
+            }
+            t += 200;
+        }
+        // 1,2,4,8,16,32,60,60,60,60 — doubles then holds at 60
+        assert_eq!(&seen[..7], &[1, 2, 4, 8, 16, 32, 60]);
+        assert!(seen[7..].iter().all(|&b| b == 60), "ceiling holds at 60");
+    }
+
+    #[test]
+    fn a_healthy_run_resets_backoff() {
+        let (mut w, _) = Watchdog::new(cfg());
+        w.on(Event::Spawned { at: 0 });
+        w.on(Event::Ready);
+        let b1 = restart_backoff(&mut w, 1).unwrap(); // crashed fast → backoff grows
+                                                      // next instance runs healthy_run_s+ before crashing → backoff must reset to 1
+        w.on(Event::Spawned { at: 100 });
+        w.on(Event::Ready);
+        w.on(Event::Tick { now: 100 + 121 }); // ran > healthy_run_s (120)
+        let b2 = restart_backoff(&mut w, 100 + 300).unwrap();
+        assert!(
+            b1 > 0 && b2 == 1,
+            "a run past healthy_run_s clears backoff (was {b1}, now {b2})"
         );
     }
 
