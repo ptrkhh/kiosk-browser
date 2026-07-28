@@ -119,6 +119,7 @@ impl Watchdog {
     }
 
     fn restart(&mut self, code: i32, at: u64, cause: &'static str) -> Vec<Action> {
+        self.channel_grace_until = None; // a fresh child gets a fresh channel — stale grace must not misroute a later genuine hang
         self.phase = Phase::BackingOff {
             until: at + self.backoff_s,
         };
@@ -214,8 +215,9 @@ impl Watchdog {
                                 Vec::new()
                             }
                             Some(_) => {
-                                // channel grace expired: restart.
-                                self.restart(0, now, "hang")
+                                // channel grace expired: this is a channel loss, not a
+                                // confirmed renderer hang — restart with an honest cause.
+                                self.restart(0, now, "channel")
                             }
                             None => {
                                 // healthy channel, missed heartbeats: confirmed hang.
@@ -566,6 +568,140 @@ mod tests {
         assert!(
             escalated,
             "N=3 safe-fails within healthy_run_s -> safe_mode_failed CRITICAL"
+        );
+    }
+
+    #[test]
+    fn stale_channel_grace_does_not_swallow_a_later_genuine_hang() {
+        // A channel fault + restart must not leak its grace deadline into the
+        // NEXT child's lifetime: a later genuine hang (healthy channel this
+        // lifetime) must still log Hang and restart with cause "hang".
+        let (mut w, _) = Watchdog::new(cfg());
+        w.on(Event::Spawned { at: 0 });
+        w.on(Event::Ready);
+        w.on(Event::ChannelFault { at: 5 }); // channel_grace_until = Some(35)
+        w.on(Event::ChildExited { code: 1, at: 10 }); // restart -> BackingOff{until:11}
+        let fx = w.on(Event::Tick { now: 11 }); // respawn
+        assert_eq!(fx, vec![Action::SpawnMain]);
+        w.on(Event::Ready); // arms fresh child
+        w.on(Event::Heartbeat { at: 20 });
+        let fx = w.on(Event::Tick { now: 20 + 16 }); // genuine hang, healthy channel this lifetime
+        assert!(
+            fx.iter()
+                .any(|a| matches!(a, Action::Log(WatchdogEvent::Hang))),
+            "stale channel-fault grace from the PREVIOUS child must not swallow this hang's telemetry"
+        );
+        assert!(fx
+            .iter()
+            .any(|a| matches!(a, Action::Log(WatchdogEvent::Restart { cause: "hang", .. }))));
+    }
+
+    #[test]
+    fn expired_channel_grace_restart_uses_channel_cause_not_hang() {
+        let (mut w, _) = Watchdog::new(cfg());
+        w.on(Event::Spawned { at: 0 });
+        w.on(Event::Ready);
+        w.on(Event::Heartbeat { at: 0 });
+        w.on(Event::ChannelFault { at: 5 }); // channel_grace_until = Some(35)
+        let fx = w.on(Event::Tick { now: 36 }); // miss (36-0>=15) AND grace expired (36>35)
+        assert!(
+            fx.iter().any(|a| matches!(
+                a,
+                Action::Log(WatchdogEvent::Restart {
+                    cause: "channel",
+                    ..
+                })
+            )),
+            "an expired channel-fault grace is a channel loss, not a confirmed hang"
+        );
+        assert!(
+            !fx.iter()
+                .any(|a| matches!(a, Action::Log(WatchdogEvent::Hang))),
+            "no Hang telemetry for a channel-loss restart"
+        );
+    }
+
+    #[test]
+    fn two_consecutive_safe_fails_do_not_escalate_but_the_third_does() {
+        let (mut w, _) = Watchdog::new(cfg());
+        force_into_safe(&mut w); // helper: drive >5 crashes
+        for i in 0..2 {
+            w.on(Event::Spawned {
+                at: 10_000 + i * 10,
+            });
+            w.on(Event::Ready);
+            let fx = w.on(Event::ChildExited {
+                code: 1,
+                at: 10_000 + i * 10 + 5,
+            });
+            assert!(
+                !fx.iter()
+                    .any(|a| matches!(a, Action::Log(WatchdogEvent::SafeModeFailed))),
+                "only 2 consecutive fast --safe fails must NOT escalate yet (fail #{})",
+                i + 1
+            );
+        }
+        w.on(Event::Spawned { at: 10_030 });
+        w.on(Event::Ready);
+        let fx = w.on(Event::ChildExited {
+            code: 1,
+            at: 10_035,
+        });
+        assert!(
+            fx.iter()
+                .any(|a| matches!(a, Action::Log(WatchdogEvent::SafeModeFailed))),
+            "the 3rd consecutive fast --safe fail must escalate to SafeModeFailed"
+        );
+    }
+
+    #[test]
+    fn surviving_healthy_run_s_in_safe_mode_exits_safe_and_resets_backoff() {
+        let (mut w, _) = Watchdog::new(cfg());
+        force_into_safe(&mut w); // helper: drive >5 crashes -> safe mode
+        w.on(Event::Spawned { at: 10_000 });
+        w.on(Event::Ready);
+        w.on(Event::Heartbeat { at: 10_000 + 119 }); // keep heartbeating through the healthy window
+        w.on(Event::Tick { now: 10_000 + 121 }); // survived >= healthy_run_s (120), no miss this tick -> exits safe mode
+        let fx = w.on(Event::ChildExited {
+            code: 1,
+            at: 10_000 + 130,
+        }); // a subsequent crash
+        let backoff = fx.iter().find_map(|a| match a {
+            Action::Log(WatchdogEvent::Restart { backoff_s, .. }) => Some(*backoff_s),
+            _ => None,
+        });
+        assert_eq!(backoff, Some(1), "backoff must reset to 1 on exiting safe");
+        let respawn = w.on(Event::Tick {
+            now: 10_000 + 130 + 1,
+        });
+        assert_eq!(
+            respawn,
+            vec![Action::SpawnMain],
+            "the NEXT respawn after exiting safe mode must be SpawnMain, not SpawnSafe"
+        );
+    }
+
+    #[test]
+    fn restarts_spread_beyond_the_10min_window_never_trip_safe_mode() {
+        let (mut w, _) = Watchdog::new(cfg());
+        let mut saw_safe_mode = false;
+        for i in 0..8u64 {
+            w.on(Event::Spawned { at: i * 700 });
+            w.on(Event::Ready);
+            let fx = w.on(Event::ChildExited {
+                code: 1,
+                at: i * 700 + 1,
+            });
+            if fx
+                .iter()
+                .any(|a| matches!(a, Action::Log(WatchdogEvent::SafeMode)))
+            {
+                saw_safe_mode = true;
+            }
+        }
+        assert!(
+            !saw_safe_mode,
+            "restarts spaced >600s apart must slide out of the crash-loop window"
         );
     }
 
