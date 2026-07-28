@@ -115,6 +115,28 @@ fn resolve_data_dir() -> PathBuf {
         .join("kiosk")
 }
 
+/// File-only breadcrumb, installed before telemetry exists (see call site in `main`).
+/// Takes/chains the existing hook first (same discipline as `install_panic_hook`
+/// below) so the stdlib default hook — which prints the panic message/backtrace to
+/// stderr — is preserved rather than discarded; that stderr output is the only
+/// panic diagnostics dev/debug console builds get.
+/// `std::panic::take_hook`/`set_hook` compose: `install_panic_hook` below calls
+/// `take_hook()` when it runs, which returns THIS closure and chains it as its
+/// `default_hook`, so once telemetry comes up both the file write and `telem.panic`
+/// fire on every panic — this one is never replaced, only wrapped.
+fn install_panic_hook_file_only(data_dir: PathBuf) {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        let path = data_dir.join("crash-panic.txt");
+        if let Ok(mut f) = std::fs::File::create(&path) {
+            use std::io::Write;
+            let _ = writeln!(f, "{info}");
+            let _ = f.sync_all();
+        }
+    }));
+}
+
 /// Best-effort crash telemetry (spec TEL-10, brief step 4).
 ///
 /// The async `Logger` is owned by the logger thread (`telemetry::run`); a
@@ -137,22 +159,6 @@ fn resolve_data_dir() -> PathBuf {
 /// write from inside a panic hook (racing the very same spool the logger thread also
 /// holds open, violating the "one writer per segment" invariant — spec arch-01) would
 /// be the "fragile mechanism" the brief warns against, not a fix.
-/// File-only breadcrumb, installed before telemetry exists (see call site in `main`).
-/// `std::panic::take_hook`/`set_hook` compose: `install_panic_hook` below calls
-/// `take_hook()` when it runs, which returns THIS closure and chains it as its
-/// `default_hook`, so once telemetry comes up both the file write and `telem.panic`
-/// fire on every panic — this one is never replaced, only wrapped.
-fn install_panic_hook_file_only(data_dir: PathBuf) {
-    std::panic::set_hook(Box::new(move |info| {
-        let path = data_dir.join("crash-panic.txt");
-        if let Ok(mut f) = std::fs::File::create(&path) {
-            use std::io::Write;
-            let _ = writeln!(f, "{info}");
-            let _ = f.sync_all();
-        }
-    }));
-}
-
 fn install_panic_hook(telem: telemetry::Telemetry, data_dir: PathBuf) {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -277,6 +283,10 @@ async fn main() {
     // early means BOTH panics still leave `crash-panic.txt` for the P1-E launcher —
     // telemetry doesn't exist yet at this point, so there is nothing to send it to.
     let data_dir = resolve_data_dir();
+    // Best-effort: %ProgramData%\kiosk\ isn't created until spool.rs/store.rs run
+    // later, both after the two early panic sites below. Without this, File::create
+    // in the hook fails silently on a fresh install and there's no breadcrumb at all.
+    let _ = std::fs::create_dir_all(&data_dir);
     install_panic_hook_file_only(data_dir.clone());
 
     let ini_path = config_dir.join("kiosk.ini");
