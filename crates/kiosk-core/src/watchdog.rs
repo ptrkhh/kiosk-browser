@@ -225,6 +225,34 @@ mod tests {
     }
 
     #[test]
+    fn grace_expiry_with_no_ready_restarts_as_failed_start() {
+        let (mut w, _) = Watchdog::new(cfg());
+        w.on(Event::Spawned { at: 0 });
+        // no Ready — grace expires
+        let fx = w.on(Event::Tick {
+            now: cfg().startup_grace_s + 1,
+        });
+        assert!(fx.iter().any(|a| matches!(
+            a,
+            Action::Log(WatchdogEvent::Restart {
+                cause: "no_ready",
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn child_exited_passes_through_the_real_exit_code() {
+        let (mut w, _) = Watchdog::new(cfg());
+        w.on(Event::Spawned { at: 0 });
+        w.on(Event::Ready);
+        let fx = w.on(Event::ChildExited { code: 137, at: 10 });
+        assert!(fx
+            .iter()
+            .any(|a| matches!(a, Action::Log(WatchdogEvent::Restart { code: 137, .. }))));
+    }
+
+    #[test]
     fn miss_with_child_exited_restarts_with_real_code() {
         let (mut w, _) = Watchdog::new(cfg());
         w.on(Event::Spawned { at: 0 });
