@@ -317,6 +317,10 @@ mod tests {
         // content — the D2c smoke saw it false-reported as nav.blocked{egress}.
         assert!(!is_remote_origin("http://ipc.localhost/"));
         assert!(!is_remote_origin("http://ipc.localhost/anything"));
+        // Canary against a future loose `ends_with("ipc.localhost")`-style match: only the
+        // exact host literal is app origin, subdomains and suffix-spoofed hosts are remote.
+        assert!(is_remote_origin("http://evil.ipc.localhost/"));
+        assert!(is_remote_origin("http://ipc.localhost.evil.com/"));
     }
 
     // ---- resource_allowed (P1-D2b Task 4, SEC-10) -------------------------------------
