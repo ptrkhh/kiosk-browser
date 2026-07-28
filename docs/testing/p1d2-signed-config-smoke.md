@@ -64,6 +64,91 @@ hardening: CoreWebView2Settings does not implement Settings5, pinch zoom will st
 ⇒ autofill/password-save and pinch zoom remain ON. Check the WebView2 Runtime version on the
 deployment image before shipping; re-run this on real kiosk hardware.
 
+### Run log — 2026-07-28 (Windows 11 ARM64 dev host, x64 build, evergreen WebView2 **150.0.4078.99**, signed config, real GCP)
+
+Same host as the 2026-07-27 run: Snapdragon X Plus X1P42100; the x64 build (and the x64
+PowerShell used to measure windows) runs under emulation, so `PROCESSOR_ARCHITECTURE`
+reads `AMD64` — do not mistake this for an x64 box.
+
+Setup: build `KIOSK_CONFIG_PUBKEY_B64` pinned (fresh keypair, seed not recorded here);
+`D:\kiosk-smoke\kiosk.ini` (device_id `lobby-01`, project `ubm-gen-ai`, credential present);
+signed configs served from a local `127.0.0.1:8000` static server at the device's
+`config_url`. Two configs: **rev 10** (`logging.health_sample_s=15`, `display.monitor=5`)
+and **rev 11** (`display.monitor=1`). Note both fields are read **once at boot** from the
+*cached* config, so each takes effect on the boot *after* the one that fetched it.
+Monitors on this host: `DISPLAY1` primary 1536x960 @ (0,0), `DISPLAY2` 1920x1080 @ (-1920,0).
+
+| Check | Result |
+|---|---|
+| Settings4/Settings5 warnings on a current runtime | **FAIL then FIXED** — see finding below. Evergreen 150.0.4078.99 still logged both; root cause was a wrong-object `cast`, not the runtime. After the one-line fix, boot stderr is clean and no `config.warn{hardening.*}` is emitted |
+| `http://ipc.localhost` no longer `nav.blocked{egress}` | **PASS** — 0 occurrences of `ipc.localhost` across `spool/high` + `spool/low` over 4 boots (D2e classifier fix holds) |
+| `health.sample` every ~15 s with all 6 keys | **PASS** — 6 samples in an 80 s run at `10:48:17 / :31.5 / :46.5 / 10:49:01.5 / :16.6 / :31.6` (Δ 14.5–15.0 s). Payload: `cpu_percent`, `mem_used_mb` (+`mem_total_mb`), `disk_free_mb`, `uptime_secs`, `spool_dropped_expired`. `severity:INFO` ⇒ `spool/low`, cursor `committed` advanced to full count, `dropped:0` ⇒ delivered to Cloud Logging (`projects/ubm-gen-ai/logs/kiosk`, `generic_node/lobby-01`) |
+| `display.monitor=5` ⇒ primary + `config.warn` | **PASS** — `config.warn{field:"display.monitor", reason:"index beyond available displays; using primary"}`, window opened on primary, nothing else degraded |
+| Panic ⇒ `<ProgramData>\kiosk\crash-panic.txt` | **PASS** — forced via `kiosk-main.exe --config D:/kiosk-smoke-does-not-exist` (exit 101). File contains `panicked at crates\kiosk-main\src\main.rs:294:9: kiosk-main: cannot read …\kiosk.ini (…os error 3); pass --config <dir> in dev`. Confirms the *early*, file-only hook (fires before telemetry exists) |
+| **I1** — `display.monitor=1` window size/placement | **PLACEMENT PASS / SIZE FAIL** — window lands on `DISPLAY2` and *looks* full-screen to the operator, but is sized from the **primary's** physical extent: `GetWindowRect` = `L=-1920 T=0 R=0 B=1200` ⇒ 1920x**1200** on a 1920x**1080** panel, 120 px of overhang. No `config.warn` this run (index in range). See finding below |
+
+**FIXED — Settings4/5 was never a runtime problem (root cause).** `hardening.rs` called
+`webview2.cast::<ICoreWebView2Settings4>()` / `…Settings5` on the **`ICoreWebView2`**
+object. Those interfaces live on the **settings** object (`ICoreWebView2Settings`), so the
+QI returns `E_NOINTERFACE` on *every* runtime version — which is exactly what the
+2026-07-27 ARM64 run and the first boot of this run both saw. Fixed to `settings.cast::<…>()`
+(two lines, `crates/kiosk-main/src/hardening.rs`); after rebuild, boot stderr has no
+`hardening:` lines and no `config.warn{hardening.autofill|hardening.pinch_zoom}` reaches the
+spool ⇒ **password-autosave, general autofill and pinch-zoom are now actually OFF.**
+The 2026-07-27 "check the WebView2 Runtime version on the deployment image" note is
+superseded — no runtime-version prerequisite exists for these flags.
+
+**Open finding — I1 confirmed: the window moves, but keeps the primary's size.**
+Measured with both panels attached, `display.monitor=1`, rev 11 applied:
+
+| | logical (Screen.AllScreens) | physical | scale |
+|---|---|---|---|
+| `DISPLAY1` (internal, primary, `SDC4187`) | 1536x960 @ (0,0) | **1920x1200** | 125% |
+| `DISPLAY2` (external, `TSB010B` ~24") | 1920x1080 @ (-1920,0) | 1920x1080 | 100% |
+
+Window rect: `L=-1920 T=0 R=0 B=1200`. The origin is `DISPLAY2`'s — so `set_position` **does**
+work and the earlier "never moves" reading was wrong. The *size*, 1920x1200, is the
+**primary's physical** extent: fullscreen was applied while the window still belonged to
+`DISPLAY1`, so it captured that monitor's size, and the later `set_position` moved the window
+without re-deriving the extent for the target. On a mixed-resolution / mixed-DPI pair this
+means 120 px hang off the bottom of the external panel — invisible to the operator (it looks
+correctly full-screen) but real, and it would be much more visible on a target monitor
+*smaller* than the primary. Fix is the one already noted: `set_fullscreen(false)` →
+`set_position(target.position())` → `set_fullscreen(true)` so the extent is recomputed on the
+destination monitor.
+
+Operator observation during the same run: the kiosk filled the external monitor, while the
+internal panel showed nothing **and accepted no input** — clicks/keys on the primary desktop
+did nothing while the kiosk held focus (the run also logged 16 `focus.lost` events as the
+focus-lock fought the desktop). Expected for a kiosk that owns input, but worth pinning as
+behaviour: with `display.monitor` pointing at a secondary, the other monitor is dead space,
+not a usable second desktop.
+
+Correction to the pre-monitor-replug measurement in this same session: an earlier boot
+measured `1536x960` on the primary plus a `config.warn{display.monitor,"index beyond
+available displays"}` at `config_revision:11`. That was taken while the external monitor was
+physically **unplugged** — `available_monitors()` correctly reported 1. Not a bug; discard
+that reading.
+
+**Open finding — steady-state `config.error` noise.** A poll that returns the *already
+applied* revision logs `severity:ERROR` `config.error{"anti-rollback: revision 10 <= last
+applied 10"}`. Anti-rollback rejecting an equal revision is correct, but a device sitting on
+the current config will emit an ERROR every `config_poll_s` (300 s ⇒ ~288/day/device) for a
+non-event. `revision == last_applied` should be a silent no-op; only `<` deserves the error.
+
+**Minor — first `health.sample` reads `cpu_percent: 100.0`.** `uptime_secs:0` sample only:
+`sysinfo` has no prior refresh to diff against, so the first CPU reading is meaningless.
+Subsequent samples are sane. Either skip the first tick or prime the refresh at startup.
+
+**Minor — `labels.config_revision` is `""`** on events emitted before the first
+`config.applied` (e.g. `app.start`, the boot `health.sample`). Cosmetic; noted so a Cloud
+Logging filter on that label doesn't silently miss boot-time entries.
+
+Host prerequisites learned (this run): x64 host, `cargo` must run inside
+`vcvarsall.bat x64` (plain `cargo` fails with `cl.exe: program not found`). `python` on this
+box is the Microsoft Store alias stub, not a real interpreter — `python -m http.server` fails;
+used a one-line node `http` server instead.
+
 Host prerequisites learned: VS BuildTools needs the **VCTools** workload; this ARM64 dev host has
 no ARM64 MSVC target toolset, so the repo is pinned via `rustup override set
 stable-x86_64-pc-windows-msvc` and cargo must run inside
