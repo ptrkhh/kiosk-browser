@@ -168,37 +168,37 @@ impl Watchdog {
                     Phase::Spawning { grace_until } if now > grace_until => {
                         self.restart(0, now, "no_ready")
                     }
-                    Phase::Armed => {
-                        let fx = if now.saturating_sub(self.last_heartbeat) >= MISS_LIMIT_S {
-                            match self.channel_grace_until {
-                                Some(grace_until) if now <= grace_until => {
-                                    // channel fault still within grace: wait, no restart yet.
-                                    Vec::new()
-                                }
-                                Some(_) => {
-                                    // channel grace expired: restart.
-                                    self.restart(0, now, "hang")
-                                }
-                                None => {
-                                    // healthy channel, missed heartbeats: confirmed hang.
-                                    let mut fx = vec![Action::Log(WatchdogEvent::Hang)];
-                                    fx.extend(self.restart(0, now, "hang"));
-                                    fx
-                                }
+                    Phase::Armed if now.saturating_sub(self.last_heartbeat) >= MISS_LIMIT_S => {
+                        // a genuine miss takes precedence over health-reset: a
+                        // restart tick must never also reset backoff/restarts
+                        // (Task 4's crash-loop window depends on the restart
+                        // timestamp this tick pushes surviving the tick).
+                        match self.channel_grace_until {
+                            Some(grace_until) if now <= grace_until => {
+                                // channel fault still within grace: wait, no restart yet.
+                                Vec::new()
                             }
-                        } else {
-                            Vec::new()
-                        };
-                        // rule 6: a run past healthy_run_s clears backoff + the
-                        // crash-loop window. Idempotent; applied after the miss
-                        // check above so a same-tick restart still emits the
-                        // pre-reset backoff_s, and this only resets state for
-                        // next time.
+                            Some(_) => {
+                                // channel grace expired: restart.
+                                self.restart(0, now, "hang")
+                            }
+                            None => {
+                                // healthy channel, missed heartbeats: confirmed hang.
+                                let mut fx = vec![Action::Log(WatchdogEvent::Hang)];
+                                fx.extend(self.restart(0, now, "hang"));
+                                fx
+                            }
+                        }
+                    }
+                    Phase::Armed => {
+                        // rule 6: heartbeat is healthy (no miss this tick) and
+                        // the run has crossed healthy_run_s — clear backoff +
+                        // the crash-loop window. Idempotent.
                         if now.saturating_sub(self.spawned_at) >= self.cfg.healthy_run_s {
                             self.backoff_s = 1;
                             self.restarts.clear();
                         }
-                        fx
+                        Vec::new()
                     }
                     Phase::BackingOff { until } if now >= until => {
                         self.spawned_at = now;
@@ -367,12 +367,76 @@ mod tests {
                                                       // next instance runs healthy_run_s+ before crashing → backoff must reset to 1
         w.on(Event::Spawned { at: 100 });
         w.on(Event::Ready);
-        w.on(Event::Tick { now: 100 + 121 }); // ran > healthy_run_s (120)
+        w.on(Event::Heartbeat { at: 215 }); // keep it heartbeating through the healthy window
+        w.on(Event::Tick { now: 100 + 121 }); // ran > healthy_run_s (120), no miss this tick
         let b2 = restart_backoff(&mut w, 100 + 300).unwrap();
         assert!(
             b1 > 0 && b2 == 1,
             "a run past healthy_run_s clears backoff (was {b1}, now {b2})"
         );
+    }
+
+    #[test]
+    fn a_hang_restart_tick_does_not_also_reset_backoff() {
+        // A tick that BOTH crosses healthy_run_s AND finds a missed heartbeat
+        // must take the miss/restart path only — it must not also reset
+        // backoff or wipe the restarts window the restart just recorded.
+        let (mut w, _) = Watchdog::new(cfg());
+        w.on(Event::Spawned { at: 0 });
+        w.on(Event::Ready);
+        let b1 = restart_backoff(&mut w, 1).unwrap(); // backoff now doubled (2)
+        w.on(Event::Spawned { at: 100 });
+        w.on(Event::Ready); // last_heartbeat = 100, spawned_at = 100
+        let fx = w.on(Event::Tick { now: 100 + 121 }); // no heartbeat sent: both a miss AND past healthy_run_s
+        let b_this_tick = fx.iter().find_map(|a| match a {
+            Action::Log(WatchdogEvent::Restart { backoff_s, .. }) => Some(*backoff_s),
+            _ => None,
+        });
+        assert_eq!(
+            b_this_tick,
+            Some(b1 * 2),
+            "the hang-restart must emit the pre-reset (doubled) backoff, not 1"
+        );
+    }
+
+    #[test]
+    fn healthy_run_s_boundary_resets_at_exactly_the_threshold() {
+        let (mut w, _) = Watchdog::new(cfg());
+        w.on(Event::Spawned { at: 0 });
+        w.on(Event::Ready);
+        let b1 = restart_backoff(&mut w, 1).unwrap();
+        w.on(Event::Spawned { at: 100 });
+        w.on(Event::Ready);
+        w.on(Event::Heartbeat {
+            at: 100 + cfg().healthy_run_s,
+        });
+        // exactly healthy_run_s, not one past it
+        w.on(Event::Tick {
+            now: 100 + cfg().healthy_run_s,
+        });
+        let b2 = restart_backoff(&mut w, 100 + 300).unwrap();
+        assert!(
+            b1 > 0 && b2 == 1,
+            "the reset boundary is >=, exactly healthy_run_s must already reset"
+        );
+    }
+
+    #[test]
+    fn backing_off_respawns_on_tick_past_until_and_waits_below_it() {
+        let (mut w, _) = Watchdog::new(cfg());
+        w.on(Event::Spawned { at: 0 });
+        w.on(Event::Ready);
+        // crash: backoff_s is 1 → BackingOff { until: at + 1 }
+        let fx = w.on(Event::ChildExited { code: 1, at: 10 });
+        assert!(fx
+            .iter()
+            .any(|a| matches!(a, Action::Log(WatchdogEvent::Restart { .. }))));
+        // below until: no-op, still waiting
+        let waiting = w.on(Event::Tick { now: 10 });
+        assert_eq!(waiting, Vec::<Action>::new(), "still waiting below until");
+        // at/past until: respawn
+        let fx = w.on(Event::Tick { now: 11 });
+        assert_eq!(fx, vec![Action::SpawnMain]);
     }
 
     #[test]
