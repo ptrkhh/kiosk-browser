@@ -57,6 +57,42 @@ fn bundled_url(page: &str) -> String {
     format!("{APP_ORIGIN}/{page}")
 }
 
+/// Pure index-vs-count decision for `display.monitor` (spec §5.2): `requested`
+/// is the configured index, `count` is `available_monitors().len()`. `Some`
+/// is the in-range index to place the window on; `None` means fall back to
+/// the primary monitor and emit `config.warn`. Split out from the Tauri
+/// wiring in `setup` so this branch is host-testable without a real display.
+fn resolve_monitor_index(requested: u32, count: usize) -> Option<usize> {
+    let requested = requested as usize;
+    (requested < count).then_some(requested)
+}
+
+#[cfg(test)]
+mod monitor_index_tests {
+    use super::resolve_monitor_index;
+
+    #[test]
+    fn in_range_index_is_kept() {
+        assert_eq!(resolve_monitor_index(0, 2), Some(0));
+        assert_eq!(resolve_monitor_index(1, 2), Some(1));
+    }
+
+    #[test]
+    fn out_of_range_falls_back() {
+        assert_eq!(resolve_monitor_index(5, 1), None);
+    }
+
+    #[test]
+    fn index_equal_to_count_falls_back() {
+        assert_eq!(resolve_monitor_index(1, 1), None);
+    }
+
+    #[test]
+    fn zero_monitors_always_falls_back() {
+        assert_eq!(resolve_monitor_index(0, 0), None);
+    }
+}
+
 /// The install dir `kiosk.ini`/the credential file/the offline mp4 live in (spec §4):
 /// next to the running exe, unless `--config <dir>` overrides it.
 fn resolve_config_dir(override_dir: Option<&str>) -> PathBuf {
@@ -467,6 +503,34 @@ async fn main() {
                 allow_text_selection,
             ));
             let window = builder.build()?;
+
+            // display.monitor (spec §5.2): an out-of-range index must never
+            // leave the kiosk without a window or panic at startup — a
+            // failed monitor query or a bad config index both fall back to
+            // the primary monitor. `available_monitors`/`primary_monitor`
+            // return `Result`/`Option`, so every failure path below is
+            // `Ok`/`Some`-checked, never `unwrap`ed.
+            if let Ok(monitors) = window.available_monitors() {
+                let target = resolve_monitor_index(display.monitor, monitors.len())
+                    .and_then(|i| monitors.get(i));
+                match target {
+                    Some(m) => {
+                        let _ = window.set_position(*m.position());
+                    }
+                    None => {
+                        telem_setup.config_warn(
+                            "display.monitor",
+                            "index beyond available displays; using primary",
+                        );
+                        if let Ok(Some(primary)) = window.primary_monitor() {
+                            let _ = window.set_position(*primary.position());
+                        }
+                        // No primary monitor resolvable either: leave the window
+                        // wherever Tauri's own default placement put it rather
+                        // than failing startup.
+                    }
+                }
+            }
 
             nav::install(
                 &window,

@@ -153,6 +153,18 @@ impl Telemetry {
     pub fn health(&self, fields: Map<String, Value>) {
         self.emit(LogEvent::HealthSample, fields);
     }
+
+    /// A config value was out of range / invalid and a safe fallback was used
+    /// instead (spec §6 taxonomy: `config.warn`, WARNING). `field` is the
+    /// dotted config key (e.g. `display.monitor`); `reason` is a short,
+    /// human-readable diagnostic. Reused by P1-D2e Task 5 for
+    /// `hardening.autofill`.
+    pub fn config_warn(&self, field: &str, reason: &str) {
+        let mut f = Map::new();
+        f.insert("field".into(), Value::from(field));
+        f.insert("reason".into(), Value::from(reason));
+        self.emit(LogEvent::ConfigWarn, f);
+    }
 }
 
 /// Assembles the P1-B logger stack for this device.
