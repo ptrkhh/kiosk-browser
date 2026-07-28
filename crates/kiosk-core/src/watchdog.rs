@@ -5,9 +5,16 @@
 //! Rules 1-3 + 9 (READY arming, heartbeat/miss disambiguation, channel-fault
 //! grace, exit-86) plus rules 4-6 (backoff doubling with a 60s ceiling,
 //! respawn-on-tick, healthy_run_s backoff/crash-loop-window reset) are
-//! implemented here. Crash-loop -> safe mode (rules 7-8) is Task 4; the
-//! `safe`/`safe_fails` fields it needs are declared now so that task is
-//! purely additive.
+//! implemented here. Crash-loop -> safe mode + safe-mode escalation
+//! (rules 7-8) are implemented too: >5 restarts in a sliding 600s window
+//! trips safe mode; 3 consecutive fast (< healthy_run_s) `--safe` fails
+//! escalate to SafeModeFailed and hold backoff at the 60s ceiling; any
+//! instance (safe or normal) surviving >= healthy_run_s exits safe mode.
+//!
+//! ponytail: while in safe mode we never retry normal mode on our own; only
+//! surviving healthy_run_s as --safe exits safe. §3.1's "retry normal every
+//! 10 min" nuance isn't pinned by a test here, so a separate normal-mode
+//! retry timer isn't built — add it if a future test requires it.
 
 use crate::logging::event::Event as LogEvent;
 
@@ -70,6 +77,8 @@ impl WatchdogEvent {
 }
 
 const MISS_LIMIT_S: u64 = 15; // 3 x PING_INTERVAL_S
+const WINDOW_S: u64 = 600; // crash-loop sliding window (rule 7)
+const SAFE_FAIL_LIMIT: u32 = 3; // consecutive safe-mode fails -> SafeModeFailed (rule 8)
 
 #[derive(Debug, Clone, PartialEq)]
 enum Phase {
@@ -82,14 +91,12 @@ enum Phase {
 pub struct Watchdog {
     cfg: WatchdogConfig,
     phase: Phase,
-    #[allow(dead_code)] // Tasks 3/4
     safe: bool, // running --safe
     spawned_at: u64,
     last_heartbeat: u64,
-    backoff_s: u64,     // current backoff (Task 3)
-    restarts: Vec<u64>, // restart timestamps, sliding window (Task 4)
-    #[allow(dead_code)] // Tasks 3/4
-    safe_fails: u32, // consecutive --safe fails within healthy_run_s (Task 4)
+    backoff_s: u64,                   // current backoff (Task 3)
+    restarts: Vec<u64>,               // restart timestamps, sliding window (Task 4)
+    safe_fails: u32,                  // consecutive --safe fails within healthy_run_s (Task 4)
     channel_grace_until: Option<u64>, // set on ChannelFault
     now: u64,
 }
@@ -115,7 +122,7 @@ impl Watchdog {
         self.phase = Phase::BackingOff {
             until: at + self.backoff_s,
         };
-        let fx = vec![
+        let mut fx = vec![
             Action::DrainOrphanedSpool,
             Action::Log(WatchdogEvent::Restart {
                 code,
@@ -123,8 +130,36 @@ impl Watchdog {
                 cause,
             }),
         ];
-        self.restarts.push(at);
-        self.backoff_s = self.backoff_s.saturating_mul(2).min(60);
+
+        let mut escalated = false;
+        if self.safe {
+            // rule 8: a --safe instance that fails fast (within healthy_run_s)
+            // counts toward escalation. Surviving healthy_run_s exits safe mode
+            // via the Armed-tick healthy-reset path, not here.
+            if at.saturating_sub(self.spawned_at) < self.cfg.healthy_run_s {
+                self.safe_fails = self.safe_fails.saturating_add(1);
+                if self.safe_fails >= SAFE_FAIL_LIMIT {
+                    fx.push(Action::Log(WatchdogEvent::SafeModeFailed));
+                    escalated = true;
+                }
+            }
+        } else {
+            // rule 7: sliding 10-min crash-loop window.
+            self.restarts.push(at);
+            self.restarts.retain(|&t| at.saturating_sub(t) <= WINDOW_S);
+            if self.restarts.len() > 5 {
+                self.safe = true;
+                self.safe_fails = 0;
+                self.restarts.clear();
+                fx.push(Action::Log(WatchdogEvent::SafeMode));
+            }
+        }
+
+        self.backoff_s = if escalated {
+            60 // hold at the ceiling: stop fast-looping once escalated
+        } else {
+            self.backoff_s.saturating_mul(2).min(60)
+        };
         fx
     }
 
@@ -197,6 +232,8 @@ impl Watchdog {
                         if now.saturating_sub(self.spawned_at) >= self.cfg.healthy_run_s {
                             self.backoff_s = 1;
                             self.restarts.clear();
+                            self.safe = false; // rule 8: survived healthy_run_s -> exit safe mode
+                            self.safe_fails = 0;
                         }
                         Vec::new()
                     }
@@ -206,7 +243,11 @@ impl Watchdog {
                         self.phase = Phase::Spawning {
                             grace_until: now + self.cfg.startup_grace_s,
                         };
-                        vec![Action::SpawnMain]
+                        vec![if self.safe {
+                            Action::SpawnSafe
+                        } else {
+                            Action::SpawnMain
+                        }]
                     }
                     _ => Vec::new(),
                 }
@@ -437,6 +478,95 @@ mod tests {
         // at/past until: respawn
         let fx = w.on(Event::Tick { now: 11 });
         assert_eq!(fx, vec![Action::SpawnMain]);
+    }
+
+    /// Drives >5 fast crashes to force the FSM into safe mode.
+    fn force_into_safe(w: &mut Watchdog) {
+        for i in 0..6 {
+            w.on(Event::Spawned { at: i * 10 });
+            w.on(Event::Ready);
+            w.on(Event::ChildExited {
+                code: 1,
+                at: i * 10 + 1,
+            });
+        }
+    }
+
+    #[test]
+    fn more_than_5_restarts_in_10min_enters_safe_mode() {
+        let (mut w, _) = Watchdog::new(cfg());
+        // 6 fast crashes within 600 s -> the 6th tips into safe mode
+        let mut entered_safe = false;
+        for i in 0..6 {
+            w.on(Event::Spawned { at: i * 10 });
+            w.on(Event::Ready);
+            let fx = w.on(Event::ChildExited {
+                code: 1,
+                at: i * 10 + 1,
+            });
+            if fx
+                .iter()
+                .any(|a| matches!(a, Action::Log(WatchdogEvent::SafeMode)))
+            {
+                entered_safe = true;
+            }
+        }
+        assert!(entered_safe, ">5 restarts in 10 min must enter safe mode");
+        // and the next spawn is --safe
+        let fx = w.on(Event::Tick { now: 10_000 });
+        assert!(fx.contains(&Action::SpawnSafe));
+    }
+
+    #[test]
+    fn five_restarts_in_10min_does_not_enter_safe() {
+        let (mut w, _) = Watchdog::new(cfg());
+        let mut safe = false;
+        for i in 0..5 {
+            w.on(Event::Spawned { at: i * 10 });
+            w.on(Event::Ready);
+            let fx = w.on(Event::ChildExited {
+                code: 1,
+                at: i * 10 + 1,
+            });
+            if fx
+                .iter()
+                .any(|a| matches!(a, Action::Log(WatchdogEvent::SafeMode)))
+            {
+                safe = true;
+            }
+        }
+        assert!(
+            !safe,
+            "exactly 5 in 10 min stays in normal mode (boundary: > 5, not >= 5)"
+        );
+    }
+
+    #[test]
+    fn three_consecutive_safe_fails_escalate_to_safe_mode_failed() {
+        let (mut w, _) = Watchdog::new(cfg());
+        force_into_safe(&mut w); // helper: drive >5 crashes
+        let mut escalated = false;
+        for i in 0..3 {
+            // 3 --safe starts each failing within healthy_run_s
+            w.on(Event::Spawned {
+                at: 10_000 + i * 10,
+            });
+            w.on(Event::Ready);
+            let fx = w.on(Event::ChildExited {
+                code: 1,
+                at: 10_000 + i * 10 + 5,
+            });
+            if fx
+                .iter()
+                .any(|a| matches!(a, Action::Log(WatchdogEvent::SafeModeFailed)))
+            {
+                escalated = true;
+            }
+        }
+        assert!(
+            escalated,
+            "N=3 safe-fails within healthy_run_s -> safe_mode_failed CRITICAL"
+        );
     }
 
     #[test]
