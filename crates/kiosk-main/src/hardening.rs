@@ -171,7 +171,11 @@ mod windows_impl {
                     // pair on `ICoreWebView2Profile6` (a profile-scoped, not
                     // per-webview, surface this module does not reach). Reported as a
                     // brief-requested-but-absent flag rather than guessed.
-                    match webview2.cast::<ICoreWebView2Settings4>() {
+                    // Settings4/5 are interfaces on the SETTINGS object, not on
+                    // `ICoreWebView2` — QI'ing the webview returns E_NOINTERFACE on
+                    // every runtime version, which is what the 2026-07-27/28 smokes
+                    // saw (evergreen 150.0.4078.99 included). Cast `settings`.
+                    match settings.cast::<ICoreWebView2Settings4>() {
                         Ok(settings4) => {
                             if let Err(e) = settings4.SetIsPasswordAutosaveEnabled(false) {
                                 eprintln!("hardening: SetIsPasswordAutosaveEnabled failed: {e}");
@@ -199,7 +203,7 @@ mod windows_impl {
                     // exists anywhere on `ICoreWebView2Controller*` — grepped: zero
                     // matches). Verified against bindings.rs rather than the brief's
                     // (superseded) note; used here as actually generated.
-                    match webview2.cast::<ICoreWebView2Settings5>() {
+                    match settings.cast::<ICoreWebView2Settings5>() {
                         Ok(settings5) => {
                             if let Err(e) = settings5.SetIsPinchZoomEnabled(false) {
                                 eprintln!("hardening: SetIsPinchZoomEnabled failed: {e}");
