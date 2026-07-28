@@ -9,6 +9,7 @@ mod egress;
 mod fetch;
 mod gesture;
 mod hardening;
+mod health;
 mod idle;
 mod inject;
 mod nav;
@@ -22,7 +23,7 @@ mod telemetry;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use driver::{Driver, EffectSink};
@@ -32,6 +33,7 @@ use kiosk_core::logging::time::TrustedClock;
 use kiosk_core::net::prober::Prober;
 use kiosk_core::net::reach::resolve_probe_url;
 use nav_policy::{NavPolicy, SharedNavPolicy};
+use sysinfo::{Disks, System};
 use tauri::{AppHandle, Manager};
 use tokio::sync::{mpsc, Notify};
 use tokio_util::sync::CancellationToken;
@@ -53,6 +55,42 @@ const EVENT_CHANNEL_CAPACITY: usize = 64;
 
 fn bundled_url(page: &str) -> String {
     format!("{APP_ORIGIN}/{page}")
+}
+
+/// Pure index-vs-count decision for `display.monitor` (spec §5.2): `requested`
+/// is the configured index, `count` is `available_monitors().len()`. `Some`
+/// is the in-range index to place the window on; `None` means fall back to
+/// the primary monitor and emit `config.warn`. Split out from the Tauri
+/// wiring in `setup` so this branch is host-testable without a real display.
+fn resolve_monitor_index(requested: u32, count: usize) -> Option<usize> {
+    let requested = requested as usize;
+    (requested < count).then_some(requested)
+}
+
+#[cfg(test)]
+mod monitor_index_tests {
+    use super::resolve_monitor_index;
+
+    #[test]
+    fn in_range_index_is_kept() {
+        assert_eq!(resolve_monitor_index(0, 2), Some(0));
+        assert_eq!(resolve_monitor_index(1, 2), Some(1));
+    }
+
+    #[test]
+    fn out_of_range_falls_back() {
+        assert_eq!(resolve_monitor_index(5, 1), None);
+    }
+
+    #[test]
+    fn index_equal_to_count_falls_back() {
+        assert_eq!(resolve_monitor_index(1, 1), None);
+    }
+
+    #[test]
+    fn zero_monitors_always_falls_back() {
+        assert_eq!(resolve_monitor_index(0, 0), None);
+    }
 }
 
 /// The install dir `kiosk.ini`/the credential file/the offline mp4 live in (spec §4):
@@ -77,6 +115,28 @@ fn resolve_data_dir() -> PathBuf {
         .join("kiosk")
 }
 
+/// File-only breadcrumb, installed before telemetry exists (see call site in `main`).
+/// Takes/chains the existing hook first (same discipline as `install_panic_hook`
+/// below) so the stdlib default hook — which prints the panic message/backtrace to
+/// stderr — is preserved rather than discarded; that stderr output is the only
+/// panic diagnostics dev/debug console builds get.
+/// `std::panic::take_hook`/`set_hook` compose: `install_panic_hook` below calls
+/// `take_hook()` when it runs, which returns THIS closure and chains it as its
+/// `default_hook`, so once telemetry comes up both the file write and `telem.panic`
+/// fire on every panic — this one is never replaced, only wrapped.
+fn install_panic_hook_file_only(data_dir: PathBuf) {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        let path = data_dir.join("crash-panic.txt");
+        if let Ok(mut f) = std::fs::File::create(&path) {
+            use std::io::Write;
+            let _ = writeln!(f, "{info}");
+            let _ = f.sync_all();
+        }
+    }));
+}
+
 /// Best-effort crash telemetry (spec TEL-10, brief step 4).
 ///
 /// The async `Logger` is owned by the logger thread (`telemetry::run`); a
@@ -99,11 +159,27 @@ fn resolve_data_dir() -> PathBuf {
 /// write from inside a panic hook (racing the very same spool the logger thread also
 /// holds open, violating the "one writer per segment" invariant — spec arch-01) would
 /// be the "fragile mechanism" the brief warns against, not a fix.
-fn install_panic_hook(telem: telemetry::Telemetry) {
+fn install_panic_hook(telem: telemetry::Telemetry, data_dir: PathBuf) {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         default_hook(info);
         telem.panic(&info.to_string());
+
+        // Best-effort durable breadcrumb for the launcher (P1-E) to attach to
+        // watchdog.restart. No allocation-heavy / re-entrant work — a panic in
+        // this hook must not cascade into a second panic. `File::create`
+        // truncates: on a second panic (or a panic on another thread racing
+        // this one) the file is silently overwritten, so it only ever holds
+        // the MOST RECENT panic, not a history. That's fine for the launcher's
+        // use case (attach the breadcrumb to the restart it's currently
+        // handling) but means two panics in quick succession without an
+        // intervening restart lose the first message.
+        let path = data_dir.join("crash-panic.txt");
+        if let Ok(mut f) = std::fs::File::create(&path) {
+            use std::io::Write;
+            let _ = writeln!(f, "{info}"); // message + location (Display of PanicHookInfo)
+            let _ = f.sync_all(); // fsync the file
+        }
     }));
 }
 
@@ -194,8 +270,25 @@ impl EffectSink for TauriSink {
 
 #[tokio::main]
 async fn main() {
+    // P1-D2e Task 2: process-start instant for `health.sample`'s `uptime_secs` —
+    // taken as early as possible so uptime reflects the whole process lifetime,
+    // not just the time since the health task was spawned.
+    let process_started = Instant::now();
     let args = cli::Args::parse(std::env::args());
     let config_dir = resolve_config_dir(args.config.as_deref());
+
+    // P1-D2e final-review Fix A: `data_dir` is pure/CLI-independent (spec §4), so it can
+    // be resolved before the two panic sites below (bad `--config` path / malformed
+    // `kiosk.ini`) rather than after them. Installing a file-only breadcrumb hook this
+    // early means BOTH panics still leave `crash-panic.txt` for the P1-E launcher —
+    // telemetry doesn't exist yet at this point, so there is nothing to send it to.
+    let data_dir = resolve_data_dir();
+    // Best-effort: %ProgramData%\kiosk\ isn't created until spool.rs/store.rs run
+    // later, both after the two early panic sites below. Without this, File::create
+    // in the hook fails silently on a fresh install and there's no breadcrumb at all.
+    let _ = std::fs::create_dir_all(&data_dir);
+    install_panic_hook_file_only(data_dir.clone());
+
     let ini_path = config_dir.join("kiosk.ini");
     let ini_text = std::fs::read_to_string(&ini_path).unwrap_or_else(|e| {
         panic!(
@@ -204,7 +297,6 @@ async fn main() {
         )
     });
 
-    let data_dir = resolve_data_dir();
     let booted = boot::boot(&ini_text, &data_dir).unwrap_or_else(|e| {
         panic!(
             "kiosk-main: {} is not a valid kiosk.ini: {e}",
@@ -230,6 +322,10 @@ async fn main() {
     // process restart (this loop is spawned once, below, and never re-reads config).
     let idle_reset_seconds = booted.manager.current().content.idle_reset_seconds;
     let allow_text_selection = booted.manager.current().input.allow_text_selection;
+    // P1-D2e Task 2: same "read once, next-restart to change" convention as the
+    // fields above — the health-sample timer is spawned once, below, and never
+    // re-reads config.
+    let health_sample_s = booted.manager.current().logging.health_sample_s;
     // P1-D2c Task 4: same "read once, next-restart to change" convention as the
     // three fields above — remote `input.exit_gesture` wins over bootstrap
     // `[exit_gesture]` (cfg-12), resolved once here via `gesture::effective_gesture`
@@ -287,7 +383,15 @@ async fn main() {
     // fetch/probe/driver/TauriSink/nav keeps working unchanged.
     let app_version = kiosk_core::app_version().to_string();
     let cancel_log = cancel.clone();
+    // Published by `telemetry::run` on the logger thread, read by `health::run`
+    // (spawned below) — see `telemetry::run`'s doc comment for why this atomic,
+    // rather than a direct cross-thread `Logger::dropped_expired()` call, is the
+    // plumbing: the `Logger` lives on this dedicated OS thread and is never `Sync`
+    // across it.
+    let dropped_expired = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let dropped_expired_log = dropped_expired.clone();
     let (handle_tx, handle_rx) = std::sync::mpsc::channel::<Option<telemetry::Telemetry>>();
+    let panic_hook_data_dir = data_dir.clone();
     let spawned = std::thread::Builder::new()
         .name("telemetry".into())
         .spawn(move || {
@@ -302,7 +406,7 @@ async fn main() {
             ) {
                 Ok((telem, logger, log_rx)) => {
                     let _ = handle_tx.send(Some(telem));
-                    telemetry::run(logger, log_rx, cancel_log);
+                    telemetry::run(logger, log_rx, cancel_log, dropped_expired_log);
                 }
                 Err(e) => {
                     eprintln!("kiosk-main: telemetry disabled ({e}); continuing without it");
@@ -322,7 +426,7 @@ async fn main() {
         .flatten()
         .unwrap_or_else(telemetry::Telemetry::disabled);
 
-    install_panic_hook(telem.clone());
+    install_panic_hook(telem.clone(), panic_hook_data_dir);
     telem.app_start();
     telem.config_applied(revision, &warnings);
 
@@ -347,6 +451,21 @@ async fn main() {
     // P1-D2c Task 3: emits `IdleExpired` UNCONDITIONALLY — the FSM (rule 9) already
     // no-ops it outside `Online`, so no state check belongs here too.
     tokio::spawn(idle::run(idle_reset_seconds, tx.clone(), cancel.clone()));
+
+    // P1-D2e Task 2: periodic `health.sample`. `resolve_data_dir()` is a pure
+    // function of `%ProgramData%`, cheap to call again here — the `data_dir` bound
+    // at the top of `main` was already moved into the telemetry thread's closure
+    // above (same pattern as `pinpad_state` below).
+    tokio::spawn(health::run(
+        System::new(),
+        Disks::new_with_refreshed_list(),
+        resolve_data_dir(),
+        process_started,
+        health_sample_s,
+        Arc::new(move || dropped_expired.load(std::sync::atomic::Ordering::Relaxed)),
+        telem.clone(),
+        cancel.clone(),
+    ));
 
     // Keep-awake (spec §7, display.keep_awake): asserted once at startup, for the
     // life of the process — WebView2/tao has no per-window "don't sleep" flag, so
@@ -436,6 +555,34 @@ async fn main() {
             ));
             let window = builder.build()?;
 
+            // display.monitor (spec §5.2): an out-of-range index must never
+            // leave the kiosk without a window or panic at startup — a
+            // failed monitor query or a bad config index both fall back to
+            // the primary monitor. `available_monitors`/`primary_monitor`
+            // return `Result`/`Option`, so every failure path below is
+            // `Ok`/`Some`-checked, never `unwrap`ed.
+            if let Ok(monitors) = window.available_monitors() {
+                let target = resolve_monitor_index(display.monitor, monitors.len())
+                    .and_then(|i| monitors.get(i));
+                match target {
+                    Some(m) => {
+                        let _ = window.set_position(*m.position());
+                    }
+                    None => {
+                        telem_setup.config_warn(
+                            "display.monitor",
+                            "index beyond available displays; using primary",
+                        );
+                        if let Ok(Some(primary)) = window.primary_monitor() {
+                            let _ = window.set_position(*primary.position());
+                        }
+                        // No primary monitor resolvable either: leave the window
+                        // wherever Tauri's own default placement put it rather
+                        // than failing startup.
+                    }
+                }
+            }
+
             nav::install(
                 &window,
                 tx_setup.clone(),
@@ -444,7 +591,12 @@ async fn main() {
             );
             scheme_guard::install(&window, telem_setup.clone(), nav_policy_setup.clone());
             egress::install(&window, telem_setup.clone(), nav_policy_setup.clone());
-            hardening::apply(&window, nav_policy_setup.clone(), content_zoom);
+            hardening::apply(
+                &window,
+                nav_policy_setup.clone(),
+                content_zoom,
+                telem_setup.clone(),
+            );
             shortcuts::install(&window, app.handle().clone(), exit_gesture_setup.clone());
             gesture::install(&window, app.handle().clone(), exit_gesture_setup.clone());
             recovery::install(&window, telem_setup.clone(), nav_policy_setup.clone());
