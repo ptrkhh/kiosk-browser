@@ -137,11 +137,27 @@ fn resolve_data_dir() -> PathBuf {
 /// write from inside a panic hook (racing the very same spool the logger thread also
 /// holds open, violating the "one writer per segment" invariant — spec arch-01) would
 /// be the "fragile mechanism" the brief warns against, not a fix.
-fn install_panic_hook(telem: telemetry::Telemetry) {
+fn install_panic_hook(telem: telemetry::Telemetry, data_dir: PathBuf) {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         default_hook(info);
         telem.panic(&info.to_string());
+
+        // Best-effort durable breadcrumb for the launcher (P1-E) to attach to
+        // watchdog.restart. No allocation-heavy / re-entrant work — a panic in
+        // this hook must not cascade into a second panic. `File::create`
+        // truncates: on a second panic (or a panic on another thread racing
+        // this one) the file is silently overwritten, so it only ever holds
+        // the MOST RECENT panic, not a history. That's fine for the launcher's
+        // use case (attach the breadcrumb to the restart it's currently
+        // handling) but means two panics in quick succession without an
+        // intervening restart lose the first message.
+        let path = data_dir.join("crash-panic.txt");
+        if let Ok(mut f) = std::fs::File::create(&path) {
+            use std::io::Write;
+            let _ = writeln!(f, "{info}"); // message + location (Display of PanicHookInfo)
+            let _ = f.sync_all(); // fsync the file
+        }
     }));
 }
 
@@ -341,6 +357,7 @@ async fn main() {
     let dropped_expired = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let dropped_expired_log = dropped_expired.clone();
     let (handle_tx, handle_rx) = std::sync::mpsc::channel::<Option<telemetry::Telemetry>>();
+    let panic_hook_data_dir = data_dir.clone();
     let spawned = std::thread::Builder::new()
         .name("telemetry".into())
         .spawn(move || {
@@ -375,7 +392,7 @@ async fn main() {
         .flatten()
         .unwrap_or_else(telemetry::Telemetry::disabled);
 
-    install_panic_hook(telem.clone());
+    install_panic_hook(telem.clone(), panic_hook_data_dir);
     telem.app_start();
     telem.config_applied(revision, &warnings);
 
