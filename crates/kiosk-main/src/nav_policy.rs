@@ -235,7 +235,9 @@ pub fn is_remote_origin(url: &str) -> bool {
         .ok()
         .and_then(|u| u.host_str().map(str::to_string))
     {
-        Some(host) => host != "tauri.localhost" && host != "kioskasset.localhost",
+        Some(host) => {
+            host != "tauri.localhost" && host != "kioskasset.localhost" && host != "ipc.localhost"
+        }
         None => false,
     }
 }
@@ -309,6 +311,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ipc_origin_is_app_origin_not_remote_egress() {
+        // Tauri's own IPC custom-protocol origin (Windows) must not be classed as remote
+        // content — the D2c smoke saw it false-reported as nav.blocked{egress}.
+        assert!(!is_remote_origin("http://ipc.localhost/"));
+        assert!(!is_remote_origin("http://ipc.localhost/anything"));
+    }
+
     // ---- resource_allowed (P1-D2b Task 4, SEC-10) -------------------------------------
 
     #[test]
@@ -336,6 +346,19 @@ mod tests {
             "https://home.test/app",
         );
         assert!(p.resource_allowed("http://tauri.localhost/bundle.js"));
+    }
+
+    #[test]
+    fn ipc_localhost_subresource_egress_is_not_blocked() {
+        // `resource_allowed` routes through the same `is_remote_origin` gate
+        // (see the `if !is_remote_origin` at the top of `resource_allowed`), so
+        // widening the app-origin set in `is_remote_origin` fixes the egress
+        // filter and the nav guard by construction — verified directly here.
+        let p = NavPolicy::from_config(
+            &content(&["https://home.test/*"], &[]),
+            "https://home.test/app",
+        );
+        assert!(p.resource_allowed("http://ipc.localhost/whatever"));
     }
 
     #[test]

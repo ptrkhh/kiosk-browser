@@ -557,7 +557,12 @@ async fn main() {
             );
             scheme_guard::install(&window, telem_setup.clone(), nav_policy_setup.clone());
             egress::install(&window, telem_setup.clone(), nav_policy_setup.clone());
-            hardening::apply(&window, nav_policy_setup.clone(), content_zoom);
+            hardening::apply(
+                &window,
+                nav_policy_setup.clone(),
+                content_zoom,
+                telem_setup.clone(),
+            );
             shortcuts::install(&window, app.handle().clone(), exit_gesture_setup.clone());
             gesture::install(&window, app.handle().clone(), exit_gesture_setup.clone());
             recovery::install(&window, telem_setup.clone(), nav_policy_setup.clone());

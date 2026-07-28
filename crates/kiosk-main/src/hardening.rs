@@ -39,14 +39,25 @@
 //! per-branch comment and task-5-report.md "Descoped (with reason)".
 
 use crate::nav_policy::{PermissionKind, SharedNavPolicy};
+use crate::telemetry::Telemetry;
 
 #[cfg(windows)]
-pub fn apply(window: &tauri::WebviewWindow, nav_policy: SharedNavPolicy, zoom: f64) {
-    windows_impl::apply(window, nav_policy, zoom);
+pub fn apply(
+    window: &tauri::WebviewWindow,
+    nav_policy: SharedNavPolicy,
+    zoom: f64,
+    telem: Telemetry,
+) {
+    windows_impl::apply(window, nav_policy, zoom, telem);
 }
 
 #[cfg(not(windows))]
-pub fn apply(_window: &tauri::WebviewWindow, _nav_policy: SharedNavPolicy, _zoom: f64) {
+pub fn apply(
+    _window: &tauri::WebviewWindow,
+    _nav_policy: SharedNavPolicy,
+    _zoom: f64,
+    _telem: Telemetry,
+) {
     eprintln!(
         "hardening: only implemented on Windows; settings flags/script-dialog/permission policy will never apply"
     );
@@ -81,6 +92,7 @@ mod windows_impl {
     use windows::core::Interface;
 
     use crate::nav_policy::{permission_allowed, SharedNavPolicy};
+    use crate::telemetry::Telemetry;
 
     /// Coarse per-window budget for `alert`/`confirm`/`prompt` before this module starts
     /// auto-dismissing them instead of letting WebView2's (already-disabled, see the
@@ -89,7 +101,12 @@ mod windows_impl {
     /// broken/hostile page trying to wedge the kiosk behind an unbounded dialog stack.
     const SCRIPT_DIALOG_BUDGET: u32 = 20;
 
-    pub fn apply(window: &tauri::WebviewWindow, nav_policy: SharedNavPolicy, zoom: f64) {
+    pub fn apply(
+        window: &tauri::WebviewWindow,
+        nav_policy: SharedNavPolicy,
+        zoom: f64,
+        telem: Telemetry,
+    ) {
         let result = window.with_webview(move |platform_webview| unsafe {
             use webview2_com::Microsoft::Web::WebView2::Win32::{
                 ICoreWebView2PermissionRequestedEventArgs, ICoreWebView2ScriptDialogOpeningEventArgs,
@@ -163,9 +180,15 @@ mod windows_impl {
                                 eprintln!("hardening: SetIsGeneralAutofillEnabled failed: {e}");
                             }
                         }
-                        Err(e) => eprintln!(
-                            "hardening: CoreWebView2Settings does not implement Settings4, autofill/password-autosave will stay on: {e}"
-                        ),
+                        Err(e) => {
+                            eprintln!(
+                                "hardening: CoreWebView2Settings does not implement Settings4, autofill/password-autosave will stay on: {e}"
+                            );
+                            telem.config_warn(
+                                "hardening.autofill",
+                                "Settings4 unavailable; autofill/password-save stay on",
+                            );
+                        }
                     }
 
                     // `ICoreWebView2Settings5` (bindings.rs:35969-36009): pinch zoom.
@@ -182,9 +205,15 @@ mod windows_impl {
                                 eprintln!("hardening: SetIsPinchZoomEnabled failed: {e}");
                             }
                         }
-                        Err(e) => eprintln!(
-                            "hardening: CoreWebView2Settings does not implement Settings5, pinch zoom will stay on: {e}"
-                        ),
+                        Err(e) => {
+                            eprintln!(
+                                "hardening: CoreWebView2Settings does not implement Settings5, pinch zoom will stay on: {e}"
+                            );
+                            telem.config_warn(
+                                "hardening.pinch_zoom",
+                                "Settings5 unavailable; pinch zoom stays on",
+                            );
+                        }
                     }
                 }
                 Err(e) => eprintln!(
