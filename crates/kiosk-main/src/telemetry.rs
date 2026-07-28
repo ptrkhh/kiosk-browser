@@ -155,10 +155,11 @@ impl Telemetry {
     }
 
     /// A config value was out of range / invalid and a safe fallback was used
-    /// instead (spec §6 taxonomy: `config.warn`, WARNING). `field` is the
-    /// dotted config key (e.g. `display.monitor`); `reason` is a short,
-    /// human-readable diagnostic. Reused by P1-D2e Task 5 for
-    /// `hardening.autofill`.
+    /// instead (spec §6 taxonomy: `config.warn`, WARNING). `field` is a stable
+    /// dotted label identifying the affected setting — a real config key where
+    /// one exists (e.g. `display.monitor`), or a shipped smoke-checklist label
+    /// for a setting with no single key (e.g. `hardening.autofill`, reused by
+    /// P1-D2e Task 5).
     pub fn config_warn(&self, field: &str, reason: &str) {
         let mut f = Map::new();
         f.insert("field".into(), Value::from(field));

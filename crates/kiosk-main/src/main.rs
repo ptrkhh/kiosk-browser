@@ -137,6 +137,22 @@ fn resolve_data_dir() -> PathBuf {
 /// write from inside a panic hook (racing the very same spool the logger thread also
 /// holds open, violating the "one writer per segment" invariant — spec arch-01) would
 /// be the "fragile mechanism" the brief warns against, not a fix.
+/// File-only breadcrumb, installed before telemetry exists (see call site in `main`).
+/// `std::panic::take_hook`/`set_hook` compose: `install_panic_hook` below calls
+/// `take_hook()` when it runs, which returns THIS closure and chains it as its
+/// `default_hook`, so once telemetry comes up both the file write and `telem.panic`
+/// fire on every panic — this one is never replaced, only wrapped.
+fn install_panic_hook_file_only(data_dir: PathBuf) {
+    std::panic::set_hook(Box::new(move |info| {
+        let path = data_dir.join("crash-panic.txt");
+        if let Ok(mut f) = std::fs::File::create(&path) {
+            use std::io::Write;
+            let _ = writeln!(f, "{info}");
+            let _ = f.sync_all();
+        }
+    }));
+}
+
 fn install_panic_hook(telem: telemetry::Telemetry, data_dir: PathBuf) {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -254,6 +270,15 @@ async fn main() {
     let process_started = Instant::now();
     let args = cli::Args::parse(std::env::args());
     let config_dir = resolve_config_dir(args.config.as_deref());
+
+    // P1-D2e final-review Fix A: `data_dir` is pure/CLI-independent (spec §4), so it can
+    // be resolved before the two panic sites below (bad `--config` path / malformed
+    // `kiosk.ini`) rather than after them. Installing a file-only breadcrumb hook this
+    // early means BOTH panics still leave `crash-panic.txt` for the P1-E launcher —
+    // telemetry doesn't exist yet at this point, so there is nothing to send it to.
+    let data_dir = resolve_data_dir();
+    install_panic_hook_file_only(data_dir.clone());
+
     let ini_path = config_dir.join("kiosk.ini");
     let ini_text = std::fs::read_to_string(&ini_path).unwrap_or_else(|e| {
         panic!(
@@ -262,7 +287,6 @@ async fn main() {
         )
     });
 
-    let data_dir = resolve_data_dir();
     let booted = boot::boot(&ini_text, &data_dir).unwrap_or_else(|e| {
         panic!(
             "kiosk-main: {} is not a valid kiosk.ini: {e}",
