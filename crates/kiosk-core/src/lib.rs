@@ -7,10 +7,12 @@ pub mod config;
 pub mod error;
 pub mod exit;
 pub mod identity;
+pub mod ipc;
 pub mod logging;
 pub mod metrics;
 pub mod nav;
 pub mod net;
+pub mod watchdog;
 
 /// The crate/product version, sourced from Cargo. Later plans extend this
 /// with the git sha for telemetry labels (spec §6 TEL-04).
