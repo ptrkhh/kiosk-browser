@@ -8,47 +8,40 @@
 //! wires it in.
 #![allow(dead_code)]
 
+use crate::clock::now;
 use kiosk_core::watchdog::Event;
 use std::io;
 use std::path::Path;
 use std::process::Child;
 use std::sync::mpsc::Sender;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock before UNIX_EPOCH")
-        .as_secs()
-}
-
-/// Raw kernel32 declarations for the one thing std doesn't expose: an
-/// independent, waitable duplicate of a process HANDLE. `kernel32.lib` is
-/// already linked into every Windows Rust binary, so no extra dependency
-/// is needed for these four calls.
+/// Raw kernel32 declarations for the two calls std doesn't expose: waiting
+/// on a HANDLE and reading its exit code. `kernel32.lib` is already linked
+/// into every Windows Rust binary, so no extra dependency is needed.
 #[cfg(windows)]
 #[allow(non_snake_case)]
 mod win32 {
     use std::os::windows::io::RawHandle;
 
-    pub const DUPLICATE_SAME_ACCESS: u32 = 0x0000_0002;
     pub const INFINITE: u32 = 0xFFFF_FFFF;
+    pub const WAIT_FAILED: u32 = 0xFFFF_FFFF;
 
     extern "system" {
-        pub fn GetCurrentProcess() -> RawHandle;
-        pub fn DuplicateHandle(
-            h_source_process: RawHandle,
-            h_source: RawHandle,
-            h_target_process: RawHandle,
-            lp_target: *mut RawHandle,
-            dw_desired_access: u32,
-            b_inherit: i32,
-            dw_options: u32,
-        ) -> i32;
         pub fn WaitForSingleObject(h_handle: RawHandle, dw_milliseconds: u32) -> u32;
         pub fn GetExitCodeProcess(h_process: RawHandle, lp_exit_code: *mut u32) -> i32;
-        pub fn CloseHandle(h_object: RawHandle) -> i32;
     }
+}
+
+/// Sends a synthetic `ChildExited{code: -1, ..}` and kills `child` so no
+/// orphaned process is left holding the single-instance mutex/IPC pipe
+/// while the FSM's backoff spawns a replacement.
+#[cfg(windows)]
+fn report_dead_and_kill(tx: &Sender<Event>, mut child: Child) {
+    let _ = child.kill();
+    let _ = tx.send(Event::ChildExited {
+        code: -1,
+        at: now(),
+    });
 }
 
 /// Spawns the supervised child (`exe --config <config_dir> [--safe]`),
@@ -58,13 +51,23 @@ mod win32 {
 /// Returns the live `Child` handle to the caller. `Child::wait` takes
 /// `&mut self`, and there is no safe way to share one `Child` between the
 /// caller and a waiter thread, so the waiter is instead given an
-/// independent duplicate of the underlying process HANDLE
-/// (`DuplicateHandle`) that it alone waits on and closes; the caller's own
-/// `Child`/handle is unaffected regardless of when the caller drops it.
+/// independent, owned duplicate of the underlying process handle
+/// (`BorrowedHandle::try_clone_to_owned`, stable std, equivalent to
+/// `DuplicateHandle` with `DUPLICATE_SAME_ACCESS`) that it alone waits on;
+/// the `OwnedHandle` closes itself on drop. The caller's own `Child` is
+/// unaffected regardless of when the caller drops it.
 ///
 /// On spawn failure, returns the `io::Error` without touching `tx` or
 /// panicking; the caller is responsible for feeding a synthetic
 /// `Event::ChildExited{code: -1, ..}` so the FSM's backoff governs retries.
+///
+/// If the process handle cannot be duplicated, or the waiter thread cannot
+/// be created, the child is killed immediately and a synthetic
+/// `Event::ChildExited{code: -1, ..}` is sent instead: a `Child` this
+/// function can no longer observe must not be handed back as if it were
+/// healthy, since the caller (and Task 4's supervise loop) will treat the
+/// returned handle as disposable and may drop it, which does not kill a
+/// Windows process.
 #[cfg(windows)]
 pub fn spawn_main(
     exe: &Path,
@@ -72,7 +75,7 @@ pub fn spawn_main(
     safe: bool,
     tx: Sender<Event>,
 ) -> io::Result<Child> {
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::AsHandle;
 
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("--config").arg(config_dir);
@@ -85,69 +88,62 @@ pub fn spawn_main(
     // left to notify and no reason to panic the caller.
     let _ = tx.send(Event::Spawned { at: now() });
 
-    let source = child.as_raw_handle();
-    let mut dup = std::ptr::null_mut();
-    // Safety: `source` is a valid open HANDLE owned by `child`, which
-    // outlives this call. `dup` receives a brand-new, independently
-    // closeable HANDLE to the same process object.
-    let duplicated = unsafe {
-        win32::DuplicateHandle(
-            win32::GetCurrentProcess(),
-            source,
-            win32::GetCurrentProcess(),
-            &mut dup,
-            0,
-            0,
-            win32::DUPLICATE_SAME_ACCESS,
-        )
+    let dup = match child.as_handle().try_clone_to_owned() {
+        Ok(dup) => dup,
+        Err(_) => {
+            // Duplication failing is exceedingly rare (e.g. handle-table
+            // exhaustion). Report it as an immediate exit so backoff
+            // governs, and kill the child since nothing will ever observe
+            // its real exit.
+            report_dead_and_kill(&tx, child);
+            return Err(io::Error::other(
+                "spawn_main: failed to duplicate child process handle",
+            ));
+        }
     };
 
-    if duplicated == 0 {
-        // Duplication failing is exceedingly rare (e.g. handle-table
-        // exhaustion). Report it as an immediate exit so backoff governs
-        // rather than silently never observing this child's exit.
-        let _ = tx.send(Event::ChildExited {
-            code: -1,
-            at: now(),
+    let waiter_tx = tx.clone();
+    let spawned = std::thread::Builder::new()
+        .name("kiosk-launcher-child-waiter".into())
+        .spawn(move || {
+            use std::os::windows::io::AsRawHandle;
+            let handle = dup.as_raw_handle();
+            // Safety: `dup` is an `OwnedHandle` this thread exclusively
+            // owns for its lifetime (moved in, not shared); `handle` stays
+            // valid for the duration of these two calls because `dup` is
+            // not dropped until after they return.
+            let code = unsafe {
+                let wait = win32::WaitForSingleObject(handle, win32::INFINITE);
+                if wait == win32::WAIT_FAILED {
+                    -1
+                } else {
+                    let mut code: u32 = 0;
+                    if win32::GetExitCodeProcess(handle, &mut code) == 0 {
+                        -1
+                    } else {
+                        code as i32
+                    }
+                }
+            };
+            let _ = waiter_tx.send(Event::ChildExited { code, at: now() });
         });
-        return Ok(child);
+
+    match spawned {
+        Ok(_) => Ok(child),
+        Err(_) => {
+            // Thread creation failing is as rare as handle duplication
+            // failing, and equally fatal to ever observing this child's
+            // exit: report it the same way.
+            report_dead_and_kill(&tx, child);
+            Err(io::Error::other(
+                "spawn_main: failed to create child-waiter thread",
+            ))
+        }
     }
-
-    // Safety: `dup` is a plain HANDLE value (an integer-sized pointer with
-    // no aliasing/thread-affinity requirements from the OS); wrapping it
-    // lets it cross the `thread::spawn` boundary, which otherwise refuses
-    // raw pointers.
-    struct SendableHandle(std::os::windows::io::RawHandle);
-    unsafe impl Send for SendableHandle {}
-    let dup = SendableHandle(dup);
-
-    std::thread::spawn(move || {
-        // Force capture of the whole `SendableHandle` (not just its raw
-        // pointer field) — 2021-edition disjoint closure captures would
-        // otherwise capture `dup.0` directly and bypass its `unsafe impl
-        // Send`.
-        let dup = dup;
-        let dup = dup.0;
-        // Safety: `dup` is the independent HANDLE duplicated above; this
-        // thread is its sole owner and closes it exactly once, below.
-        let code = unsafe {
-            win32::WaitForSingleObject(dup, win32::INFINITE);
-            let mut code: u32 = 0;
-            win32::GetExitCodeProcess(dup, &mut code);
-            win32::CloseHandle(dup);
-            code
-        };
-        let _ = tx.send(Event::ChildExited {
-            code: code as i32,
-            at: now(),
-        });
-    });
-
-    Ok(child)
 }
 
 /// Non-Windows stub: kiosk-launcher's process-spawn model relies on
-/// duplicating a Windows process HANDLE (see the `cfg(windows)` impl
+/// duplicating a Windows process handle (see the `cfg(windows)` impl
 /// above), so on other host platforms (dev-only; the kiosk target is
 /// Windows x64) this simply reports "unsupported" rather than spawning.
 #[cfg(not(windows))]
@@ -171,7 +167,11 @@ mod tests {
     /// Real Windows smoke test (brief Step 3): spawns `where.exe` with the
     /// exact argument shape `spawn_main` always appends. `where.exe`
     /// rejects `--config <dir> --safe` as an invalid pattern and exits
-    /// fast with code 2 — deterministic, no network, no display needed.
+    /// non-zero fast — deterministic, no network, no display needed. The
+    /// exact nonzero code is host/path-dependent (varies with how the
+    /// TEMP path tokenizes as a search pattern), so only nonzero is
+    /// asserted; the behavior under test is the waiter thread, not
+    /// `where.exe`'s argument parser.
     #[test]
     fn spawn_main_reports_spawned_then_child_exited() {
         let (tx, rx) = mpsc::channel();
@@ -190,8 +190,27 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("expected Event::ChildExited");
         assert!(
-            matches!(exited, Event::ChildExited { code: 2, .. }),
-            "where.exe with an invalid pattern exits 2, got {exited:?}"
+            matches!(exited, Event::ChildExited { code, .. } if code != 0),
+            "where.exe with an invalid pattern exits nonzero, got {exited:?}"
         );
+    }
+
+    /// Contract Task 4 depends on: a nonexistent exe produces `Err`, sends
+    /// nothing on `tx`, and does not panic.
+    #[test]
+    fn spawn_main_nonexistent_exe_is_err_with_no_traffic() {
+        let (tx, rx) = mpsc::channel();
+        let exe = Path::new("this-exe-does-not-exist-kiosk-launcher-test.exe");
+        let config_dir = std::env::temp_dir();
+
+        let result = spawn_main(exe, &config_dir, false, tx);
+        assert!(result.is_err());
+        // No event was sent; either the receive times out, or (since `tx`
+        // was dropped along with the failed attempt) the channel reports
+        // disconnected. Either way, no traffic was ever delivered.
+        assert!(matches!(
+            rx.recv_timeout(std::time::Duration::from_millis(200)),
+            Err(mpsc::RecvTimeoutError::Timeout) | Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
     }
 }

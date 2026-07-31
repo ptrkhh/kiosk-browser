@@ -8,18 +8,12 @@
 //! wires it in.
 #![allow(dead_code)]
 
+use crate::clock::now;
 use kiosk_core::watchdog::Event;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock before UNIX_EPOCH")
-        .as_secs()
-}
+use std::time::Duration;
 
 /// Starts a detached thread that sends `Event::Tick{now}` on `tx` roughly
 /// once per second until `cancel` is set to `true`, then stops without
