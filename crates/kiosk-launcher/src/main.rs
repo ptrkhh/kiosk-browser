@@ -3,6 +3,8 @@
 //! packaging, and CI shapes are final from P0.
 
 mod loop_;
+mod spawn;
+mod timer;
 
 fn main() {
     println!("kiosk-launcher {}", kiosk_core::app_version());
