@@ -215,7 +215,16 @@ pub fn build(
     // lives in kiosk-core, not here). Task 6 replaces `Logging::default()` with
     // the fetched config's `[logging]`.
     let logging = Logging::default();
-    let spool = Spool::open(data_dir, SpoolConfig::from_logging(&logging))?;
+    // Spec arch-01: kiosk-main owns the `main` spool partition, never the bare
+    // `<data>/spool` root — the launcher's `drain_orphan` renames exactly
+    // `<data>/spool/main` aside when this process dies, so the two must agree
+    // on that path. `Spool::open` appends its own `spool/` component, so the
+    // partition ROOT (not the final on-disk dir) is what's passed here —
+    // mirrors kiosk-launcher's `LAUNCHER_PARTITION` in `sink.rs`.
+    let spool = Spool::open(
+        &data_dir.join("spool").join("main"),
+        SpoolConfig::from_logging(&logging),
+    )?;
     let limiter = RateLimiter::new(clock.clone());
 
     let ctx = EntryContext {
