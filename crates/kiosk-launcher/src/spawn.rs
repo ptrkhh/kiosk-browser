@@ -32,16 +32,14 @@ mod win32 {
     }
 }
 
-/// Sends a synthetic `ChildExited{code: -1, ..}` and kills `child` so no
-/// orphaned process is left holding the single-instance mutex/IPC pipe
-/// while the FSM's backoff spawns a replacement.
+/// Kills `child` so no orphaned process is left holding the single-instance
+/// mutex/IPC pipe. Does not send anything on `tx`: the caller of
+/// `spawn_main` is solely responsible for reporting the `Err` result as a
+/// synthetic `ChildExited{-1}`, and this helper must not race it with a
+/// second one.
 #[cfg(windows)]
-fn report_dead_and_kill(tx: &Sender<Event>, mut child: Child) {
+fn kill_orphan(mut child: Child) {
     let _ = child.kill();
-    let _ = tx.send(Event::ChildExited {
-        code: -1,
-        at: now(),
-    });
 }
 
 /// Spawns the supervised child (`exe --config <config_dir> [--safe]`),
@@ -49,25 +47,26 @@ fn report_dead_and_kill(tx: &Sender<Event>, mut child: Child) {
 /// thread that sends `Event::ChildExited` once the child exits.
 ///
 /// Returns the live `Child` handle to the caller. `Child::wait` takes
-/// `&mut self`, and there is no safe way to share one `Child` between the
-/// caller and a waiter thread, so the waiter is instead given an
-/// independent, owned duplicate of the underlying process handle
-/// (`BorrowedHandle::try_clone_to_owned`, stable std, equivalent to
-/// `DuplicateHandle` with `DUPLICATE_SAME_ACCESS`) that it alone waits on;
-/// the `OwnedHandle` closes itself on drop. The caller's own `Child` is
-/// unaffected regardless of when the caller drops it.
+/// `&mut self`, so the waiter thread is instead given an independent, owned
+/// duplicate of the underlying process handle (`BorrowedHandle::
+/// try_clone_to_owned`, stable std, equivalent to `DuplicateHandle` with
+/// `DUPLICATE_SAME_ACCESS`) that it alone waits on; the `OwnedHandle` closes
+/// itself on drop. The caller's own `Child` is unaffected regardless of when
+/// the caller drops it.
 ///
-/// On spawn failure, returns the `io::Error` without touching `tx` or
-/// panicking; the caller is responsible for feeding a synthetic
-/// `Event::ChildExited{code: -1, ..}` so the FSM's backoff governs retries.
-///
-/// If the process handle cannot be duplicated, or the waiter thread cannot
-/// be created, the child is killed immediately and a synthetic
-/// `Event::ChildExited{code: -1, ..}` is sent instead: a `Child` this
-/// function can no longer observe must not be handed back as if it were
-/// healthy, since the caller (and Task 4's supervise loop) will treat the
-/// returned handle as disposable and may drop it, which does not kill a
-/// Windows process.
+/// # `Err` contract
+/// Whenever this function returns `Err` — whether `cmd.spawn()` itself
+/// failed, the process handle could not be duplicated, or the waiter thread
+/// could not be created — it has sent nothing on `tx` that represents an
+/// exit, and no supervised child exists. The caller (Task 4) is solely
+/// responsible for feeding a synthetic `Event::ChildExited{code: -1, ..}`
+/// in every `Err` case so the FSM's backoff governs retries; that keeps
+/// "one spawn attempt, one exit event" true regardless of which stage
+/// failed. A `Event::Spawned` may still have been sent before the failure
+/// (handle-duplication and thread-creation failures happen after spawn
+/// succeeded, so the child is killed to avoid orphaning it) — that is
+/// harmless, since a `Spawned` followed by the caller's `ChildExited{-1}`
+/// is exactly the sequence a fast crash produces.
 #[cfg(windows)]
 pub fn spawn_main(
     exe: &Path,
@@ -92,10 +91,10 @@ pub fn spawn_main(
         Ok(dup) => dup,
         Err(_) => {
             // Duplication failing is exceedingly rare (e.g. handle-table
-            // exhaustion). Report it as an immediate exit so backoff
-            // governs, and kill the child since nothing will ever observe
-            // its real exit.
-            report_dead_and_kill(&tx, child);
+            // exhaustion). Kill the child since nothing will ever observe
+            // its real exit, and return `Err` with no traffic on `tx`; the
+            // caller supplies the one `ChildExited{-1}`.
+            kill_orphan(child);
             return Err(io::Error::other(
                 "spawn_main: failed to duplicate child process handle",
             ));
@@ -131,10 +130,11 @@ pub fn spawn_main(
     match spawned {
         Ok(_) => Ok(child),
         Err(_) => {
-            // Thread creation failing is as rare as handle duplication
-            // failing, and equally fatal to ever observing this child's
-            // exit: report it the same way.
-            report_dead_and_kill(&tx, child);
+            // Thread creation failing is equally rare and equally fatal to
+            // ever observing this child's exit. Kill the child and return
+            // `Err` with no traffic on `tx`; the caller supplies the one
+            // `ChildExited{-1}`.
+            kill_orphan(child);
             Err(io::Error::other(
                 "spawn_main: failed to create child-waiter thread",
             ))
