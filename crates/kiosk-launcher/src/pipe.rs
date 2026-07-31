@@ -48,6 +48,14 @@ use std::sync::Arc;
 /// PIDs are reused across boots, but only one process can hold a given PID at
 /// a time, and the pipe dies with its process — keep that property if the
 /// suffix ever changes.
+///
+/// # Reconnect gap (cross-task contract for Task 5's client)
+/// Between reconnects, `serve` closes the old pipe handle before creating the
+/// next instance (and sleeps first on a rejection path), so the pipe name
+/// transiently does not exist at all. A client that tries to open it during
+/// that window gets `ERROR_FILE_NOT_FOUND`, not `ERROR_PIPE_BUSY` — Task 5's
+/// client must retry the open on `ERROR_FILE_NOT_FOUND` as well as on
+/// `ERROR_PIPE_BUSY`, not only the latter.
 pub const PIPE_NAME: &str = r"\\.\pipe\kiosk-heartbeat";
 
 /// The concrete, per-process pipe name. Uses the launcher's own PID as the
@@ -336,6 +344,11 @@ pub fn serve(
     // Suppresses repeat logging while create/connect keeps failing the same
     // way; re-armed by any success.
     let mut logged_failure = false;
+    // Same once-per-streak latch pattern as `logged_failure`, but for
+    // consecutive wrong-PID rejections: an operator should see "someone is
+    // repeatedly trying to forge heartbeats" once per streak, not once per
+    // rejection.
+    let mut logged_impostor = false;
 
     loop {
         if cancel.load(Ordering::Relaxed) {
@@ -356,6 +369,18 @@ pub fn serve(
                 continue;
             }
         };
+        // Wait for the supervised child's PID *before* handing out the sole
+        // pipe instance via `connect_pipe` (Finding 1): if this wait ran
+        // after connect, whoever connected first — attacker or child — would
+        // hold the only instance for up to ~2s, and a looping attacker could
+        // keep winning that race forever, starving the real child of a slot
+        // to ever deliver `Ready`.
+        let expected = await_child_pid(&child_pid, &cancel);
+        if cancel.load(Ordering::Relaxed) {
+            close_pipe(handle);
+            return;
+        }
+
         if let Err(e) = connect_pipe(handle) {
             if !logged_failure {
                 logged_failure = true;
@@ -370,14 +395,23 @@ pub fn serve(
         }
         logged_failure = false;
 
-        // Authenticate the client against the supervised child.
-        let expected = await_child_pid(&child_pid, &cancel);
+        // Authenticate the client against the supervised child. `expected`
+        // is the snapshot taken above, not a fresh re-read: the PID check
+        // must reject whoever connected, even if the shared value changed
+        // again in the meantime.
         if expected == 0 || client_pid(handle) != Some(expected) {
+            if !logged_impostor {
+                logged_impostor = true;
+                eprintln!(
+                    "kiosk-launcher: heartbeat pipe rejected a client with an unexpected PID"
+                );
+            }
             disconnect_pipe(handle);
             close_pipe(handle);
             sleep_retry();
             continue;
         }
+        logged_impostor = false;
         if expected != faulted_pid {
             // Different child than the one that faulted (or a first
             // connection): nothing to "reconnect" to.
