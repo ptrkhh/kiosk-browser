@@ -4,6 +4,7 @@
 
 mod clock;
 mod loop_;
+mod pipe;
 mod spawn;
 mod timer;
 
