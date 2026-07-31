@@ -1869,6 +1869,7 @@ name = "kiosk-launcher"
 version = "0.1.0"
 dependencies = [
  "kiosk-core",
+ "serde_json",
 ]
 
 [[package]]
