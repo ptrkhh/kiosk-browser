@@ -1,12 +1,6 @@
 //! A 1-second tick source feeding `watchdog::Event::Tick` into the
 //! supervisor loop, so the pure FSM can detect missed heartbeats and
 //! elapsed run time without ever reading a clock itself.
-//!
-//! # Dead code scope
-//! `#[allow(dead_code)]` here is temporary: `main.rs` does not yet call
-//! `spawn_timer`. Remove this allow when Task 4 (`LauncherSink` + assembly)
-//! wires it in.
-#![allow(dead_code)]
 
 use crate::clock::now;
 use kiosk_core::watchdog::Event;

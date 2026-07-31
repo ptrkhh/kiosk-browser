@@ -1,12 +1,6 @@
 //! Spawns the supervised child process and waits for its exit on a
 //! detached thread, translating process I/O into `watchdog::Event`s.
 //! Windows/P1 only — see the `not(windows)` stub at the bottom.
-//!
-//! # Dead code scope
-//! `#[allow(dead_code)]` here is temporary: `main.rs` does not yet call
-//! `spawn_main`. Remove this allow when Task 4 (`LauncherSink` + assembly)
-//! wires it in.
-#![allow(dead_code)]
 
 use crate::clock::now;
 use kiosk_core::watchdog::Event;

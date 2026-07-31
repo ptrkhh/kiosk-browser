@@ -28,12 +28,6 @@
 //! alive (a pipe breaking because the child died is a `ChildExited`, not a
 //! channel fault — reporting both races the FSM's restart and can leave the
 //! *next* child with an inherited channel-grace window).
-//!
-//! # Dead code scope
-//! `#[allow(dead_code)]` here is temporary: `main.rs` does not yet call
-//! `serve`. Remove this allow when Task 4 (`LauncherSink` + assembly) wires
-//! it in.
-#![allow(dead_code)]
 
 use crate::clock::now;
 use kiosk_core::ipc::{decode, Frame};

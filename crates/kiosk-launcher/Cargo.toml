@@ -6,3 +6,12 @@ edition.workspace = true
 [dependencies]
 kiosk-core.workspace = true
 serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+# Test-only: the orphan-drain test needs a service account whose key actually
+# parses (the drain mints a token for real against the fake transport), so the
+# keypair is generated at run time — never a committed fixture. Same discipline
+# as kiosk-main's telemetry tests and kiosk-core's own auth tests.
+rsa = { version = "0.9", features = ["pem"] }
+rand = "0.8"
