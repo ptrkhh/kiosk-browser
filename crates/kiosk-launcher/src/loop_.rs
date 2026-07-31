@@ -4,12 +4,20 @@ use std::sync::mpsc::Receiver;
 
 /// Executes the FSM's Actions. Real impl (Task 4) spawns/drains/logs; tests record.
 /// Returns `Break(code)` when it handled `ExitLauncher`, to stop the loop.
+///
+/// # Dead code scope
+/// `#[allow(dead_code)]` here is temporary: `main.rs` does not yet wire this trait
+/// into the loop. Remove this allow when Task 4 (`LauncherSink` + assembly) drives `run()`.
 #[allow(dead_code)]
 pub trait ActionSink {
     fn dispatch(&mut self, action: Action) -> ControlFlow<i32>;
 }
 
 /// Drain events into the FSM; dispatch each Action. Returns the process exit code.
+///
+/// # Dead code scope
+/// `#[allow(dead_code)]` here is temporary: `main.rs` does not yet wire this function
+/// into the launcher. Remove this allow when Task 4 (`LauncherSink` + assembly) drives this.
 #[allow(dead_code)]
 pub fn run(
     rx: Receiver<Event>,
