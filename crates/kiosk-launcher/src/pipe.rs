@@ -7,12 +7,27 @@
 //! `thread::spawn(move || pipe::serve(..))`.
 //!
 //! # Pipe name propagation (cross-task contract)
-//! `PIPE_NAME` is only the base. The concrete per-boot name
+//! `PIPE_NAME` is only the base. The concrete per-launcher name
 //! (`instance_name()`, `PIPE_NAME` + the launcher's PID) is what's actually
-//! served. Task 4 must set it as the `KIOSK_HEARTBEAT_PIPE` environment
-//! variable on the spawned child (`Command::env`) when it calls
-//! `spawn::spawn_main`; Task 5's client in kiosk-main reads that env var
-//! rather than recomputing the PID-based name itself.
+//! served. `spawn::spawn_main` takes that name as a parameter and sets it as
+//! the `KIOSK_HEARTBEAT_PIPE` environment variable on the child it spawns;
+//! Task 5's client in kiosk-main reads that env var rather than recomputing
+//! the PID-based name itself. Task 4 passes `pipe::instance_name()` to both
+//! `serve` and `spawn_main`.
+//!
+//! # Supervised-child PID (cross-task contract)
+//! `serve` takes `child_pid: Arc<AtomicU32>`, shared with Task 4's sink,
+//! where **0 means "no live child"**. Task 4 must:
+//! * store `child.id()` immediately after a successful `spawn_main`, and
+//! * store `0` as soon as it observes `Event::ChildExited` (including the
+//!   synthetic `ChildExited{-1}` it feeds on a `spawn_main` `Err`).
+//!
+//! `serve` uses it for two things: it only accepts pipe clients whose
+//! process ID matches (so no other local process can forge heartbeats for a
+//! hung kiosk), and it only reports `ChannelFault` while a child is actually
+//! alive (a pipe breaking because the child died is a `ChildExited`, not a
+//! channel fault — reporting both races the FSM's restart and can leave the
+//! *next* child with an inherited channel-grace window).
 //!
 //! # Dead code scope
 //! `#[allow(dead_code)]` here is temporary: `main.rs` does not yet call
@@ -23,12 +38,16 @@
 use crate::clock::now;
 use kiosk_core::ipc::{decode, Frame};
 use kiosk_core::watchdog::Event;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
-/// Base pipe name; `instance_name()` appends a per-boot suffix so a stale
-/// instance from a previous boot can never collide with the current one.
+/// Base pipe name; `instance_name()` appends the launcher's PID so two
+/// launcher processes (or a launcher and a still-exiting predecessor) can
+/// never serve the same name. Note the suffix is per-*process*, not per-boot:
+/// PIDs are reused across boots, but only one process can hold a given PID at
+/// a time, and the pipe dies with its process — keep that property if the
+/// suffix ever changes.
 pub const PIPE_NAME: &str = r"\\.\pipe\kiosk-heartbeat";
 
 /// The concrete, per-process pipe name. Uses the launcher's own PID as the
@@ -58,7 +77,14 @@ mod win32 {
     pub const PIPE_TYPE_BYTE: u32 = 0x0000_0000;
     pub const PIPE_READMODE_BYTE: u32 = 0x0000_0000;
     pub const PIPE_WAIT: u32 = 0x0000_0000;
-    pub const PIPE_UNLIMITED_INSTANCES: u32 = 255;
+    /// Creation fails with ERROR_ACCESS_DENIED if another process already
+    /// owns this pipe name — the loud outcome we want, rather than silently
+    /// becoming an extra instance of a squatter's pipe (whose DACL and pipe
+    /// mode we would then inherit, and whose instance the child might reach).
+    pub const FILE_FLAG_FIRST_PIPE_INSTANCE: u32 = 0x0008_0000;
+    /// Refuse clients arriving over SMB; the only legitimate client is a
+    /// child process on this machine.
+    pub const PIPE_REJECT_REMOTE_CLIENTS: u32 = 0x0000_0008;
     pub const ERROR_PIPE_CONNECTED: u32 = 535;
 
     /// `-1` reinterpreted as a pointer-sized handle: the documented
@@ -80,6 +106,7 @@ mod win32 {
             lp_security_attributes: *mut c_void,
         ) -> RawHandle;
         pub fn ConnectNamedPipe(h_named_pipe: RawHandle, lp_overlapped: *mut c_void) -> i32;
+        pub fn GetNamedPipeClientProcessId(h_pipe: RawHandle, client_pid: *mut u32) -> i32;
         pub fn DisconnectNamedPipe(h_named_pipe: RawHandle) -> i32;
         pub fn ReadFile(
             h_file: RawHandle,
@@ -125,9 +152,13 @@ mod imp {
         let handle = unsafe {
             win32::CreateNamedPipeW(
                 wide.as_ptr(),
-                win32::PIPE_ACCESS_INBOUND,
-                win32::PIPE_TYPE_BYTE | win32::PIPE_READMODE_BYTE | win32::PIPE_WAIT,
-                win32::PIPE_UNLIMITED_INSTANCES,
+                win32::PIPE_ACCESS_INBOUND | win32::FILE_FLAG_FIRST_PIPE_INSTANCE,
+                win32::PIPE_TYPE_BYTE
+                    | win32::PIPE_READMODE_BYTE
+                    | win32::PIPE_WAIT
+                    | win32::PIPE_REJECT_REMOTE_CLIENTS,
+                // Exactly one client (the supervised child) is ever expected.
+                1,
                 0,
                 0,
                 0,
@@ -161,6 +192,21 @@ mod imp {
             Ok(())
         } else {
             Err(io::Error::from_raw_os_error(err as i32))
+        }
+    }
+
+    /// PID of the process on the other end of a connected pipe instance.
+    /// `None` if Windows won't tell us — treated by the caller as "not the
+    /// supervised child", i.e. rejected.
+    pub fn client_pid(handle: RawHandle) -> Option<u32> {
+        let mut pid: u32 = 0;
+        // Safety: `handle` is a live, connected named-pipe server handle
+        // owned by the caller; `pid` is a valid u32 the call writes into.
+        let ok = unsafe { win32::GetNamedPipeClientProcessId(handle, &mut pid) };
+        if ok != 0 {
+            Some(pid)
+        } else {
+            None
         }
     }
 
@@ -262,15 +308,34 @@ mod imp {
 /// connects/disconnects or the process exits. This is the same shape as
 /// `spawn_main`'s child-waiter thread: a detached thread that outlives a
 /// courtesy cancel flag.
+///
+/// # Client authentication
+/// Only frames from the process whose PID is in `child_pid` are honoured;
+/// any other local process that opens the (trivially derivable) pipe name is
+/// disconnected without a single event, so it cannot keep the watchdog happy
+/// on behalf of a hung kiosk. See the module docs for `child_pid`'s contract.
 #[cfg(windows)]
-pub fn serve(pipe_name: &str, tx: Sender<Event>, cancel: Arc<AtomicBool>) {
-    use imp::{close_pipe, connect_pipe, create_pipe, disconnect_pipe, LineReader};
+pub fn serve(
+    pipe_name: &str,
+    tx: Sender<Event>,
+    cancel: Arc<AtomicBool>,
+    child_pid: Arc<AtomicU32>,
+) {
+    use imp::{client_pid, close_pipe, connect_pipe, create_pipe, disconnect_pipe, LineReader};
 
     // Set once a ChannelFault has been reported and we're waiting to accept
     // the reconnect; cleared the moment the first valid post-reconnect frame
     // arrives, at which point ChannelReconnected is sent before that frame's
     // own Event (the FSM's channel-grace state depends on this order).
     let mut awaiting_reconnect_event = false;
+    // PID of the child whose fault we're waiting to see reconnect. A *new*
+    // child is not a reconnect of the old channel, so the latch is cleared
+    // when the supervised child changes (no spurious ChannelReconnected /
+    // ChannelReset log on every restart).
+    let mut faulted_pid: u32 = 0;
+    // Suppresses repeat logging while create/connect keeps failing the same
+    // way; re-armed by any success.
+    let mut logged_failure = false;
 
     loop {
         if cancel.load(Ordering::Relaxed) {
@@ -278,14 +343,45 @@ pub fn serve(pipe_name: &str, tx: Sender<Event>, cancel: Arc<AtomicBool>) {
         }
         let handle = match create_pipe(pipe_name) {
             Ok(h) => h,
-            Err(_) => return, // can't even create the pipe; nothing to serve
+            Err(e) => {
+                // ponytail: eprintln! is the only diagnostic path this crate
+                // has here — `serve` has no Logger (Task 4 owns that stack),
+                // so on a windowless kiosk build this may go nowhere. Route
+                // it through the real logger when Task 4 wires `serve` in.
+                if !logged_failure {
+                    logged_failure = true;
+                    eprintln!("kiosk-launcher: cannot create heartbeat pipe {pipe_name}: {e}");
+                }
+                sleep_retry();
+                continue;
+            }
         };
-        if connect_pipe(handle).is_err() {
+        if let Err(e) = connect_pipe(handle) {
+            if !logged_failure {
+                logged_failure = true;
+                eprintln!("kiosk-launcher: heartbeat pipe accept failed: {e}");
+            }
             close_pipe(handle);
             if cancel.load(Ordering::Relaxed) {
                 return;
             }
+            sleep_retry();
             continue;
+        }
+        logged_failure = false;
+
+        // Authenticate the client against the supervised child.
+        let expected = await_child_pid(&child_pid, &cancel);
+        if expected == 0 || client_pid(handle) != Some(expected) {
+            disconnect_pipe(handle);
+            close_pipe(handle);
+            sleep_retry();
+            continue;
+        }
+        if expected != faulted_pid {
+            // Different child than the one that faulted (or a first
+            // connection): nothing to "reconnect" to.
+            awaiting_reconnect_event = false;
         }
 
         let mut reader = LineReader::new(handle);
@@ -308,12 +404,21 @@ pub fn serve(pipe_name: &str, tx: Sender<Event>, cancel: Arc<AtomicBool>) {
                     // decode error: dropped silently, keep reading.
                 }
                 Err(_) => {
-                    if tx.send(Event::ChannelFault { at: now() }).is_err() {
-                        close_pipe(handle);
-                        return;
+                    // Only a fault *while the child is alive* is a channel
+                    // fault. If the child is gone (PID reset to 0 by Task 4
+                    // on ChildExited), the broken pipe is just the corpse of
+                    // that child: ChildExited already tells the FSM, and a
+                    // racing ChannelFault landing after restart() would hand
+                    // the *next* child a stale 30s channel-grace window.
+                    if child_pid.load(Ordering::Relaxed) == expected {
+                        if tx.send(Event::ChannelFault { at: now() }).is_err() {
+                            close_pipe(handle);
+                            return;
+                        }
+                        awaiting_reconnect_event = true;
+                        faulted_pid = expected;
                     }
                     disconnect_pipe(handle);
-                    awaiting_reconnect_event = true;
                     break;
                 }
             }
@@ -325,10 +430,38 @@ pub fn serve(pipe_name: &str, tx: Sender<Event>, cancel: Arc<AtomicBool>) {
     }
 }
 
+/// Pause before retrying a failed create/accept, so a persistent failure is
+/// a slow retry loop rather than 100% CPU for weeks.
+#[cfg(windows)]
+fn sleep_retry() {
+    std::thread::sleep(std::time::Duration::from_millis(100));
+}
+
+/// Reads the supervised child's PID, tolerating the startup window where
+/// Task 4 has spawned the child but not yet published its PID: waits (up to
+/// ~2s, bounded, cancellable) for a nonzero value before giving up and
+/// returning 0, which the caller treats as "reject this client".
+#[cfg(windows)]
+fn await_child_pid(child_pid: &AtomicU32, cancel: &AtomicBool) -> u32 {
+    for _ in 0..100 {
+        let pid = child_pid.load(Ordering::Relaxed);
+        if pid != 0 || cancel.load(Ordering::Relaxed) {
+            return pid;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    child_pid.load(Ordering::Relaxed)
+}
+
 /// Non-Windows stub: named pipes are a Windows-only IPC mechanism here (the
 /// kiosk target is Windows x64; other host platforms are dev-only).
 #[cfg(not(windows))]
-pub fn serve(_pipe_name: &str, _tx: Sender<Event>, _cancel: Arc<AtomicBool>) {
+pub fn serve(
+    _pipe_name: &str,
+    _tx: Sender<Event>,
+    _cancel: Arc<AtomicBool>,
+    _child_pid: Arc<AtomicU32>,
+) {
     eprintln!("kiosk-launcher pipe::serve is Windows-only; not serving on this platform");
 }
 
@@ -405,7 +538,11 @@ mod windows_smoke {
 
         let serve_name = pipe_name.clone();
         let serve_cancel = cancel.clone();
-        let server = std::thread::spawn(move || serve(&serve_name, tx, serve_cancel));
+        // This test process is the pipe client, so it is the "supervised
+        // child" as far as the PID check is concerned.
+        let child_pid = Arc::new(AtomicU32::new(std::process::id()));
+        let serve_pid = child_pid.clone();
+        let server = std::thread::spawn(move || serve(&serve_name, tx, serve_cancel, serve_pid));
 
         // First client: Ready, then Ping.
         let mut client = open_client(&pipe_name);
@@ -434,10 +571,84 @@ mod windows_smoke {
 
         cancel.store(true, Ordering::Relaxed);
         drop(client2);
-        // Best-effort join with a bound: per the shutdown caveat, the server
-        // thread may be parked in a blocking Windows call with nothing to
-        // unblock it, so this must not hang the test suite indefinitely.
-        let _ = server; // detach; joining is not required for the test to pass
+        // Deliberately not joined: per the shutdown caveat, the server thread
+        // may be parked in a blocking Windows call that `cancel` cannot
+        // interrupt, so joining could hang the suite. It exits with the
+        // process.
+        drop(server);
+    }
+
+    /// Finding 1: a read error while no child is alive (shared PID back to 0,
+    /// as Task 4 sets it on `ChildExited`) must NOT produce `ChannelFault` —
+    /// the dead child's broken pipe is already reported as `ChildExited`.
+    #[test]
+    fn read_error_with_no_live_child_produces_no_channel_fault() {
+        let pipe_name = format!(
+            r"\\.\pipe\kiosk-heartbeat-test-nofault-{}",
+            std::process::id()
+        );
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let child_pid = Arc::new(AtomicU32::new(std::process::id()));
+
+        let serve_name = pipe_name.clone();
+        let serve_cancel = cancel.clone();
+        let serve_pid = child_pid.clone();
+        let _server = std::thread::spawn(move || serve(&serve_name, tx, serve_cancel, serve_pid));
+
+        let mut client = open_client(&pipe_name);
+        client
+            .write_all(kiosk_core::ipc::encode(&Frame::Ready).as_bytes())
+            .unwrap();
+        assert_eq!(recv_event(&rx), Event::Ready);
+
+        // The "child" exits: Task 4 zeroes the PID, then the pipe breaks.
+        child_pid.store(0, Ordering::Relaxed);
+        drop(client);
+
+        assert!(
+            matches!(
+                rx.recv_timeout(Duration::from_millis(500)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "no event at all should follow a read error with no live child"
+        );
+        cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// Finding 3a: a client that is not the supervised child is disconnected
+    /// and its frames produce no events — otherwise any local process could
+    /// keep the watchdog happy on behalf of a hung kiosk.
+    #[test]
+    fn client_with_wrong_pid_is_rejected() {
+        let pipe_name = format!(
+            r"\\.\pipe\kiosk-heartbeat-test-badpid-{}",
+            std::process::id()
+        );
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        // Some PID that is definitely not this test process.
+        let child_pid = Arc::new(AtomicU32::new(u32::MAX));
+
+        let serve_name = pipe_name.clone();
+        let serve_cancel = cancel.clone();
+        let serve_pid = child_pid.clone();
+        let _server = std::thread::spawn(move || serve(&serve_name, tx, serve_cancel, serve_pid));
+
+        let mut client = open_client(&pipe_name);
+        // Writes may or may not succeed depending on when the server
+        // disconnects; either way no event may be produced.
+        let _ = client.write_all(kiosk_core::ipc::encode(&Frame::Ready).as_bytes());
+        let _ = client.write_all(kiosk_core::ipc::encode(&Frame::Ping).as_bytes());
+
+        assert!(
+            matches!(
+                rx.recv_timeout(Duration::from_millis(500)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "an impostor client must produce no events"
+        );
+        cancel.store(true, Ordering::Relaxed);
     }
 
     #[test]
@@ -450,7 +661,9 @@ mod windows_smoke {
         let cancel = Arc::new(AtomicBool::new(false));
 
         let serve_name = pipe_name.clone();
-        let _server = std::thread::spawn(move || serve(&serve_name, tx, cancel));
+        let serve_cancel = cancel.clone();
+        let child_pid = Arc::new(AtomicU32::new(std::process::id()));
+        let _server = std::thread::spawn(move || serve(&serve_name, tx, serve_cancel, child_pid));
 
         let mut client = open_client(&pipe_name);
         client.write_all(b"not json at all\n").unwrap();
@@ -460,5 +673,6 @@ mod windows_smoke {
         // The garbage line must be dropped silently; the next real event
         // must still arrive.
         assert_eq!(recv_event(&rx), Event::Ready);
+        cancel.store(true, Ordering::Relaxed);
     }
 }

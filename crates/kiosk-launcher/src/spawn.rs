@@ -46,6 +46,12 @@ fn kill_orphan(mut child: Child) {
 /// pushes `Event::Spawned` immediately, and starts a detached waiter
 /// thread that sends `Event::ChildExited` once the child exits.
 ///
+/// `pipe_name` is passed to the child as the `KIOSK_HEARTBEAT_PIPE`
+/// environment variable (the child cannot derive the launcher's PID-suffixed
+/// heartbeat pipe name itself — see `pipe`'s module docs). It is set on the
+/// `Command` this function builds, so it affects only the child; the
+/// launcher's own environment is never mutated.
+///
 /// Returns the live `Child` handle to the caller. `Child::wait` takes
 /// `&mut self`, so the waiter thread is instead given an independent, owned
 /// duplicate of the underlying process handle (`BorrowedHandle::
@@ -72,12 +78,14 @@ pub fn spawn_main(
     exe: &Path,
     config_dir: &Path,
     safe: bool,
+    pipe_name: &str,
     tx: Sender<Event>,
 ) -> io::Result<Child> {
     use std::os::windows::io::AsHandle;
 
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("--config").arg(config_dir);
+    cmd.env("KIOSK_HEARTBEAT_PIPE", pipe_name);
     if safe {
         cmd.arg("--safe");
     }
@@ -151,6 +159,7 @@ pub fn spawn_main(
     _exe: &Path,
     _config_dir: &Path,
     _safe: bool,
+    _pipe_name: &str,
     _tx: Sender<Event>,
 ) -> io::Result<Child> {
     Err(io::Error::new(
@@ -178,7 +187,8 @@ mod tests {
         let exe = Path::new("where.exe");
         let config_dir = std::env::temp_dir();
 
-        let child = spawn_main(exe, &config_dir, true, tx).expect("where.exe should spawn");
+        let child = spawn_main(exe, &config_dir, true, r"\\.\pipe\kiosk-heartbeat-test", tx)
+            .expect("where.exe should spawn");
         drop(child); // caller's copy; dropping closes its own HANDLE, not the process
 
         let spawned = rx
@@ -203,7 +213,13 @@ mod tests {
         let exe = Path::new("this-exe-does-not-exist-kiosk-launcher-test.exe");
         let config_dir = std::env::temp_dir();
 
-        let result = spawn_main(exe, &config_dir, false, tx);
+        let result = spawn_main(
+            exe,
+            &config_dir,
+            false,
+            r"\\.\pipe\kiosk-heartbeat-test",
+            tx,
+        );
         assert!(result.is_err());
         // No event was sent; either the receive times out, or (since `tx`
         // was dropped along with the failed attempt) the channel reports
