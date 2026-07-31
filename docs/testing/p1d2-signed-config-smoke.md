@@ -85,7 +85,8 @@ Monitors on this host: `DISPLAY1` primary 1536x960 @ (0,0), `DISPLAY2` 1920x1080
 | `health.sample` every ~15 s with all 6 keys | **PASS** — 6 samples in an 80 s run at `10:48:17 / :31.5 / :46.5 / 10:49:01.5 / :16.6 / :31.6` (Δ 14.5–15.0 s). Payload: `cpu_percent`, `mem_used_mb` (+`mem_total_mb`), `disk_free_mb`, `uptime_secs`, `spool_dropped_expired`. `severity:INFO` ⇒ `spool/low`, cursor `committed` advanced to full count, `dropped:0` ⇒ delivered to Cloud Logging (`projects/ubm-gen-ai/logs/kiosk`, `generic_node/lobby-01`) |
 | `display.monitor=5` ⇒ primary + `config.warn` | **PASS** — `config.warn{field:"display.monitor", reason:"index beyond available displays; using primary"}`, window opened on primary, nothing else degraded |
 | Panic ⇒ `<ProgramData>\kiosk\crash-panic.txt` | **PASS** — forced via `kiosk-main.exe --config D:/kiosk-smoke-does-not-exist` (exit 101). File contains `panicked at crates\kiosk-main\src\main.rs:294:9: kiosk-main: cannot read …\kiosk.ini (…os error 3); pass --config <dir> in dev`. Confirms the *early*, file-only hook (fires before telemetry exists) |
-| **I1** — `display.monitor=1` window size/placement | **PLACEMENT PASS / SIZE FAIL** — window lands on `DISPLAY2` and *looks* full-screen to the operator, but is sized from the **primary's** physical extent: `GetWindowRect` = `L=-1920 T=0 R=0 B=1200` ⇒ 1920x**1200** on a 1920x**1080** panel, 120 px of overhang. No `config.warn` this run (index in range). See finding below |
+| **I1** — `display.monitor=1` window size/placement | **FAIL then FIXED** — before: `L=-1920 T=0 R=0 B=1200` ⇒ 1920x**1200** on a 1920x**1080** panel (right monitor, wrong size, 120 px overhang). After the build-hidden → position → fullscreen → show reorder: `L=-1920 T=0 R=0 B=1080` ⇒ **exactly `DISPLAY2`'s 1920x1080, no overhang**. See finding below |
+| I1 regression — `display.monitor=5` still falls back correctly | **PASS** — rev 12, `GetWindowRect` = `L=0 T=0 R=1536 B=960` = the primary's full extent, plus the `config.warn{display.monitor}`. The reorder did not break the fallback branch |
 
 **FIXED — Settings4/5 was never a runtime problem (root cause).** `hardening.rs` called
 `webview2.cast::<ICoreWebView2Settings4>()` / `…Settings5` on the **`ICoreWebView2`**
@@ -98,7 +99,7 @@ spool ⇒ **password-autosave, general autofill and pinch-zoom are now actually 
 The 2026-07-27 "check the WebView2 Runtime version on the deployment image" note is
 superseded — no runtime-version prerequisite exists for these flags.
 
-**Open finding — I1 confirmed: the window moves, but keeps the primary's size.**
+**FIXED — I1: the window moved, but kept the primary's size.**
 Measured with both panels attached, `display.monitor=1`, rev 11 applied:
 
 | | logical (Screen.AllScreens) | physical | scale |
@@ -113,9 +114,30 @@ work and the earlier "never moves" reading was wrong. The *size*, 1920x1200, is 
 without re-deriving the extent for the target. On a mixed-resolution / mixed-DPI pair this
 means 120 px hang off the bottom of the external panel — invisible to the operator (it looks
 correctly full-screen) but real, and it would be much more visible on a target monitor
-*smaller* than the primary. Fix is the one already noted: `set_fullscreen(false)` →
-`set_position(target.position())` → `set_fullscreen(true)` so the extent is recomputed on the
-destination monitor.
+*smaller* than the primary.
+
+Fix applied in `crates/kiosk-main/src/main.rs` `setup()`: drop `.fullscreen(true)` from the
+`WebviewWindowBuilder`, add `.visible(false)`, and after the `display.monitor` positioning
+block call `window.set_fullscreen(true)` → `show()` → `set_focus()`. A window that is
+*already* fullscreen when `set_position` runs keeps the extent it captured from the monitor
+it was born on; fullscreening *after* the move makes tao re-evaluate against the monitor the
+window is now on. `visible(false)` covers the gap between `build()` and the fullscreen call
+so there's no default-size flash at boot. The `set_fullscreen` call sits outside the
+`available_monitors()` block, so a failed monitor query still yields a fullscreen kiosk
+rather than a small floating window.
+
+Re-measured after the fix, `display.monitor=1`, both panels attached:
+`L=-1920 T=0 R=0 B=1080` ⇒ **1920x1080, exactly `DISPLAY2`, no overhang.** Fallback branch
+re-checked with `display.monitor=5` (rev 12): `L=0 T=0 R=1536 B=960` = the primary's full
+extent, `config.warn{display.monitor}` still emitted. `cargo test -p kiosk-main --release`:
+**121 passed, 0 failed.** Side effect worth noting: `focus.lost` events over a ~40 s run
+dropped from 16 to 1 — the old build was fighting the desktop for focus during the
+fullscreen-then-move window.
+
+Note on measurement units: the `GetWindowRect` figures above come from a DPI-unaware x64
+PowerShell, so they are in the same logical coordinate space `Screen.AllScreens` reports.
+The pre-fix `1200` was the primary's *physical* height leaking through unscaled — which is
+the bug's signature, not a measurement artifact.
 
 Operator observation during the same run: the kiosk filled the external monitor, while the
 internal panel showed nothing **and accepted no input** — clicks/keys on the primary desktop

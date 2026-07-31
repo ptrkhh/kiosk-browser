@@ -535,11 +535,24 @@ async fn main() {
                 WINDOW_LABEL,
                 tauri::WebviewUrl::App("splash.html".into()),
             );
+            // Built hidden, shown after `display.monitor` placement below. Two reasons,
+            // both load-bearing:
+            //   1. No flash — without this the window would be visible at its default
+            //      size/position for the moment between `build()` and the fullscreen
+            //      call, which on a kiosk is an ugly boot artifact.
+            //   2. `fullscreen(true)` is NOT set on the builder (it used to be). A
+            //      window that is already fullscreen when `set_position` runs keeps the
+            //      size it captured from whatever monitor it was born on: the
+            //      2026-07-28 smoke measured 1920x1200 (the 125%-scaled primary's
+            //      physical extent) on a 1920x1080 external panel — the move worked, the
+            //      size did not follow. `set_fullscreen(true)` AFTER `set_position`
+            //      re-evaluates the monitor the window is currently on, so it sizes to
+            //      the target. Order is: build hidden → position → fullscreen → show.
+            builder = builder.visible(false);
             builder = if windowed {
                 builder.inner_size(1280.0, 800.0).decorations(true)
             } else {
                 builder
-                    .fullscreen(true)
                     .decorations(false)
                     .always_on_top(true)
                     .focused(true)
@@ -582,6 +595,16 @@ async fn main() {
                     }
                 }
             }
+
+            // AFTER positioning — see the builder comment above. Unconditional (not
+            // inside the `available_monitors` block) so a failed monitor query still
+            // yields a fullscreen kiosk on whatever monitor Tauri picked, rather than a
+            // small floating window.
+            if !windowed {
+                let _ = window.set_fullscreen(true);
+            }
+            let _ = window.show();
+            let _ = window.set_focus();
 
             nav::install(
                 &window,
