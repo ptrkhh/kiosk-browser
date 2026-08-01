@@ -73,7 +73,17 @@ fn build_telemetry(
         kiosk_core::identity::effective_device_id(bootstrap.device_id.as_deref(), None)?;
 
     let clock = TrustedClock::new();
-    let transport: Arc<dyn Transport> = Arc::new(ReqwestTransport::new(Duration::from_secs(10))?);
+    // 3s, deliberately SHORTER than kiosk-main's 10s. `LauncherSink::log`
+    // calls `Logger::flush` synchronously on the single supervise thread, and
+    // `flush` does not honour the `retry_after` backoff that `Logger::tick`
+    // does — so an OFFLINE device would pay the full timeout twice (token +
+    // entries:write) on every watchdog event, parking the supervisor for ~20s
+    // per restart and delaying both respawns and the exit-86 handoff. The
+    // launcher's entries are rare and spooled: a dropped delivery attempt costs
+    // nothing (the next flush retries from the spool), an unresponsive
+    // supervisor costs the screen. P2: give the sink a flush thread, or route
+    // it through `Logger::tick` so the backoff applies, and this can go back up.
+    let transport: Arc<dyn Transport> = Arc::new(ReqwestTransport::new(Duration::from_secs(3))?);
     let token_source = TokenSource::new(service_account, transport.clone(), clock.clone());
     let client = GclClient::new(token_source, transport.clone(), clock.clone());
     let drain_client = GclClient::new(
@@ -244,7 +254,9 @@ pub struct LauncherSink {
     tx: Sender<Event>,
     /// The supervised child's handle, so a still-live predecessor can be killed
     /// before it is replaced (dropping a `Child` does NOT kill a Windows process,
-    /// and an orphan keeps holding the single-instance mutex and the pipe).
+    /// and an orphan keeps holding the heartbeat pipe — `nMaxInstances` is 1, so
+    /// the new child could never connect). NOTE: there is no single-instance
+    /// mutex today; nothing but this kill prevents two kiosk-mains (owed, P1-F).
     child: Option<Child>,
     /// Shared with `pipe::serve`; 0 means "no live child". This sink is its only
     /// writer — see `pipe`'s module docs for what it gates.
@@ -293,10 +305,20 @@ impl LauncherSink {
     }
 
     /// Kill whatever child is still held, so a hang-restart never leaves an
-    /// orphaned kiosk-main holding the single-instance mutex and the pipe.
+    /// orphaned kiosk-main holding the heartbeat pipe's single instance.
+    ///
+    /// Kills AND WAITS (bounded — see `spawn::kill_and_wait`): `TerminateProcess`
+    /// returns before the kernel closes the dying process's handles, and the very
+    /// next thing the `DrainOrphanedSpool` arm does is rename `spool/main` out
+    /// from under it. Without the wait that rename races kiosk-main's cached
+    /// spool segment file and fails `ERROR_SHARING_VIOLATION`, silently dropping
+    /// the dead child's pre-death telemetry (TEL-10) on exactly the hang /
+    /// no_ready / channel restarts whose diagnostics matter most. Waiting also
+    /// closes the `ChannelFault`-after-kill race: the pipe reader's read error
+    /// can no longer beat the `child_pid.store(0)` that follows.
     fn kill_child(&mut self) {
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
+            crate::spawn::kill_and_wait(&mut child);
         }
     }
 

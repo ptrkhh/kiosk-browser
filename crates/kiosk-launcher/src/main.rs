@@ -141,15 +141,16 @@ fn main() {
     // `serve` blocks its caller for its whole lifetime (unlike `spawn_timer`,
     // which spawns its own thread), so it gets a thread here.
     {
-        let (name, tx, cancel, pid) = (
+        let (name, data, tx, cancel, pid) = (
             pipe_name.clone(),
+            data_dir.clone(),
             tx.clone(),
             cancel.clone(),
             child_pid.clone(),
         );
         if let Err(e) = std::thread::Builder::new()
             .name("kiosk-launcher-pipe".into())
-            .spawn(move || pipe::serve(&name, tx, cancel, pid))
+            .spawn(move || pipe::serve(&name, &data, tx, cancel, pid))
         {
             // Without the pipe there are no Ready/heartbeat events, so the FSM
             // restarts the child at every startup-grace expiry. Supervising that
@@ -170,7 +171,10 @@ fn main() {
     );
 
     let code = loop_::run(rx, wd, initial, &mut sink);
-    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    // No `cancel.store(true)` here: `process::exit` tears every thread down
+    // regardless and nothing observes the flag on this path, so setting it
+    // would only read like a shutdown handshake that does not exist. `cancel`
+    // is for the threads' own between-blocking-calls checks.
     std::process::exit(code);
 }
 

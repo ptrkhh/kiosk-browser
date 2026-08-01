@@ -26,14 +26,54 @@ mod win32 {
     }
 }
 
-/// Kills `child` so no orphaned process is left holding the single-instance
-/// mutex/IPC pipe. Does not send anything on `tx`: the caller of
-/// `spawn_main` is solely responsible for reporting the `Err` result as a
-/// synthetic `ChildExited{-1}`, and this helper must not race it with a
-/// second one.
+/// How long [`kill_and_wait`] waits for a killed child to actually die.
+///
+/// ponytail: a bounded wait, not `Child::wait`'s `INFINITE`. The ceiling is
+/// that a process wedged in an uninterruptible kernel wait (a hung GPU/display
+/// driver is the realistic case on a kiosk running WebView2) is given up on
+/// after this long, and the caller proceeds with its handles possibly still
+/// open. That degrades to today's behaviour — a racy spool rename — instead of
+/// parking the single supervise thread forever, which would stop the kiosk
+/// being supervised at all. Raise it if a real device is ever seen needing more.
+#[cfg(windows)]
+const KILL_WAIT_MS: u32 = 5_000;
+
+/// Kills `child` and waits (bounded, [`KILL_WAIT_MS`]) for it to actually go
+/// away.
+///
+/// `Child::kill` is `TerminateProcess`, which returns BEFORE the kernel has
+/// torn the process down and closed its handles. Callers depend on the child's
+/// files really being closed — `sink`'s orphan-spool rename hits
+/// `ERROR_SHARING_VIOLATION` on kiosk-main's still-open spool segment
+/// otherwise, and silently loses that child's pre-death telemetry — so the
+/// wait is part of the kill, not an optional extra.
+#[cfg(windows)]
+pub(crate) fn kill_and_wait(child: &mut Child) {
+    use std::os::windows::io::AsRawHandle;
+    let _ = child.kill();
+    let handle = child.as_raw_handle();
+    // Safety: `handle` is the live process handle owned by `child`, which
+    // outlives this call; the wait is bounded and has no out-parameters.
+    unsafe {
+        win32::WaitForSingleObject(handle, KILL_WAIT_MS);
+    }
+}
+
+/// Non-Windows stub (dev hosts only; the kiosk target is Windows x64).
+#[cfg(not(windows))]
+pub(crate) fn kill_and_wait(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Kills `child` so no orphaned process is left holding the IPC pipe (its
+/// `nMaxInstances` is 1, so a live orphan keeps the real child from ever
+/// connecting). Does not send anything on `tx`: the caller of `spawn_main` is
+/// solely responsible for reporting the `Err` result as a synthetic
+/// `ChildExited{-1}`, and this helper must not race it with a second one.
 #[cfg(windows)]
 fn kill_orphan(mut child: Child) {
-    let _ = child.kill();
+    kill_and_wait(&mut child);
 }
 
 /// Spawns the supervised child (`exe --config <config_dir> [--safe]`),
@@ -81,6 +121,13 @@ pub fn spawn_main(
     cmd.arg("--config").arg(config_dir);
     cmd.env("KIOSK_HEARTBEAT_PIPE", pipe_name);
     if safe {
+        // OWED (P1-F): kiosk-main does NOT consume `--safe` yet — its CLI
+        // catch-all just prints "ignoring unknown argument". So a safe-mode
+        // escalation currently spawns an IDENTICAL kiosk-main, and the
+        // `watchdog.safe_mode` entry means "escalation attempted", NOT "safe
+        // mode entered". Implementing safe mode (bundled error page, device id
+        // + last error, no remote load) is its own piece of work; until then,
+        // read `watchdog.safe_mode` / `watchdog.safe_mode_failed` accordingly.
         cmd.arg("--safe");
     }
     let child = cmd.spawn()?;

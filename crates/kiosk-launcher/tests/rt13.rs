@@ -125,13 +125,14 @@ impl Harness {
 
         timer::spawn_timer(tx.clone(), cancel.clone());
         {
-            let (name, tx, cancel, pid) = (
+            let (name, data, tx, cancel, pid) = (
                 pipe_name.clone(),
+                data_dir.path().to_path_buf(),
                 tx.clone(),
                 cancel.clone(),
                 child_pid.clone(),
             );
-            std::thread::spawn(move || pipe::serve(&name, tx, cancel, pid));
+            std::thread::spawn(move || pipe::serve(&name, &data, tx, cancel, pid));
         }
 
         let sink = LauncherSink::new(

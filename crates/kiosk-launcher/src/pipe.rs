@@ -70,6 +70,24 @@ pub fn frame_to_event(line: &str, now: u64) -> Option<Event> {
     }
 }
 
+/// Fail-closed client authentication, as a pure seam.
+///
+/// `expected` is the PID snapshot taken before the accept; `current` is the
+/// shared child PID re-read at accept time. Either may legitimately identify
+/// the child: during a restart with `backoff_s > 2` the snapshot is taken while
+/// the shared PID is still 0 (`await_child_pid` gives up after ~2s), so a
+/// snapshot-only check rejects the *legitimate* new child's first connect and
+/// logs it as an impostor on every normal restart.
+///
+/// Fail-closed in every other case: `None` (Windows won't name the client), a
+/// zero client PID, and any PID matching neither value are all rejected.
+pub fn accept_client(client: Option<u32>, expected: u32, current: u32) -> bool {
+    match client {
+        Some(p) if p != 0 => p == expected || p == current,
+        _ => false,
+    }
+}
+
 #[cfg(windows)]
 mod win32 {
     use std::ffi::c_void;
@@ -319,6 +337,7 @@ mod imp {
 #[cfg(windows)]
 pub fn serve(
     pipe_name: &str,
+    data_dir: &std::path::Path,
     tx: Sender<Event>,
     cancel: Arc<AtomicBool>,
     child_pid: Arc<AtomicU32>,
@@ -351,13 +370,18 @@ pub fn serve(
         let handle = match create_pipe(pipe_name) {
             Ok(h) => h,
             Err(e) => {
-                // ponytail: eprintln! is the only diagnostic path this crate
-                // has here — `serve` has no Logger (Task 4 owns that stack),
-                // so on a windowless kiosk build this may go nowhere. Route
-                // it through the real logger when Task 4 wires `serve` in.
+                // ponytail: `serve` has no Logger (the sink owns that stack,
+                // and `Logger` is neither `Clone` nor `Sync`), so the operator
+                // signal here is the same `startup-degraded.txt` breadcrumb the
+                // config/telemetry startup failures leave. Without it a squatted
+                // pipe name — a permanent heartbeat outage, since
+                // FILE_FLAG_FIRST_PIPE_INSTANCE keeps failing forever — is the
+                // only silent-forever degraded path on the device. Upgrade to a
+                // real log entry if `serve` ever gets a logger.
                 if !logged_failure {
                     logged_failure = true;
                     eprintln!("kiosk-launcher: cannot create heartbeat pipe {pipe_name}: {e}");
+                    crate::sink::breadcrumb(data_dir, "pipe", &e.to_string());
                 }
                 sleep_retry();
                 continue;
@@ -369,7 +393,7 @@ pub fn serve(
         // hold the only instance for up to ~2s, and a looping attacker could
         // keep winning that race forever, starving the real child of a slot
         // to ever deliver `Ready`.
-        let expected = await_child_pid(&child_pid, &cancel);
+        let mut expected = await_child_pid(&child_pid, &cancel);
         if cancel.load(Ordering::Relaxed) {
             close_pipe(handle);
             return;
@@ -389,11 +413,16 @@ pub fn serve(
         }
         logged_failure = false;
 
-        // Authenticate the client against the supervised child. `expected`
-        // is the snapshot taken above, not a fresh re-read: the PID check
-        // must reject whoever connected, even if the shared value changed
-        // again in the meantime.
-        if expected == 0 || client_pid(handle) != Some(expected) {
+        // Authenticate the client against the supervised child: the snapshot
+        // taken above OR the shared PID as it stands right now. During a
+        // restart with `backoff_s > 2` the snapshot is 0 (the child did not
+        // exist yet when `await_child_pid` gave up), so snapshot-only would
+        // reject the legitimate new child and cry impostor on every restart.
+        // Still fail-closed — see `accept_client`. One extra relaxed load at
+        // accept time, so no starvation window reopens, and this still runs
+        // before any `LineReader` exists: a rejected client emits no event.
+        let client = client_pid(handle);
+        if !accept_client(client, expected, child_pid.load(Ordering::Relaxed)) {
             if !logged_impostor {
                 logged_impostor = true;
                 eprintln!(
@@ -406,6 +435,10 @@ pub fn serve(
             continue;
         }
         logged_impostor = false;
+        // The accepted client's own PID is what the ChannelFault liveness
+        // check and the reconnect latch must compare against from here on —
+        // it may be the current value rather than the stale snapshot.
+        expected = client.unwrap_or(expected);
         if expected != faulted_pid {
             // Different child than the one that faulted (or a first
             // connection): nothing to "reconnect" to.
@@ -486,6 +519,7 @@ fn await_child_pid(child_pid: &AtomicU32, cancel: &AtomicBool) -> u32 {
 #[cfg(not(windows))]
 pub fn serve(
     _pipe_name: &str,
+    _data_dir: &std::path::Path,
     _tx: Sender<Event>,
     _cancel: Arc<AtomicBool>,
     _child_pid: Arc<AtomicU32>,
@@ -510,6 +544,37 @@ mod tests {
         assert_eq!(
             frame_to_event("{\"type\":\"ping\"}", 42),
             Some(Event::Heartbeat { at: 42 })
+        );
+    }
+
+    /// Finding 4: during a restart with `backoff_s > 2` the pre-accept snapshot
+    /// is 0 (no child existed when `await_child_pid` gave up), and the
+    /// legitimate new child must still be accepted on the CURRENT value —
+    /// otherwise every normal restart logs a security-shaped impostor rejection
+    /// and costs the child a ~1s retry.
+    #[test]
+    fn accept_client_takes_either_the_snapshot_or_the_current_pid() {
+        assert!(accept_client(Some(1234), 1234, 1234), "steady state");
+        assert!(
+            accept_client(Some(1234), 1234, 0),
+            "the child that connected has since exited: its own frames are still its own"
+        );
+        assert!(
+            accept_client(Some(5678), 0, 5678),
+            "post-backoff restart: stale snapshot 0, the new child is current"
+        );
+    }
+
+    /// ...and the fail-closed property survives it: an unknown, absent or
+    /// zero-matching PID is still rejected before any frame is read.
+    #[test]
+    fn accept_client_is_fail_closed() {
+        assert!(!accept_client(None, 1234, 1234), "Windows won't name it");
+        assert!(!accept_client(Some(9999), 1234, 5678), "matches neither");
+        assert!(!accept_client(Some(1234), 0, 0), "no live child at all");
+        assert!(
+            !accept_client(Some(0), 0, 0),
+            "a zero client PID must never match the zero sentinel"
         );
     }
 
@@ -548,6 +613,12 @@ mod windows_smoke {
         }
     }
 
+    /// Data dir for the tests that never fail `create_pipe` and so never write
+    /// a breadcrumb; the squatter test below uses a real tempdir instead.
+    fn test_data_dir() -> std::path::PathBuf {
+        std::env::temp_dir().join("kiosk-launcher-pipe-tests")
+    }
+
     fn recv_event(rx: &mpsc::Receiver<Event>) -> Event {
         rx.recv_timeout(Duration::from_secs(5))
             .expect("expected an Event within 5s")
@@ -570,7 +641,9 @@ mod windows_smoke {
         // child" as far as the PID check is concerned.
         let child_pid = Arc::new(AtomicU32::new(std::process::id()));
         let serve_pid = child_pid.clone();
-        let server = std::thread::spawn(move || serve(&serve_name, tx, serve_cancel, serve_pid));
+        let server = std::thread::spawn(move || {
+            serve(&serve_name, &test_data_dir(), tx, serve_cancel, serve_pid)
+        });
 
         // First client: Ready, then Ping.
         let mut client = open_client(&pipe_name);
@@ -622,7 +695,9 @@ mod windows_smoke {
         let serve_name = pipe_name.clone();
         let serve_cancel = cancel.clone();
         let serve_pid = child_pid.clone();
-        let _server = std::thread::spawn(move || serve(&serve_name, tx, serve_cancel, serve_pid));
+        let _server = std::thread::spawn(move || {
+            serve(&serve_name, &test_data_dir(), tx, serve_cancel, serve_pid)
+        });
 
         let mut client = open_client(&pipe_name);
         client
@@ -661,7 +736,9 @@ mod windows_smoke {
         let serve_name = pipe_name.clone();
         let serve_cancel = cancel.clone();
         let serve_pid = child_pid.clone();
-        let _server = std::thread::spawn(move || serve(&serve_name, tx, serve_cancel, serve_pid));
+        let _server = std::thread::spawn(move || {
+            serve(&serve_name, &test_data_dir(), tx, serve_cancel, serve_pid)
+        });
 
         let mut client = open_client(&pipe_name);
         // Writes may or may not succeed depending on when the server
@@ -679,6 +756,50 @@ mod windows_smoke {
         cancel.store(true, Ordering::Relaxed);
     }
 
+    /// Finding 5: a squatted pipe name is a permanent heartbeat outage
+    /// (`FILE_FLAG_FIRST_PIPE_INSTANCE` keeps failing forever) and there is no
+    /// console on a deployed device — so it must leave the same
+    /// `startup-degraded.txt` breadcrumb the config/telemetry failures do.
+    #[test]
+    fn a_squatted_pipe_name_leaves_a_breadcrumb() {
+        let pipe_name = format!(
+            r"\\.\pipe\kiosk-heartbeat-test-squat-{}",
+            std::process::id()
+        );
+        // Squat the name first: `serve`'s own create then fails forever.
+        let squatter = imp::create_pipe(&pipe_name).expect("squat the name");
+
+        let data = tempfile::tempdir().unwrap();
+        let dir = data.path().to_path_buf();
+        let (tx, _rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let serve_cancel = cancel.clone();
+        let serve_name = pipe_name.clone();
+        let _server = std::thread::spawn(move || {
+            serve(
+                &serve_name,
+                &dir,
+                tx,
+                serve_cancel,
+                Arc::new(AtomicU32::new(0)),
+            )
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let file = data.path().join(crate::sink::DEGRADED_FILE);
+        while !file.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let text = std::fs::read_to_string(&file).expect("breadcrumb written");
+        assert!(
+            text.contains("pipe:"),
+            "reason token must be `pipe`, got {text:?}"
+        );
+
+        cancel.store(true, Ordering::Relaxed);
+        imp::close_pipe(squatter);
+    }
+
     #[test]
     fn garbage_line_does_not_panic_or_produce_an_event() {
         let pipe_name = format!(
@@ -691,7 +812,9 @@ mod windows_smoke {
         let serve_name = pipe_name.clone();
         let serve_cancel = cancel.clone();
         let child_pid = Arc::new(AtomicU32::new(std::process::id()));
-        let _server = std::thread::spawn(move || serve(&serve_name, tx, serve_cancel, child_pid));
+        let _server = std::thread::spawn(move || {
+            serve(&serve_name, &test_data_dir(), tx, serve_cancel, child_pid)
+        });
 
         let mut client = open_client(&pipe_name);
         client.write_all(b"not json at all\n").unwrap();
