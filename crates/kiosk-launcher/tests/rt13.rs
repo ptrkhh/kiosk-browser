@@ -94,6 +94,9 @@ struct Harness {
     code_rx: mpsc::Receiver<i32>,
     _config_dir: tempfile::TempDir,
     _data_dir: tempfile::TempDir,
+    /// Set once teardown (via `stop()` or `Drop`) has run, so the two never
+    /// double-act on the same harness.
+    torn_down: AtomicBool,
 }
 
 /// A pipe name unique to this scenario. `pipe::instance_name()` is per-launcher
@@ -163,6 +166,7 @@ impl Harness {
             code_rx,
             _config_dir: config_dir,
             _data_dir: data_dir,
+            torn_down: AtomicBool::new(false),
         }
     }
 
@@ -186,10 +190,32 @@ impl Harness {
         );
     }
 
-    /// Ends a supervise loop that would otherwise run forever, and waits for it.
-    /// The kill is what wakes a loop whose child is perfectly healthy (a healthy
-    /// Armed FSM emits no `Action` at all, so the stop flag alone is never seen).
-    fn stop(&self) {
+    /// Polls until `pred` has matched at least `count` recorded `Action`s, or
+    /// `within` elapses. Used to prove something happened a SECOND time (e.g.
+    /// re-arming after a restart), not just once.
+    fn wait_for_count(
+        &self,
+        what: &str,
+        within: Duration,
+        count: usize,
+        pred: impl Fn(&Action) -> bool,
+    ) {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if self.snapshot().iter().filter(|a| pred(a)).count() >= count {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!(
+            "timed out after {within:?} waiting for {count}x {what}; actions so far: {:?}",
+            self.snapshot()
+        );
+    }
+
+    /// Signals the stop flag and kills the mock child, if one is still alive.
+    /// Shared by `stop()` and `Drop` so both tear down the same way.
+    fn kill_child(&self) {
         self.stop.store(true, Ordering::Relaxed);
         let pid = self.child_pid.load(Ordering::Relaxed);
         if pid != 0 {
@@ -197,12 +223,20 @@ impl Harness {
                 .args(["/PID", &pid.to_string(), "/T", "/F"])
                 .output(); // captured, so the suite's output stays clean
         }
+    }
+
+    /// Ends a supervise loop that would otherwise run forever, and waits for it.
+    /// The kill is what wakes a loop whose child is perfectly healthy (a healthy
+    /// Armed FSM emits no `Action` at all, so the stop flag alone is never seen).
+    fn stop(&self) {
+        self.kill_child();
         let code = self
             .code_rx
             .recv_timeout(Duration::from_secs(30))
             .expect("the supervise loop must exit once stopped");
         assert_eq!(code, 0, "a harness-stopped loop exits 0");
         self.cancel.store(true, Ordering::Relaxed);
+        self.torn_down.store(true, Ordering::Relaxed);
     }
 
     /// Waits for `loop_::run` to return on its own (scenario 4).
@@ -212,7 +246,31 @@ impl Harness {
             .recv_timeout(within)
             .expect("the launcher must exit on its own");
         self.cancel.store(true, Ordering::Relaxed);
+        self.torn_down.store(true, Ordering::Relaxed);
         code
+    }
+}
+
+/// Reaps the mock child even when a scenario panics before reaching `stop()`
+/// or `wait_for_exit()` — e.g. a `wait_for` timeout at the assertion above.
+/// The child is owned by a detached thread inside `LauncherSink`, which
+/// Windows will not reap on its own, so a leaked test failure otherwise
+/// leaves a permanent orphan `rt13-mock-main.exe` process behind.
+///
+/// Idempotent: if `stop()`/`wait_for_exit()` already ran, `torn_down` is
+/// already set and this is a no-op. Must never panic — `Drop` runs during
+/// unwinding, and a panic here would abort the process instead of reporting
+/// the original test failure.
+impl Drop for Harness {
+    fn drop(&mut self) {
+        if self.torn_down.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        self.kill_child();
+        self.cancel.store(true, Ordering::Relaxed);
+        // Best-effort: give the loop a moment to notice, but never block a
+        // panicking test forever and never turn a failure into a hang.
+        let _ = self.code_rx.recv_timeout(Duration::from_secs(5));
     }
 }
 
@@ -278,13 +336,38 @@ fn a_hung_child_is_detected_and_restarted_within_the_miss_window() {
 }
 
 /// Scenario 3 — crash: the child exits 7 after `Ready`. The restart carries the
-/// real exit code.
+/// real exit code, and the restarted child re-arms.
+///
+/// The second `Arm` is the one assertion in this suite that proves the FSM
+/// recovered a full cycle, not just logged an event. Immediately after a
+/// restart, `pipe::serve` can still hold the OLD child's PID in its
+/// pre-connect `expected` snapshot when the NEW child connects (`pipe.rs`),
+/// so the server rejects the first `Ready` write and the new mock's write
+/// fails with `ERROR_NO_DATA`; the real client's write-retry (per
+/// `kiosk-main/src/heartbeat.rs`) backs off ~100ms and resends. That recovery
+/// path is real production behaviour with nothing else in this suite
+/// asserting on it — miss it here and a restarted kiosk could restart-loop
+/// forever in the field while every scenario still passed.
 #[test]
 fn a_crashing_child_is_restarted_with_its_real_exit_code() {
     let h = Harness::start("crash", "exit:7");
     h.wait_for("watchdog.restart{code:7}", Duration::from_secs(30), |a| {
         matches!(a, Action::Log(WatchdogEvent::Restart { code: 7, .. }))
     });
+    // Bounded generously: it must tolerate the ~100ms-1s pipe-rejection retry
+    // cycle, but 30s is still a real bound, not effectively infinite.
+    h.wait_for_count(
+        "a second watchdog.arm (the restarted child re-arming)",
+        Duration::from_secs(30),
+        2,
+        |a| matches!(a, Action::Log(WatchdogEvent::Arm { .. })),
+    );
+    // Not asserted separately: a second `Arm` cannot happen without a second
+    // `SpawnMain` having run first (the mock only reaches `Ready` after being
+    // spawned), so this already closes Finding 4 ("restart logged but nothing
+    // was spawned"). A separate exact spawn-count assertion would be racy
+    // here anyway — `exit:7` crash-loops the mock, so more restarts can land
+    // between the second `Arm` and `stop()` taking effect.
     h.stop();
 }
 

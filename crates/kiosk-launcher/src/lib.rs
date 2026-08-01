@@ -7,9 +7,9 @@
 //! can only link a lib target. Nothing here is a new abstraction — it is the
 //! same modules `main.rs` previously declared with `mod`.
 
-pub mod clock;
+mod clock;
 pub mod loop_;
 pub mod pipe;
 pub mod sink;
-pub mod spawn;
+mod spawn;
 pub mod timer;
