@@ -604,10 +604,16 @@ mod tests {
         let mut c = client(t, clock.clone());
         c.write(&[entry(1, &clock)]).expect("200");
         let after = clock.offset_seconds().unwrap();
-        assert_eq!(
-            after - before,
-            7200,
-            "the Date of a SUCCESS response must update the trusted clock"
+        // The two harvests bracket `c.write()`, and `observe_http_date` anchors each to
+        // `Utc::now()`, so the delta is 7200 MINUS the wall-time that elapsed between them
+        // (seconds on a slow/emulated box). Assert the harvest moved the clock ~+2h in the
+        // right direction, tolerating that elapsed — an exact 7200 was never a real property.
+        let elapsed = 7200 - (after - before);
+        assert!(
+            (0..=120).contains(&elapsed),
+            "the Date of a SUCCESS response must move the trusted clock ~+2h \
+             (delta {}, implied elapsed {elapsed}s)",
+            after - before
         );
 
         // (b) On failure - the load-bearing half. A dead-CMOS kiosk's first
@@ -622,10 +628,13 @@ mod tests {
         let mut c = client(t, clock.clone());
         c.write(&[entry(1, &clock)]).expect_err("500");
         let after = clock.offset_seconds().unwrap();
-        assert_eq!(
-            after - before,
-            -7200,
-            "the Date of a FAILURE response must ALSO update the trusted clock"
+        // Same elapsed-tolerance as (a), mirrored: this Date moves the clock ~-2h.
+        let elapsed = (-7200) - (after - before);
+        assert!(
+            (0..=120).contains(&elapsed),
+            "the Date of a FAILURE response must ALSO move the trusted clock ~-2h \
+             (delta {}, implied elapsed {elapsed}s)",
+            after - before
         );
     }
 

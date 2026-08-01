@@ -66,14 +66,23 @@ fn should_block(policy: &NavPolicy, url: &str, is_main_frame: bool) -> Option<Bl
 /// out. Also enforces `nav_policy` (P1-D2b Task 2): a main-frame navigation `decide`s
 /// against is cancelled before it ever starts, and reported as `nav.blocked`. Call once,
 /// right after the webview is built.
+/// `ready` is pulsed on the FIRST successful `NavigationCompleted` of ANY
+/// origin — including a bundled app-origin page such as the offline error page —
+/// not just remote/content navigations (arch-03: webview initialized + first
+/// nav committed; the watchdog only needs to know the app is alive and
+/// rendering, not that a remote site was reachable). `NavigationCompleted`
+/// fires on every navigation, so the pulse is latched to the first success
+/// only. This is the heartbeat client's cue to send `Frame::Ready` to the
+/// launcher.
 #[cfg(windows)]
 pub fn install(
     window: &tauri::WebviewWindow,
     tx: mpsc::Sender<AppEvent>,
     telem: Telemetry,
     nav_policy: SharedNavPolicy,
+    ready: std::sync::Arc<tokio::sync::Notify>,
 ) {
-    windows_impl::install(window, tx, telem, nav_policy);
+    windows_impl::install(window, tx, telem, nav_policy, ready);
 }
 
 #[cfg(not(windows))]
@@ -82,6 +91,7 @@ pub fn install(
     _tx: mpsc::Sender<AppEvent>,
     _telem: Telemetry,
     _nav_policy: SharedNavPolicy,
+    _ready: std::sync::Arc<tokio::sync::Notify>,
 ) {
     eprintln!("nav: only implemented on Windows; NavigationCommitted/Failed will never fire");
 }
@@ -103,6 +113,7 @@ mod windows_impl {
         tx: mpsc::Sender<AppEvent>,
         telem: Telemetry,
         nav_policy: SharedNavPolicy,
+        ready: std::sync::Arc<tokio::sync::Notify>,
     ) {
         let result = window.with_webview(move |platform_webview| unsafe {
             use webview2_com::Microsoft::Web::WebView2::Win32::{
@@ -195,12 +206,34 @@ mod windows_impl {
                 eprintln!("nav: add_NewWindowRequested failed, popups may open a second window: {e}");
             }
 
+            let ready_latch = std::sync::atomic::AtomicBool::new(false);
             let completed_handler = NavigationCompletedEventHandler::create(Box::new(
                 move |_sender, args: Option<ICoreWebView2NavigationCompletedEventArgs>| -> windows::core::Result<()> {
                     let Some(args) = args else { return Ok(()) };
                     let mut nav_id: u64 = 0;
                     args.NavigationId(&mut nav_id)?;
                     let uri = nav_urls.borrow_mut().remove(&nav_id);
+
+                    let mut is_success = windows::core::BOOL(0);
+                    args.IsSuccess(&mut is_success)?;
+
+                    // Readiness pulse fires on the FIRST successful commit of ANY
+                    // origin — including the bundled app-origin offline page — not
+                    // just remote/content navigations. The watchdog is asking "is
+                    // the app alive and rendering", not "is the site reachable": a
+                    // device that boots offline still renders the offline page
+                    // successfully and must arm the launcher, or `startup_grace_s`
+                    // expires and the launcher restart-loops a working kiosk into
+                    // safe mode on `cause: "no_ready"`. This must run BEFORE the
+                    // `feeds_fsm` filter below, which exists only to scope the
+                    // navigation FSM and must not gate readiness.
+                    if is_success.as_bool()
+                        && ready_latch
+                            .compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+                            .is_ok()
+                    {
+                        ready.notify_one();
+                    }
 
                     // C1: only genuine remote/content navigations reach the FSM. An
                     // app-origin bundled page (the error page's own commit!) or an
@@ -211,8 +244,6 @@ mod windows_impl {
                         return Ok(());
                     }
 
-                    let mut is_success = windows::core::BOOL(0);
-                    args.IsSuccess(&mut is_success)?;
                     let event = if is_success.as_bool() {
                         AppEvent::NavigationCommitted
                     } else {

@@ -3,5 +3,22 @@ name = "kiosk-launcher"
 version.workspace = true
 edition.workspace = true
 
+# RT-13's scriptable stand-in for kiosk-main. Declared as a `[[bin]]` (not an
+# example) because that is the only target kind cargo hands the test a reliable
+# path to, via `env!("CARGO_BIN_EXE_rt13-mock-main")`.
+[[bin]]
+name = "rt13-mock-main"
+path = "tests/bin/mock_main.rs"
+
 [dependencies]
 kiosk-core.workspace = true
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+# Test-only: the orphan-drain test needs a service account whose key actually
+# parses (the drain mints a token for real against the fake transport), so the
+# keypair is generated at run time — never a committed fixture. Same discipline
+# as kiosk-main's telemetry tests and kiosk-core's own auth tests.
+rsa = { version = "0.9", features = ["pem"] }
+rand = "0.8"
