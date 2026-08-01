@@ -6,12 +6,12 @@
 //! feed ONE `mpsc::Sender<watchdog::Event>`, and a single loop owns the
 //! `Watchdog` and dispatches each returned `Action` to the [`sink::LauncherSink`].
 
-mod clock;
-mod loop_;
-mod pipe;
-mod sink;
-mod spawn;
-mod timer;
+//!
+//! The modules themselves live in this crate's lib target (`lib.rs`) rather than
+//! being declared here, so RT-13 can link them; this file remains the only
+//! production entry point and the only place the assembly below exists.
+
+use kiosk_launcher::{loop_, pipe, sink, timer};
 
 use kiosk_core::config::bootstrap::BootstrapConfig;
 use kiosk_core::watchdog::{Watchdog, WatchdogConfig};
