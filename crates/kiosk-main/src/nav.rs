@@ -66,10 +66,14 @@ fn should_block(policy: &NavPolicy, url: &str, is_main_frame: bool) -> Option<Bl
 /// out. Also enforces `nav_policy` (P1-D2b Task 2): a main-frame navigation `decide`s
 /// against is cancelled before it ever starts, and reported as `nav.blocked`. Call once,
 /// right after the webview is built.
-/// `ready` is pulsed on the FIRST committed remote navigation only (arch-03:
-/// webview initialized + first nav committed) — that is the heartbeat client's
-/// cue to send `Frame::Ready` to the launcher. `NavigationCommitted` fires on
-/// every navigation, so the pulse is latched.
+/// `ready` is pulsed on the FIRST successful `NavigationCompleted` of ANY
+/// origin — including a bundled app-origin page such as the offline error page —
+/// not just remote/content navigations (arch-03: webview initialized + first
+/// nav committed; the watchdog only needs to know the app is alive and
+/// rendering, not that a remote site was reachable). `NavigationCompleted`
+/// fires on every navigation, so the pulse is latched to the first success
+/// only. This is the heartbeat client's cue to send `Frame::Ready` to the
+/// launcher.
 #[cfg(windows)]
 pub fn install(
     window: &tauri::WebviewWindow,
@@ -210,6 +214,27 @@ mod windows_impl {
                     args.NavigationId(&mut nav_id)?;
                     let uri = nav_urls.borrow_mut().remove(&nav_id);
 
+                    let mut is_success = windows::core::BOOL(0);
+                    args.IsSuccess(&mut is_success)?;
+
+                    // Readiness pulse fires on the FIRST successful commit of ANY
+                    // origin — including the bundled app-origin offline page — not
+                    // just remote/content navigations. The watchdog is asking "is
+                    // the app alive and rendering", not "is the site reachable": a
+                    // device that boots offline still renders the offline page
+                    // successfully and must arm the launcher, or `startup_grace_s`
+                    // expires and the launcher restart-loops a working kiosk into
+                    // safe mode on `cause: "no_ready"`. This must run BEFORE the
+                    // `feeds_fsm` filter below, which exists only to scope the
+                    // navigation FSM and must not gate readiness.
+                    if is_success.as_bool()
+                        && ready_latch
+                            .compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+                            .is_ok()
+                    {
+                        ready.notify_one();
+                    }
+
                     // C1: only genuine remote/content navigations reach the FSM. An
                     // app-origin bundled page (the error page's own commit!) or an
                     // uncorrelated navId (e.g. the very first boot splash, whose
@@ -219,20 +244,7 @@ mod windows_impl {
                         return Ok(());
                     }
 
-                    let mut is_success = windows::core::BOOL(0);
-                    args.IsSuccess(&mut is_success)?;
                     let event = if is_success.as_bool() {
-                        // arch-03: the launcher's READY is the FIRST commit only.
-                        // A second `Frame::Ready` mid-run would be wrong, so the
-                        // pulse is latched with a compare-exchange (this handler
-                        // runs on WebView2's COM thread; `notify_one` is safe to
-                        // call from anywhere and never blocks).
-                        if ready_latch
-                            .compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
-                            .is_ok()
-                        {
-                            ready.notify_one();
-                        }
                         AppEvent::NavigationCommitted
                     } else {
                         let mut status = COREWEBVIEW2_WEB_ERROR_STATUS_UNKNOWN;

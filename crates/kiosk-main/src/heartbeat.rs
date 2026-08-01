@@ -91,11 +91,16 @@ pub async fn run(pipe_name: String, ready: Arc<Notify>, cancel: CancellationToke
             }
         }
 
-        if client
-            .write_all(encode(&Frame::Ready).as_bytes())
-            .await
-            .is_err()
-        {
+        // Cancel-aware: a server that stops draining leaves `write_all` parked
+        // on a full pipe buffer forever, which would otherwise be the one await
+        // in this module unresponsive to shutdown (the launcher waits for this
+        // process to exit).
+        let ready_frame = encode(&Frame::Ready);
+        let write_result = tokio::select! {
+            _ = cancel.cancelled() => return,
+            r = client.write_all(ready_frame.as_bytes()) => r,
+        };
+        if write_result.is_err() {
             if !sleep_or_cancel(&cancel, RECONNECT_BACKOFF).await {
                 return;
             }
@@ -112,7 +117,14 @@ pub async fn run(pipe_name: String, ready: Arc<Notify>, cancel: CancellationToke
             tokio::select! {
                 _ = cancel.cancelled() => return,
                 _ = tick.tick() => {
-                    if client.write_all(encode(&Frame::Ping).as_bytes()).await.is_err() {
+                    // Same cancel-aware wrap as the `Ready` write above: a stalled
+                    // pipe must not park this task past shutdown.
+                    let ping_frame = encode(&Frame::Ping);
+                    let write_result = tokio::select! {
+                        _ = cancel.cancelled() => return,
+                        r = client.write_all(ping_frame.as_bytes()) => r,
+                    };
+                    if write_result.is_err() {
                         break; // pipe gone: reconnect
                     }
                 }
@@ -290,7 +302,12 @@ mod tests {
         ));
         tokio::time::sleep(Duration::from_millis(50)).await;
         cancel.cancel();
-        tokio::time::timeout(Duration::from_secs(2), task)
+        // Tight enough that only a genuinely cancel-aware sleep (not a plain
+        // `tokio::time::sleep` standing in for `sleep_or_cancel`) can meet it:
+        // the retry loop is sitting in `RECONNECT_BACKOFF` (1s) when cancelled,
+        // so a mutant that ignores `cancel` inside that sleep would blow this
+        // bound while still passing a laxer one.
+        tokio::time::timeout(Duration::from_millis(300), task)
             .await
             .expect("heartbeat::run must exit promptly on cancel")
             .expect("task panicked");
