@@ -132,6 +132,11 @@ fn build_telemetry(
 /// `reason` is a stable enumerated token (`config`, `telemetry`); `detail` is the
 /// underlying error's Display. Readers must tolerate the file being missing,
 /// empty, or truncated.
+///
+/// Lifecycle: written on any degraded start, removed on the next fully-healthy
+/// start (bootstrap config parsed AND telemetry built). Presence therefore means
+/// "the LAST boot was degraded", not "some boot, once, was degraded" — a fleet
+/// check must read it that way.
 pub fn breadcrumb(data_dir: &Path, reason: &str, detail: &str) {
     let _ = std::fs::create_dir_all(data_dir);
     if let Ok(mut f) = std::fs::File::create(data_dir.join(DEGRADED_FILE)) {
@@ -261,7 +266,14 @@ impl LauncherSink {
         bootstrap: Option<&BootstrapConfig>,
     ) -> LauncherSink {
         let telemetry = bootstrap.and_then(|b| match build_telemetry(b, &config_dir, &data_dir) {
-            Ok(t) => Some(t),
+            Ok(t) => {
+                // Bootstrap parsed AND telemetry built: this boot took no
+                // degraded path, so any breadcrumb left by a PAST degraded boot
+                // is now stale. Best-effort, same as `breadcrumb` itself — a
+                // failed delete must never affect startup.
+                let _ = std::fs::remove_file(data_dir.join(DEGRADED_FILE));
+                Some(t)
+            }
             Err(e) => {
                 eprintln!("kiosk-launcher: telemetry disabled ({e}); supervising without it");
                 breadcrumb(&data_dir, "telemetry", &e.to_string());
@@ -649,6 +661,108 @@ mod tests {
             "config: D:\\kiosk\\kiosk.ini is not a valid kiosk.ini: boom"
         );
         assert_eq!(text.lines().count(), 1, "exactly one line");
+    }
+
+    /// A fully-healthy start (bootstrap parses AND telemetry builds) must clear a
+    /// breadcrumb left by a PAST degraded boot — otherwise presence of the file
+    /// stops meaning "the last boot was degraded" and a fixed device looks
+    /// permanently sick to any fleet check shaped as "does this file exist".
+    #[test]
+    fn a_healthy_start_clears_a_pre_existing_breadcrumb() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        // A breadcrumb from some earlier, degraded boot.
+        breadcrumb(
+            &data_dir,
+            "config",
+            "stale, from a boot that has since healed",
+        );
+        assert!(data_dir.join(DEGRADED_FILE).exists());
+
+        // A real, parseable credential next to `kiosk.ini`, exactly as
+        // `build_telemetry` expects to find it.
+        std::fs::write(config_dir.join("cred.json"), test_service_account_json()).unwrap();
+        let bootstrap = BootstrapConfig::parse(
+            "[kiosk]\nconfig_url = https://e/c.json\nsite = hq\nproject_id = p\n\
+             credential = cred.json\ndevice_id = lobby-01\n\n[bootstrap]\nurl = https://app.example.com/\n",
+        )
+        .expect("valid ini");
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let sink = LauncherSink::new(
+            PathBuf::from("kiosk-main.exe"),
+            config_dir,
+            data_dir.clone(),
+            "test-pipe".into(),
+            tx,
+            Arc::new(AtomicU32::new(0)),
+            Some(&bootstrap),
+        );
+
+        assert!(
+            sink.telemetry.is_some(),
+            "telemetry must have built successfully for this to be the healthy path under test"
+        );
+        assert!(
+            !data_dir.join(DEGRADED_FILE).exists(),
+            "a fully-healthy start must clear the stale breadcrumb"
+        );
+    }
+
+    /// The degraded telemetry path (unreadable credential) must leave a
+    /// pre-existing breadcrumb in place — only a fully-healthy start clears it.
+    #[test]
+    fn a_degraded_telemetry_start_leaves_a_pre_existing_breadcrumb() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        // No credential file written: `build_telemetry` fails reading it.
+
+        breadcrumb(&data_dir, "config", "stale, still unresolved");
+        assert!(data_dir.join(DEGRADED_FILE).exists());
+
+        let bootstrap = BootstrapConfig::parse(
+            "[kiosk]\nconfig_url = https://e/c.json\nsite = hq\nproject_id = p\n\
+             credential = missing.json\ndevice_id = lobby-01\n\n[bootstrap]\nurl = https://app.example.com/\n",
+        )
+        .expect("valid ini");
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let sink = LauncherSink::new(
+            PathBuf::from("kiosk-main.exe"),
+            config_dir,
+            data_dir.clone(),
+            "test-pipe".into(),
+            tx,
+            Arc::new(AtomicU32::new(0)),
+            Some(&bootstrap),
+        );
+
+        assert!(
+            sink.telemetry.is_none(),
+            "telemetry must have failed to build for this to be the degraded path under test"
+        );
+        assert!(
+            data_dir.join(DEGRADED_FILE).exists(),
+            "a degraded start must not erase a live warning"
+        );
+    }
+
+    /// JSON for a real, runtime-generated RSA keypair, in the shape
+    /// `ServiceAccount::from_json` expects — reused by the breadcrumb-lifecycle
+    /// tests above, which need `build_telemetry` to actually succeed.
+    fn test_service_account_json() -> String {
+        let private_pem = &*TEST_KEY_PEM;
+        serde_json::json!({
+            "private_key": private_pem,
+            "client_email": "kiosk-logger@test-project.iam.gserviceaccount.com",
+            "token_uri": "https://oauth2.googleapis.com/token",
+        })
+        .to_string()
     }
 
     /// `fields_for` shapes the enumerated payload the taxonomy expects.
