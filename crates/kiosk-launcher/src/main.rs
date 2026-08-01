@@ -138,26 +138,16 @@ fn main() {
     let pipe_name = pipe::instance_name();
 
     timer::spawn_timer(tx.clone(), cancel.clone());
-    // `serve` blocks its caller for its whole lifetime (unlike `spawn_timer`,
-    // which spawns its own thread), so it gets a thread here.
-    {
-        let (name, data, tx, cancel, pid) = (
-            pipe_name.clone(),
-            data_dir.clone(),
-            tx.clone(),
-            cancel.clone(),
-            child_pid.clone(),
-        );
-        if let Err(e) = std::thread::Builder::new()
-            .name("kiosk-launcher-pipe".into())
-            .spawn(move || pipe::serve(&name, &data, tx, cancel, pid))
-        {
-            // Without the pipe there are no Ready/heartbeat events, so the FSM
-            // restarts the child at every startup-grace expiry. Supervising that
-            // way is still better than not supervising at all.
-            eprintln!("kiosk-launcher: heartbeat pipe thread failed to start ({e})");
-        }
-    }
+    // Clones for the pipe thread, captured now because `LauncherSink::new`
+    // below moves `tx`, `child_pid`, `pipe_name`, and `data_dir` by value; the
+    // thread itself isn't spawned until after that call returns (see there).
+    let pipe_thread_args = (
+        pipe_name.clone(),
+        data_dir.clone(),
+        tx.clone(),
+        cancel.clone(),
+        child_pid.clone(),
+    );
 
     let (wd, initial) = Watchdog::new(watchdog_config(bootstrap.as_ref()));
     let mut sink = sink::LauncherSink::new(
@@ -169,6 +159,26 @@ fn main() {
         child_pid,
         bootstrap.as_ref(),
     );
+
+    // Must start after `LauncherSink::new`: its healthy-telemetry arm clears a
+    // stale `startup-degraded.txt` breadcrumb left over from a previous boot.
+    // A squatted-pipe breadcrumb written by `serve` before that clear runs
+    // would be deleted along with it, silently losing the one diagnostic for
+    // a permanent heartbeat outage. `serve` blocks its caller for its whole
+    // lifetime (unlike `spawn_timer`, which spawns its own thread), so it
+    // gets a thread here.
+    {
+        let (name, data, tx, cancel, pid) = pipe_thread_args;
+        if let Err(e) = std::thread::Builder::new()
+            .name("kiosk-launcher-pipe".into())
+            .spawn(move || pipe::serve(&name, &data, tx, cancel, pid))
+        {
+            // Without the pipe there are no Ready/heartbeat events, so the FSM
+            // restarts the child at every startup-grace expiry. Supervising that
+            // way is still better than not supervising at all.
+            eprintln!("kiosk-launcher: heartbeat pipe thread failed to start ({e})");
+        }
+    }
 
     let code = loop_::run(rx, wd, initial, &mut sink);
     // No `cancel.store(true)` here: `process::exit` tears every thread down
