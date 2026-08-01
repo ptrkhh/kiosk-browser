@@ -9,7 +9,9 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 kiosk-core.workspace = true
 tauri = { version = "2", features = [] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+# "net" is what brings in `tokio::net::windows::named_pipe` — the heartbeat
+# client's transport to the launcher (P1-E2 Task 5).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 tokio-util = "0.7"                      # CancellationToken
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1", features = ["derive"] }

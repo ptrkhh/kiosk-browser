@@ -66,14 +66,19 @@ fn should_block(policy: &NavPolicy, url: &str, is_main_frame: bool) -> Option<Bl
 /// out. Also enforces `nav_policy` (P1-D2b Task 2): a main-frame navigation `decide`s
 /// against is cancelled before it ever starts, and reported as `nav.blocked`. Call once,
 /// right after the webview is built.
+/// `ready` is pulsed on the FIRST committed remote navigation only (arch-03:
+/// webview initialized + first nav committed) — that is the heartbeat client's
+/// cue to send `Frame::Ready` to the launcher. `NavigationCommitted` fires on
+/// every navigation, so the pulse is latched.
 #[cfg(windows)]
 pub fn install(
     window: &tauri::WebviewWindow,
     tx: mpsc::Sender<AppEvent>,
     telem: Telemetry,
     nav_policy: SharedNavPolicy,
+    ready: std::sync::Arc<tokio::sync::Notify>,
 ) {
-    windows_impl::install(window, tx, telem, nav_policy);
+    windows_impl::install(window, tx, telem, nav_policy, ready);
 }
 
 #[cfg(not(windows))]
@@ -82,6 +87,7 @@ pub fn install(
     _tx: mpsc::Sender<AppEvent>,
     _telem: Telemetry,
     _nav_policy: SharedNavPolicy,
+    _ready: std::sync::Arc<tokio::sync::Notify>,
 ) {
     eprintln!("nav: only implemented on Windows; NavigationCommitted/Failed will never fire");
 }
@@ -103,6 +109,7 @@ mod windows_impl {
         tx: mpsc::Sender<AppEvent>,
         telem: Telemetry,
         nav_policy: SharedNavPolicy,
+        ready: std::sync::Arc<tokio::sync::Notify>,
     ) {
         let result = window.with_webview(move |platform_webview| unsafe {
             use webview2_com::Microsoft::Web::WebView2::Win32::{
@@ -195,6 +202,7 @@ mod windows_impl {
                 eprintln!("nav: add_NewWindowRequested failed, popups may open a second window: {e}");
             }
 
+            let ready_latch = std::sync::atomic::AtomicBool::new(false);
             let completed_handler = NavigationCompletedEventHandler::create(Box::new(
                 move |_sender, args: Option<ICoreWebView2NavigationCompletedEventArgs>| -> windows::core::Result<()> {
                     let Some(args) = args else { return Ok(()) };
@@ -214,6 +222,17 @@ mod windows_impl {
                     let mut is_success = windows::core::BOOL(0);
                     args.IsSuccess(&mut is_success)?;
                     let event = if is_success.as_bool() {
+                        // arch-03: the launcher's READY is the FIRST commit only.
+                        // A second `Frame::Ready` mid-run would be wrong, so the
+                        // pulse is latched with a compare-exchange (this handler
+                        // runs on WebView2's COM thread; `notify_one` is safe to
+                        // call from anywhere and never blocks).
+                        if ready_latch
+                            .compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+                            .is_ok()
+                        {
+                            ready.notify_one();
+                        }
                         AppEvent::NavigationCommitted
                     } else {
                         let mut status = COREWEBVIEW2_WEB_ERROR_STATUS_UNKNOWN;

@@ -10,6 +10,7 @@ mod fetch;
 mod gesture;
 mod hardening;
 mod health;
+mod heartbeat;
 mod idle;
 mod inject;
 mod nav;
@@ -467,6 +468,21 @@ async fn main() {
         cancel.clone(),
     ));
 
+    // P1-E2 Task 5: heartbeat client. `ready` is pulsed by `nav::install` on the
+    // first committed navigation (arch-03); the client then sends `Frame::Ready`
+    // and pings the launcher. No `KIOSK_HEARTBEAT_PIPE` → nobody is supervising
+    // us (developer / direct launch) → no heartbeat, kiosk runs unchanged.
+    let ready = Arc::new(Notify::new());
+    match heartbeat::pipe_name_from_env() {
+        Some(pipe_name) => {
+            tokio::spawn(heartbeat::run(pipe_name, ready.clone(), cancel.clone()));
+        }
+        None => eprintln!(
+            "kiosk-main: {} unset; running standalone with no launcher heartbeat",
+            heartbeat::PIPE_ENV
+        ),
+    }
+
     // Keep-awake (spec §7, display.keep_awake): asserted once at startup, for the
     // life of the process — WebView2/tao has no per-window "don't sleep" flag, so
     // this is the process-wide Win32 mechanism instead. `ES_CONTINUOUS` makes the
@@ -493,6 +509,7 @@ async fn main() {
     let cancel_setup = cancel.clone();
     let nav_policy_setup = nav_policy.clone();
     let exit_gesture_setup = exit_gesture.clone();
+    let ready_setup = ready.clone();
 
     // P1-D2c Task 5: the `verify_pin` command's state. `resolve_data_dir()` is a
     // pure function of `%ProgramData%`, cheap to call again here — the `data_dir`
@@ -611,6 +628,7 @@ async fn main() {
                 tx_setup.clone(),
                 telem_setup.clone(),
                 nav_policy_setup.clone(),
+                ready_setup.clone(),
             );
             scheme_guard::install(&window, telem_setup.clone(), nav_policy_setup.clone());
             egress::install(&window, telem_setup.clone(), nav_policy_setup.clone());
