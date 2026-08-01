@@ -143,6 +143,12 @@ impl Harness {
             tx,
             child_pid.clone(),
             None, // no bootstrap => no telemetry; see the module note
+            // No job object: `Harness` already reaps the mock explicitly (see
+            // `kill_child`/`Drop`), and a kill-on-close job scoped to a single
+            // scenario would fire whenever this sink was dropped — killing a
+            // mock the scenario still expects to be alive. `job::Job`'s own
+            // unit test covers kill-on-close directly.
+            None,
         );
         let actions = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));

@@ -11,7 +11,7 @@
 //! being declared here, so RT-13 can link them; this file remains the only
 //! production entry point and the only place the assembly below exists.
 
-use kiosk_launcher::{loop_, pipe, sink, timer};
+use kiosk_launcher::{job, loop_, pipe, sink, timer};
 
 use kiosk_core::config::bootstrap::BootstrapConfig;
 use kiosk_core::watchdog::{Watchdog, WatchdogConfig};
@@ -124,6 +124,40 @@ fn watchdog_config(bootstrap: Option<&BootstrapConfig>) -> WatchdogConfig {
 }
 
 fn main() {
+    // Degraded-start warnings raised before `LauncherSink::new` exists, replayed
+    // as breadcrumbs once it does — see where they're drained below.
+    let mut degraded: Vec<(&str, String)> = Vec::new();
+
+    // FIRST, before ANY side effect: nothing above this point touches a file,
+    // creates the heartbeat pipe or spawns a child, so a second launcher exits
+    // without disturbing a single byte of the running one's state.
+    //
+    // The token is bound for the whole of `main` and never dropped (this
+    // function ends in `process::exit`). It must NEVER become `let _ = ...`:
+    // that closes the handle immediately and frees the name, disarming the
+    // check for the next launcher that starts.
+    let _single_instance = match job::acquire_single_instance() {
+        Ok(Some(token)) => Some(token),
+        // A peer supervises. Deliberate clean exit — a success, not a failure.
+        Ok(None) => {
+            eprintln!("kiosk-launcher: another kiosk-launcher is running; exiting");
+            std::process::exit(0);
+        }
+        // The mutex could not be CREATED (e.g. no SeCreateGlobalPrivilege for
+        // the `Global\` namespace). Distinct from already-held on purpose:
+        // conflating them would make the launcher silently refuse to start,
+        // which is the black screen this binary exists to prevent. Never block
+        // boot on a hardening failure.
+        Err(e) => {
+            eprintln!(
+                "kiosk-launcher: single-instance mutex unavailable ({e}); \
+                 continuing without double-start protection"
+            );
+            degraded.push(("mutex", e.to_string()));
+            None
+        }
+    };
+
     let config_dir = resolve_config_dir(std::env::args());
     let data_dir = resolve_data_dir();
     let bootstrap = load_bootstrap(&config_dir, &data_dir);
@@ -149,16 +183,47 @@ fn main() {
         child_pid.clone(),
     );
 
+    // The kill-on-close job the sink assigns every child to. A failure here is
+    // WARNING + continue: the launcher supervises exactly as it did before
+    // P1-F1, it just can't take the child with it when it dies unexpectedly.
+    let job = match job::Job::create() {
+        Ok(job) => Some(job),
+        Err(e) => {
+            eprintln!(
+                "kiosk-launcher: job object unavailable ({e}); a supervised \
+                 kiosk-main will survive an unexpected launcher death"
+            );
+            degraded.push(("job", e.to_string()));
+            None
+        }
+    };
+
     let (wd, initial) = Watchdog::new(watchdog_config(bootstrap.as_ref()));
     let mut sink = sink::LauncherSink::new(
         exe,
         config_dir,
-        data_dir,
+        data_dir.clone(),
         pipe_name,
         tx,
         child_pid,
         bootstrap.as_ref(),
+        // Moved into the sink, which lives for the rest of `main`: the job must
+        // outlive every child it kills, and dropping it early would kill the
+        // kiosk rather than merely disable the feature.
+        job,
     );
+
+    // Replayed only NOW, after `LauncherSink::new`: its healthy-telemetry arm
+    // deletes `startup-degraded.txt`, so a breadcrumb written earlier would be
+    // silently erased — the same ordering trap that put the pipe thread below
+    // this call. And before the pipe thread starts, so `serve`'s squatted-pipe
+    // breadcrumb (a permanent heartbeat outage) still wins the file.
+    //
+    // `_if_absent`: a `config`/`telemetry` failure this boot is strictly more
+    // severe than losing kill-on-close, and the file only holds one line.
+    for (reason, detail) in &degraded {
+        sink::breadcrumb_if_absent(&data_dir, reason, detail);
+    }
 
     // Must start after `LauncherSink::new`: its healthy-telemetry arm clears a
     // stale `startup-degraded.txt` breadcrumb left over from a previous boot.

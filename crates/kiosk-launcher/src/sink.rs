@@ -31,6 +31,7 @@ use kiosk_core::watchdog::{Action, Event, WatchdogEvent};
 use serde_json::{Map, Value};
 
 use crate::clock::now;
+use crate::job::Job;
 use crate::loop_::ActionSink;
 use crate::spawn::spawn_main;
 
@@ -159,6 +160,23 @@ pub fn breadcrumb(data_dir: &Path, reason: &str, detail: &str) {
 /// See [`breadcrumb`]. Operator-facing contract — do not rename.
 pub const DEGRADED_FILE: &str = "startup-degraded.txt";
 
+/// Like [`breadcrumb`], but never overwrites one already written this boot.
+///
+/// The file is a single line and `breadcrumb` truncates, so it is
+/// last-writer-wins. The supervision-hardening warnings (`job`, `mutex`) are
+/// the LEAST severe things that write it — a device that cannot read its
+/// `kiosk.ini` has no telemetry at all and no way to be told so — and must not
+/// bury a louder one that a `config`/`telemetry`/`pipe` failure already left.
+///
+/// Best-effort, like everything on this path: the check and the write are not
+/// atomic against `pipe::serve`'s own breadcrumb on another thread. Losing that
+/// race costs one diagnostic line, never correctness.
+pub fn breadcrumb_if_absent(data_dir: &Path, reason: &str, detail: &str) {
+    if !data_dir.join(DEGRADED_FILE).exists() {
+        breadcrumb(data_dir, reason, detail);
+    }
+}
+
 /// The enumerated jsonPayload for a `watchdog.*` entry. Only the fields the FSM
 /// actually carries — no free-form content ever reaches telemetry.
 pub fn fields_for(e: &WatchdogEvent) -> Map<String, Value> {
@@ -255,9 +273,21 @@ pub struct LauncherSink {
     /// The supervised child's handle, so a still-live predecessor can be killed
     /// before it is replaced (dropping a `Child` does NOT kill a Windows process,
     /// and an orphan keeps holding the heartbeat pipe — `nMaxInstances` is 1, so
-    /// the new child could never connect). NOTE: there is no single-instance
-    /// mutex today; nothing but this kill prevents two kiosk-mains (owed, P1-F).
+    /// the new child could never connect). Two kiosk-mains from two LAUNCHERS is
+    /// now prevented upstream, by `job::acquire_single_instance` in `main`.
     child: Option<Child>,
+    /// The kill-on-close Job Object every spawned child is assigned to, so an
+    /// unexpected launcher death (taskkill, panic, fast shutdown) takes
+    /// kiosk-main with it instead of leaving an unsupervised full-screen orphan.
+    ///
+    /// Owned HERE because this struct lives for the launcher's whole run: the
+    /// job fires when its last handle closes, so a `Job` dropped early kills the
+    /// kiosk on the spot rather than merely disabling the feature.
+    ///
+    /// `None` only when `job::create` failed at startup (WARNING + continue —
+    /// see `main`): supervision still works, the child just outlives an
+    /// unexpected launcher death, i.e. exactly the pre-P1-F1 behaviour.
+    job: Option<Job>,
     /// Shared with `pipe::serve`; 0 means "no live child". This sink is its only
     /// writer — see `pipe`'s module docs for what it gates.
     child_pid: Arc<AtomicU32>,
@@ -268,6 +298,11 @@ pub struct LauncherSink {
 }
 
 impl LauncherSink {
+    // 8 flat arguments, one over clippy's threshold. They are the launcher's
+    // whole wiring, every one is a distinct type, and there is exactly ONE
+    // production caller (`main`) plus the test harnesses — a params struct here
+    // would be a second name for `LauncherSink`'s own fields and nothing else.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         exe: PathBuf,
         config_dir: PathBuf,
@@ -276,6 +311,7 @@ impl LauncherSink {
         tx: Sender<Event>,
         child_pid: Arc<AtomicU32>,
         bootstrap: Option<&BootstrapConfig>,
+        job: Option<Job>,
     ) -> LauncherSink {
         let telemetry = bootstrap.and_then(|b| match build_telemetry(b, &config_dir, &data_dir) {
             Ok(t) => {
@@ -301,6 +337,7 @@ impl LauncherSink {
             child: None,
             child_pid,
             telemetry,
+            job,
         }
     }
 
@@ -332,6 +369,33 @@ impl LauncherSink {
             self.tx.clone(),
         ) {
             Ok(child) => {
+                // Assign to the job FIRST, before anything else this arm does.
+                //
+                // ACCEPTED RACE (P1): `std::process::Command` starts the child
+                // running, so between `spawn_main` returning and this call there
+                // is a window — one syscall wide — in which the child is not yet
+                // in the job and would survive a launcher death. Closing it
+                // properly means CREATE_SUSPENDED plus a resume, and
+                // `std::process::Child` exposes no thread handle to resume
+                // (`ResumeThread` needs one; the alternatives are undocumented
+                // `NtResumeProcess` or a thread-table walk). Not worth that for
+                // a window whose worst case is the pre-P1-F1 status quo — an
+                // orphaned kiosk-main — rather than a regression. Revisit if the
+                // spawn path ever moves to raw `CreateProcessW`.
+                if let Some(job) = self.job.as_ref() {
+                    if let Err(e) = job.assign(&child) {
+                        // WARNING + continue: assignment can legitimately fail
+                        // under some CI/container/debugger job configurations,
+                        // and a supervised-but-unkillable kiosk still beats no
+                        // kiosk. Same operator channel as every other degraded
+                        // start — there is no console on a deployed device.
+                        eprintln!(
+                            "kiosk-launcher: could not assign kiosk-main (pid {}) to the job object ({e}); it will survive an unexpected launcher death",
+                            child.id()
+                        );
+                        breadcrumb_if_absent(&self.data_dir, "job", &e.to_string());
+                    }
+                }
                 // Publish the PID BEFORE storing the handle: `pipe::serve` may
                 // already be waiting for it to authenticate the child's connect.
                 self.child_pid.store(child.id(), Ordering::Relaxed);
@@ -685,6 +749,35 @@ mod tests {
         assert_eq!(text.lines().count(), 1, "exactly one line");
     }
 
+    /// The hardening warnings are the least severe things that write the
+    /// single-line breadcrumb, so they must claim it when it is free and leave
+    /// it alone when a louder failure already has it — otherwise a device with
+    /// an unreadable `kiosk.ini` (no telemetry AT ALL) reports itself to the
+    /// operator as merely missing kill-on-close.
+    #[test]
+    fn breadcrumb_if_absent_never_buries_a_louder_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+
+        breadcrumb_if_absent(data, "job", "kill-on-close unavailable");
+        let text = std::fs::read_to_string(data.join(DEGRADED_FILE)).unwrap();
+        assert!(
+            text.contains("job:"),
+            "an unclaimed breadcrumb must be written, got {text:?}"
+        );
+
+        // A more severe failure claims the file...
+        breadcrumb(data, "config", "cannot read kiosk.ini");
+        // ...and a later hardening warning must not overwrite it.
+        breadcrumb_if_absent(data, "mutex", "access denied");
+
+        let text = std::fs::read_to_string(data.join(DEGRADED_FILE)).unwrap();
+        assert!(
+            text.contains("config:"),
+            "the louder warning must survive, got {text:?}"
+        );
+    }
+
     /// A fully-healthy start (bootstrap parses AND telemetry builds) must clear a
     /// breadcrumb left by a PAST degraded boot — otherwise presence of the file
     /// stops meaning "the last boot was degraded" and a fixed device looks
@@ -722,6 +815,7 @@ mod tests {
             tx,
             Arc::new(AtomicU32::new(0)),
             Some(&bootstrap),
+            None, // no job object: these tests only exercise the breadcrumb lifecycle
         );
 
         assert!(
@@ -762,6 +856,7 @@ mod tests {
             tx,
             Arc::new(AtomicU32::new(0)),
             Some(&bootstrap),
+            None, // no job object: these tests only exercise the breadcrumb lifecycle
         );
 
         assert!(
