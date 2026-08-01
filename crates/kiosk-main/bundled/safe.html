@@ -1,0 +1,46 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>kiosk — safe mode</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #000;
+        color: #ccc;
+        font: 16px sans-serif;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        text-align: center;
+        gap: 8px;
+      }
+      #device,
+      #err {
+        color: #888;
+        font-size: 13px;
+      }
+    </style>
+  </head>
+  <body>
+    <!-- P1-F1 Task 2: app-origin only, no remote resources/requests. Device id + last
+         error arrive as query params on the navigate URL (both Rust-controlled: the
+         device id from boot, the error from crash-panic.txt) and are written with
+         textContent, never innerHTML — the error text is free-form file content. -->
+    <p>Kiosk safe mode</p>
+    <p id="device"></p>
+    <p id="err"></p>
+    <script>
+      (function () {
+        var params = new URLSearchParams(window.location.search);
+        document.getElementById("device").textContent =
+          "device: " + (params.get("device") || "unknown");
+        document.getElementById("err").textContent =
+          "last error: " + (params.get("err") || "unknown");
+      })();
+    </script>
+  </body>
+</html>

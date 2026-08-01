@@ -11,6 +11,10 @@ pub struct Args {
     /// read from (default: the running exe's own directory). Spec §4's `--config
     /// <path>` names a DIRECTORY, not the ini file itself — `kiosk.ini` inside it.
     pub config: Option<String>,
+    /// P1-F1 Task 2: the launcher's watchdog escalation flag. When set, `main`
+    /// skips the config fetch / prober / remote driver entirely and renders the
+    /// bundled `safe.html` instead — see `main.rs`'s `args.safe` branch.
+    pub safe: bool,
 }
 
 impl Args {
@@ -21,6 +25,7 @@ impl Args {
             match item.as_str() {
                 "--windowed" => args.windowed = true,
                 "--config" => args.config = items.next(),
+                "--safe" => args.safe = true,
                 "--version" => {
                     println!("kiosk-main {}", kiosk_core::app_version());
                     std::process::exit(0);
@@ -42,12 +47,19 @@ mod tests {
 
     #[test]
     fn parses_all_flags() {
-        let a = parse(&["kiosk-main", "--config", "D:\\kiosk", "--windowed"]);
+        let a = parse(&[
+            "kiosk-main",
+            "--config",
+            "D:\\kiosk",
+            "--windowed",
+            "--safe",
+        ]);
         assert_eq!(
             a,
             Args {
                 windowed: true,
                 config: Some("D:\\kiosk".into()),
+                safe: true,
             }
         );
     }
@@ -55,6 +67,12 @@ mod tests {
     #[test]
     fn defaults_are_off() {
         assert_eq!(parse(&["kiosk-main"]), Args::default());
+    }
+
+    #[test]
+    fn safe_flag_sets_safe() {
+        let a = parse(&["kiosk-main", "--safe"]);
+        assert!(a.safe);
     }
 
     #[test]
