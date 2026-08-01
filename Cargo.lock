@@ -1891,6 +1891,7 @@ name = "kiosk-main"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "chrono",
  "kiosk-core",
  "rand 0.8.7",
  "reqwest 0.12.28",

@@ -13,6 +13,7 @@ mod health;
 mod heartbeat;
 mod idle;
 mod inject;
+mod maintenance;
 mod nav;
 mod nav_policy;
 mod pinpad;
@@ -220,6 +221,7 @@ fn install_panic_hook(telem: telemetry::Telemetry, data_dir: PathBuf) {
 /// Drives the FSM's effects into the live webview (spec §Architecture actor-spine).
 /// The `Effect` → page decision itself is `effect::page_for` (pure, host-tested); this
 /// only carries out what it decides.
+#[derive(Clone)]
 struct TauriSink {
     app: AppHandle,
     tx: mpsc::Sender<AppEvent>,
@@ -366,6 +368,12 @@ async fn main() {
     // process restart (this loop is spawned once, below, and never re-reads config).
     let idle_reset_seconds = booted.manager.current().content.idle_reset_seconds;
     let allow_text_selection = booted.manager.current().input.allow_text_selection;
+    // P1-F1 Task 3: same "read once, next-restart to change" convention as the fields
+    // above — the nightly-reload timer is spawned once, below, and never re-reads
+    // config (a later config fetch changing either field takes effect only on the
+    // next process restart).
+    let nightly_reload = booted.manager.current().maintenance.nightly_reload.clone();
+    let maintenance_timezone = booted.manager.current().maintenance.timezone.clone();
     // P1-D2e Task 2: same "read once, next-restart to change" convention as the
     // fields above — the health-sample timer is spawned once, below, and never
     // re-reads config.
@@ -736,6 +744,27 @@ async fn main() {
                 );
                 sink.navigate(&safe_url);
             } else {
+                // P1-F1 Task 3: nightly-reload timer. Reuses the same `sink.navigate`
+                // path as the FSM (a clone — `sink` itself moves into `driver::run`
+                // below) so a reload is a plain navigation to the live `nav_policy`'s
+                // home, not a second navigation mechanism. `--safe` never spawns this
+                // (same `if safe {} else {}` split as the FSM driver above).
+                let maint_sink = sink.clone();
+                let maint_nav_policy = nav_policy_setup.clone();
+                let maint_telem = telem_setup.clone();
+                tokio::spawn(maintenance::run(
+                    nightly_reload,
+                    maintenance_timezone,
+                    move || maint_sink.navigate(maint_nav_policy.load().home()),
+                    move || {
+                        maint_telem.config_warn(
+                            "maintenance.nightly_reload",
+                            "unparseable HH:MM or unknown timezone; nightly reload disabled",
+                        )
+                    },
+                    cancel_setup.clone(),
+                ));
+
                 tokio::spawn(driver::run(
                     rx,
                     Driver {
