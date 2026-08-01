@@ -68,11 +68,21 @@ fn resolve_main_exe(config_dir: &Path) -> PathBuf {
 /// black screen, while one that starts with the spec's default watchdog timings
 /// still supervises. The cost is that this run has no telemetry — the same trade
 /// kiosk-main makes when its own credential is unreadable.
-fn load_bootstrap(config_dir: &Path) -> Option<BootstrapConfig> {
+///
+/// Both degraded paths also drop a `startup-degraded.txt` breadcrumb in the data
+/// dir (see [`sink::breadcrumb`]): under a Scheduled Task these `eprintln!`s have
+/// no console to reach, and a device that supervises perfectly while reporting
+/// nothing must not look healthy to the fleet.
+fn load_bootstrap(config_dir: &Path, data_dir: &Path) -> Option<BootstrapConfig> {
     let path = config_dir.join("kiosk.ini");
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
         Err(e) => {
+            sink::breadcrumb(
+                data_dir,
+                "config",
+                &format!("cannot read {}: {e}", path.display()),
+            );
             eprintln!(
                 "kiosk-launcher: cannot read {} ({e}); supervising with default timings and no telemetry",
                 path.display()
@@ -83,6 +93,11 @@ fn load_bootstrap(config_dir: &Path) -> Option<BootstrapConfig> {
     match BootstrapConfig::parse(&text) {
         Ok(b) => Some(b),
         Err(e) => {
+            sink::breadcrumb(
+                data_dir,
+                "config",
+                &format!("{} is not a valid kiosk.ini: {e}", path.display()),
+            );
             eprintln!(
                 "kiosk-launcher: {} is not a valid kiosk.ini ({e}); supervising with default timings and no telemetry",
                 path.display()
@@ -111,7 +126,7 @@ fn watchdog_config(bootstrap: Option<&BootstrapConfig>) -> WatchdogConfig {
 fn main() {
     let config_dir = resolve_config_dir(std::env::args());
     let data_dir = resolve_data_dir();
-    let bootstrap = load_bootstrap(&config_dir);
+    let bootstrap = load_bootstrap(&config_dir, &data_dir);
     let exe = resolve_main_exe(&config_dir);
 
     let (tx, rx) = mpsc::channel();

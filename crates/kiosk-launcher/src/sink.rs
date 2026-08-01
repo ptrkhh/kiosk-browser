@@ -118,6 +118,32 @@ fn build_telemetry(
     })
 }
 
+/// Operator-facing breadcrumb file for a degraded start (`<data>/startup-degraded.txt`).
+///
+/// Under a Scheduled Task or an MSI-installed service there is NO console, so the
+/// `eprintln!`s on these paths go nowhere and a telemetry-dead device is
+/// indistinguishable from a healthy one. This file is the signal that survives
+/// having no console — same discipline as kiosk-main's `crash-panic.txt`: data
+/// dir, plain text, `File::create` (truncating, last-writer-wins), and every
+/// failure swallowed, because diagnostics must never be able to stop the
+/// supervisor from starting.
+///
+/// Format: exactly one line, `<unix_seconds> <reason>: <detail>`.
+/// `reason` is a stable enumerated token (`config`, `telemetry`); `detail` is the
+/// underlying error's Display. Readers must tolerate the file being missing,
+/// empty, or truncated.
+pub fn breadcrumb(data_dir: &Path, reason: &str, detail: &str) {
+    let _ = std::fs::create_dir_all(data_dir);
+    if let Ok(mut f) = std::fs::File::create(data_dir.join(DEGRADED_FILE)) {
+        use std::io::Write;
+        let _ = writeln!(f, "{} {reason}: {detail}", now());
+        let _ = f.sync_all();
+    }
+}
+
+/// See [`breadcrumb`]. Operator-facing contract — do not rename.
+pub const DEGRADED_FILE: &str = "startup-degraded.txt";
+
 /// The enumerated jsonPayload for a `watchdog.*` entry. Only the fields the FSM
 /// actually carries — no free-form content ever reaches telemetry.
 pub fn fields_for(e: &WatchdogEvent) -> Map<String, Value> {
@@ -159,13 +185,17 @@ fn drain_dir(dir: &Path, client: &mut GclClient) -> io::Result<usize> {
             break;
         }
         client.write(&batch).map_err(spool_err)?;
+        // Trust `commit_drained`, never `batch.len()`: an acked entry sitting
+        // behind a still-unacked one stays on disk, so only the committed count
+        // is honest about what actually left this device.
         let committed = spool.commit_drained(&batch).map_err(spool_err)?;
-        delivered += batch.len();
+        delivered += committed;
         if committed == 0 {
             // A blocked commit prefix (see `Logger::flush`'s poison-entry notes)
-            // would otherwise re-drain the same batch forever. The partition is
-            // left in place; the next restart retries it.
-            break;
+            // would otherwise re-drain the same batch forever. Return WITHOUT
+            // removing the directory: everything behind the poison prefix is
+            // still undelivered, and the next restart retries the partition.
+            return Ok(delivered);
         }
     }
     // Fully drained: the partition has served its purpose.
@@ -234,6 +264,7 @@ impl LauncherSink {
             Ok(t) => Some(t),
             Err(e) => {
                 eprintln!("kiosk-launcher: telemetry disabled ({e}); supervising without it");
+                breadcrumb(&data_dir, "telemetry", &e.to_string());
                 None
             }
         });
@@ -309,6 +340,16 @@ impl ActionSink for LauncherSink {
             Action::SpawnMain => self.spawn(false),
             Action::SpawnSafe => self.spawn(true),
             Action::DrainOrphanedSpool => {
+                // `Watchdog::restart` emits this for ALL FOUR causes, and only
+                // `exit` means the child is already dead: on `hang`, `no_ready`
+                // and `channel` it is still running and still WRITING to
+                // `spool/main`. Renaming and deleting a live partition would
+                // destroy the one-writer-per-partition invariant arch-01 exists
+                // to provide, so the child dies here, before the PID is zeroed
+                // and before anything is moved. On the `exit` path this kills an
+                // already-exited `Child` — a no-op that emits nothing (the
+                // waiter thread already sent its one `ChildExited`).
+                self.kill_child();
                 // The child that owned that partition is gone: nothing lives on
                 // the shared PID until the next spawn publishes one.
                 self.child_pid.store(0, Ordering::Relaxed);
@@ -338,6 +379,7 @@ mod tests {
     use super::*;
     use kiosk_core::config::schema::UrlDetail;
     use kiosk_core::logging::client::ENTRIES_WRITE_URL;
+    use kiosk_core::logging::entry::LogEntry;
     use kiosk_core::logging::event::Event as LogEvent;
     use kiosk_core::logging::ratelimit::RateLimiter;
     use kiosk_core::logging::transport::{HttpResponse, TransportError};
@@ -515,6 +557,98 @@ mod tests {
 
         assert_eq!(drain_orphan(dir.path(), &mut client).unwrap(), 0);
         assert!(transport.insert_ids().is_empty());
+    }
+
+    /// A poisoned commit prefix must NOT cost the operator the entries behind it.
+    ///
+    /// The poison is built the way `Spool` actually produces one: `drain_batch`
+    /// takes up to `MAX_BATCH` from EACH ring, merges, sorts by `(timestamp,
+    /// insert_id)` and truncates back to `MAX_BATCH`. Give each ring 100 entries
+    /// whose FIRST on-disk line is the newest, and the global truncate cuts both
+    /// heads — so `Ring::commit` stops dead at line 0 in both rings and
+    /// `commit_drained` returns 0 for a full 100-entry batch.
+    #[test]
+    fn a_blocked_commit_prefix_keeps_the_partition_and_reports_zero_delivered() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        {
+            let mut spool = Spool::open(
+                &data.join("spool").join(MAIN_PARTITION),
+                SpoolConfig::from_logging(&Logging::default()),
+            )
+            .expect("main partition opens");
+            let ctx = EntryContext {
+                project_id: "proj".into(),
+                device_id: "x".into(),
+                site: "hq".into(),
+                region: "hq".into(),
+                app_version: "0.1.0".into(),
+                config_revision: None,
+                url_detail: UrlDetail::Path,
+            };
+            let clock = established_clock();
+            let mut seq = 1u64;
+            // NavBlocked is WARNING (high ring), AppStart is INFO (low ring).
+            for event in [LogEvent::NavBlocked, LogEvent::AppStart] {
+                for i in 0..MAX_BATCH {
+                    let mut e = LogEntry::new(event, &ctx, seq, &clock, Map::new());
+                    seq += 1;
+                    e.timestamp = Some(if i == 0 {
+                        "2026-07-12T09:00:00+00:00".into() // the head: newest, so it sorts out of the batch
+                    } else {
+                        format!("2026-07-12T08:30:{:02}+00:00", i % 60)
+                    });
+                    spool.append(&e).expect("append");
+                }
+            }
+        }
+
+        let transport = FakeTransport::new();
+        let mut client = fake_client(transport.clone());
+        let n = drain_orphan(data, &mut client).expect("drain succeeds");
+
+        assert_eq!(
+            n, 0,
+            "the count must reflect committed entries only, not the batch that was posted"
+        );
+        assert!(
+            data.join(ORPHAN_DIR).exists(),
+            "a partition with undelivered entries behind a poison prefix must survive"
+        );
+        assert_eq!(
+            transport.insert_ids().len(),
+            MAX_BATCH,
+            "one batch was posted, then the drain stopped instead of re-posting it forever"
+        );
+    }
+
+    /// The degraded-start breadcrumb: one line, `<unix_seconds> <reason>: <detail>`,
+    /// in the data dir — the operator-facing contract the P1-F runbook reads.
+    /// A data dir that does not exist yet is created; an unwritable one is silent.
+    #[test]
+    fn a_degraded_start_leaves_a_readable_breadcrumb() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("kiosk"); // deliberately not created yet
+        breadcrumb(
+            &data,
+            "config",
+            "D:\\kiosk\\kiosk.ini is not a valid kiosk.ini: boom",
+        );
+
+        let text = std::fs::read_to_string(data.join(DEGRADED_FILE)).expect("breadcrumb written");
+        let (ts, rest) = text
+            .trim_end()
+            .split_once(' ')
+            .expect("`<ts> <reason>: <detail>`");
+        assert!(
+            ts.parse::<u64>().unwrap() > 1_700_000_000,
+            "unix seconds, got {ts}"
+        );
+        assert_eq!(
+            rest,
+            "config: D:\\kiosk\\kiosk.ini is not a valid kiosk.ini: boom"
+        );
+        assert_eq!(text.lines().count(), 1, "exactly one line");
     }
 
     /// `fields_for` shapes the enumerated payload the taxonomy expects.
