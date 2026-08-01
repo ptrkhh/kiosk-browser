@@ -90,6 +90,22 @@ mod url_encode_tests {
     fn reserved_and_control_chars_are_percent_encoded() {
         assert_eq!(url_encode("a b&c=d\n"), "a%20b%26c%3Dd%0A");
     }
+
+    /// The 500-char cap the `--safe` path puts on `crash-panic.txt` before encoding
+    /// (main.rs `setup`). Guards the two ways that cap could break `safe.html`:
+    /// a cut landing mid-UTF-8 (byte slicing would panic / emit an undecodable
+    /// %-sequence — `.chars()` cannot), and unbounded 3x encode expansion.
+    #[test]
+    fn capped_error_text_stays_valid_utf8_and_bounded() {
+        let huge: String = "パニック💥".repeat(10_000);
+        let capped: String = huge.chars().take(500).collect();
+        assert_eq!(capped.chars().count(), 500);
+        // 3 bytes/char worst case, x3 for percent-encoding: comfortably under any
+        // browser URL limit, which is the whole point of the cap.
+        assert!(url_encode(&capped).len() <= 500 * 4 * 3);
+        // Round-trips: every escape is a well-formed %XX of the original bytes.
+        assert_eq!(url_encode(&capped).matches('%').count(), capped.len());
+    }
 }
 
 /// Pure index-vs-count decision for `display.monitor` (spec §5.2): `requested`
@@ -221,7 +237,6 @@ fn install_panic_hook(telem: telemetry::Telemetry, data_dir: PathBuf) {
 /// Drives the FSM's effects into the live webview (spec §Architecture actor-spine).
 /// The `Effect` → page decision itself is `effect::page_for` (pure, host-tested); this
 /// only carries out what it decides.
-#[derive(Clone)]
 struct TauriSink {
     app: AppHandle,
     tx: mpsc::Sender<AppEvent>,
@@ -331,6 +346,12 @@ async fn main() {
     // boot never touches this file.
     let last_error = args.safe.then(|| data_dir.join("crash-panic.txt"));
 
+    // KNOWN LIMITATION (P1-F1, to fix in P1-F2): safe mode does NOT cover config
+    // faults. Both panic sites below run on the `--safe` path too, so a device with
+    // an unreadable or invalid `kiosk.ini` (or a bad credential) crash-loops:
+    // escalate to `--safe` → panic here → `SAFE_FAIL_LIMIT` → `safe_mode_failed`,
+    // and the operator gets a 60 s black-screen loop with no safe page at all.
+    // P1-F2 owns rendering `safe.html` BEFORE config is parsed.
     let ini_path = config_dir.join("kiosk.ini");
     let ini_text = std::fs::read_to_string(&ini_path).unwrap_or_else(|e| {
         panic!(
@@ -732,10 +753,18 @@ async fn main() {
             // `crash-panic.txt` degrades to "unknown", never a panic or a blank
             // screen.
             if safe {
-                let last_error_text = last_error
+                // Capped at 500 chars BEFORE encoding: percent-encoding expands up to
+                // 3x, and a multi-hundred-KB panic Display would make a URL WebView2
+                // refuses outright — i.e. safe.html renders NOTHING, defeating the one
+                // invariant this page has. `.chars()` (not byte slicing) so the cut
+                // never lands mid-UTF-8 and produces an undecodable %-sequence.
+                let last_error_text: String = last_error
                     .as_deref()
                     .and_then(|p| std::fs::read_to_string(p).ok())
-                    .unwrap_or_else(|| "unknown".to_string());
+                    .unwrap_or_else(|| "unknown".to_string())
+                    .chars()
+                    .take(500)
+                    .collect();
                 let safe_url = format!(
                     "{}?device={}&err={}",
                     bundled_url("safe.html"),
@@ -744,18 +773,23 @@ async fn main() {
                 );
                 sink.navigate(&safe_url);
             } else {
-                // P1-F1 Task 3: nightly-reload timer. Reuses the same `sink.navigate`
-                // path as the FSM (a clone — `sink` itself moves into `driver::run`
-                // below) so a reload is a plain navigation to the live `nav_policy`'s
-                // home, not a second navigation mechanism. `--safe` never spawns this
-                // (same `if safe {} else {}` split as the FSM driver above).
-                let maint_sink = sink.clone();
-                let maint_nav_policy = nav_policy_setup.clone();
+                // P1-F1 Task 3: nightly-reload timer. Fires `IdleExpired` INTO the FSM
+                // rather than navigating the webview directly, so the reload obeys the
+                // machine's rules (state.rs rule 9): Online + idle_clear clears the
+                // profile first and re-navigates only after `ProfileCleared` (the
+                // privacy gate), Online without idle_clear reloads home, and any other
+                // state (Offline, ErrorPage, Clearing) is a no-op — a 04:00 reload must
+                // not replace the offline video with a doomed remote load, nor paint
+                // home over an in-progress clear. `--safe` never spawns this (same
+                // `if safe {} else {}` split as the FSM driver above).
+                let tx_reload = tx_setup.clone();
                 let maint_telem = telem_setup.clone();
                 tokio::spawn(maintenance::run(
                     nightly_reload,
                     maintenance_timezone,
-                    move || maint_sink.navigate(maint_nav_policy.load().home()),
+                    move || {
+                        let _ = tx_reload.try_send(AppEvent::IdleExpired);
+                    },
                     move || {
                         maint_telem.config_warn(
                             "maintenance.nightly_reload",

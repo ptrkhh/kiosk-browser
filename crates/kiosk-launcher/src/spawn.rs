@@ -121,13 +121,13 @@ pub fn spawn_main(
     cmd.arg("--config").arg(config_dir);
     cmd.env("KIOSK_HEARTBEAT_PIPE", pipe_name);
     if safe {
-        // OWED (P1-F): kiosk-main does NOT consume `--safe` yet — its CLI
-        // catch-all just prints "ignoring unknown argument". So a safe-mode
-        // escalation currently spawns an IDENTICAL kiosk-main, and the
-        // `watchdog.safe_mode` entry means "escalation attempted", NOT "safe
-        // mode entered". Implementing safe mode (bundled error page, device id
-        // + last error, no remote load) is its own piece of work; until then,
-        // read `watchdog.safe_mode` / `watchdog.safe_mode_failed` accordingly.
+        // P1-F1 Task 2: kiosk-main consumes `--safe` — it renders the bundled
+        // `safe.html` (device id + last crash breadcrumb), skips all remote
+        // I/O and the FSM driver, and still heartbeats. So a `watchdog.
+        // safe_mode` entry means safe mode was actually ENTERED, and
+        // `watchdog.safe_mode_failed` means even the safe child kept dying.
+        // Known gap (P1-F2): the safe path still panics on an unreadable or
+        // invalid `kiosk.ini`, so config faults never reach `safe.html`.
         cmd.arg("--safe");
     }
     let child = cmd.spawn()?;
