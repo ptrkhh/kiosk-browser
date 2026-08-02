@@ -3,10 +3,15 @@
 A locked-down, single-URL kiosk browser (Rust + Tauri 2 / WebView2) for unattended
 displays. Spec of record: [`docs/superpowers/specs/2026-07-05-kiosk-browser-design.md`](docs/superpowers/specs/2026-07-05-kiosk-browser-design.md).
 
-> **Status: P0 skeleton.** Boots a fullscreen/borderless/always-on-top WebView on a
-> hardcoded URL; CI; and the Windows input-capture feasibility gate (below). Config,
-> telemetry, connectivity, webview hardening, exit gesture/PIN, and the launcher watchdog
-> arrive in later plans.
+> **Status: P1 — Windows deployable MVP, code-complete.** Landed: `kiosk.ini` bootstrap +
+> signed remote config (Ed25519, device-binding, anti-rollback), Cloud Logging telemetry
+> (trusted time, tiered spool), the connectivity prober + navigation allowlist, the full
+> §7 webview hardening set, the native idle-reset privacy gate + exit gesture + PIN pad
+> (exit 86), the launcher watchdog (heartbeat, READY arming, backoff, safe mode, Job-Object
+> kill-on-close), nightly reload, and the WiX MSI + §7.2 lockdown runbook. **Before a secure
+> production deploy:** hardware smoke validation, and two SEC-09 release blockers (a runtime
+> credential-DACL check + OS-keystore protection — see `packaging/windows/README.md`).
+> Linux (P2, WebKitGTK) and Android (P3) are later phases.
 
 ## Workspace layout (spec §4)
 
@@ -14,14 +19,15 @@ displays. Spec of record: [`docs/superpowers/specs/2026-07-05-kiosk-browser-desi
 |---|---|
 | `kiosk-core` | platform-agnostic library (config, telemetry, …); host-testable; never depends on Tauri or any per-OS API |
 | `kiosk-main` | the Tauri 2 app — the fullscreen kiosk window |
-| `kiosk-launcher` | watchdog stub for now; the real supervise/heartbeat launcher is a later plan |
+| `kiosk-launcher` | the watchdog — spawns/supervises `kiosk-main` over a named-pipe heartbeat (restart, backoff, safe mode, Job-Object kill-on-close, single-instance mutex) |
 
 ## Build & run
 
 ```bash
 cargo build --workspace
-cargo run -p kiosk-main -- --url https://example.com   # fullscreen kiosk
-cargo run -p kiosk-main -- --windowed                  # dev: decorated 1280×800
+cargo run -p kiosk-main -- --config <dir>   # <dir> holds kiosk.ini (+ credential, offline mp4)
+cargo run -p kiosk-main -- --windowed       # dev: decorated 1280×800
+cargo run -p kiosk-main -- --safe           # bundled safe page (device id + last error), no remote
 cargo test --workspace
 ```
 
