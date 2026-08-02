@@ -10,6 +10,12 @@
 //! ACL) is `Err`. The caller (boot/reload wiring, not this module) treats
 //! `Ok(false)` and `Err` identically — refuse to trust the credential.
 
+// ponytail: no caller wired in yet (that's Task 3's job — boot/reload
+// wiring), so in a non-test build this whole module is unreachable from
+// `main`, and every item below would otherwise warn `dead_code`. Remove this
+// once Task 3 adds a real caller.
+#![cfg_attr(not(test), allow(dead_code))]
+
 use std::io;
 use std::path::Path;
 
@@ -246,5 +252,84 @@ mod tests {
     #[test]
     fn zero_mask_is_not_a_read_grant() {
         assert!(!mask_grants_read(0));
+    }
+
+    // Real-DACL integration coverage for `credential_is_owner_only` itself
+    // (not just the pure `mask_grants_read` helper above). Exercises the
+    // actual FFI path — `GetNamedSecurityInfoW`, the ACE-type dispatch in
+    // `read_grantee_sids`, the NULL-vs-empty-DACL branch is implicitly
+    // covered by the "present, owner-only" case below — against a real file
+    // whose DACL is manipulated with `icacls`. This crate's copy of
+    // `credential_acl.rs` is byte-identical to
+    // `crates/kiosk-launcher/src/credential_acl.rs`, so this coverage
+    // applies to both; do not duplicate this test into the launcher crate.
+    #[test]
+    fn credential_is_owner_only_reflects_real_dacl() {
+        use super::credential_is_owner_only;
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().expect("create temp dir for DACL test");
+        let file = dir.path().join("cred.json");
+        std::fs::write(&file, b"{}").expect("create temp credential file");
+
+        // Resolve the current principal the way the file's owner will
+        // actually be recorded: DOMAIN\username (or COMPUTER\username for a
+        // local account), taken from the environment rather than hardcoded.
+        let domain = std::env::var("USERDOMAIN").expect("USERDOMAIN must be set on Windows");
+        let user = std::env::var("USERNAME").expect("USERNAME must be set on Windows");
+        let current_principal = format!("{domain}\\{user}");
+
+        // Step 1: reset the DACL to inheritance-off, owner-only.
+        let out = Command::new("icacls")
+            .arg(&file)
+            .arg("/inheritance:r")
+            .arg("/grant:r")
+            .arg(format!("{current_principal}:(F)"))
+            .output()
+            .expect("failed to spawn icacls");
+        assert!(
+            out.status.success(),
+            "icacls /inheritance:r /grant:r failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let result = credential_is_owner_only(&file).expect("owner-only DACL should read cleanly");
+        assert!(
+            result,
+            "expected Ok(true) for a DACL granting only the current user (owner)"
+        );
+
+        // Step 2: additionally grant read to BUILTIN\Users, referenced by its
+        // well-known SID (S-1-5-32-545) so this test is locale-independent —
+        // the English name "BUILTIN\Users" would not resolve on a non-English
+        // Windows install.
+        let out = Command::new("icacls")
+            .arg(&file)
+            .arg("/grant")
+            .arg("*S-1-5-32-545:(R)")
+            .output()
+            .expect("failed to spawn icacls");
+        assert!(
+            out.status.success(),
+            "icacls /grant *S-1-5-32-545:(R) failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let result =
+            credential_is_owner_only(&file).expect("widened DACL should still read cleanly");
+        assert!(
+            !result,
+            "expected Ok(false) once BUILTIN\\Users (S-1-5-32-545) can read the file"
+        );
+
+        // Step 3: a path that does not exist must fail closed with Err.
+        let missing = dir.path().join("does-not-exist.json");
+        assert!(
+            credential_is_owner_only(&missing).is_err(),
+            "expected Err for a nonexistent path"
+        );
+
+        // `dir` (a `tempfile::TempDir`) removes itself and its contents on
+        // drop here, regardless of whether the assertions above passed.
     }
 }
