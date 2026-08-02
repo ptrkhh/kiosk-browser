@@ -109,6 +109,99 @@ mod url_encode_tests {
     }
 }
 
+/// SEC-09 reload gate, Critical 2 fix: `fetch::run` cannot navigate directly (it was
+/// spawned before the window existed), so it reports the violation message once over
+/// `credential_violation_rx`; this is the task that performs the actual `safe.html`
+/// navigation — the exact same call `--safe` uses — and then holds that state by
+/// cancelling `driver_probe_cancel`. Without the cancel, `probe::run` keeps emitting
+/// `LinkChanged` and `driver::run` keeps dispatching `Navigate`/`ShowVideo` through the
+/// same sink (the FSM was never told about the violation — `AppState::Safe` has no
+/// `Event` transitions in, by design), so a later network flip can repaint the webview
+/// right over `safe.html`. Extracted from `.setup()` so this is host-testable without a
+/// real Tauri window. One-shot: once tripped there is nothing left to watch for
+/// (`fetch::run` has already stopped polling).
+async fn hold_safe_after_credential_violation(
+    mut credential_violation_rx: mpsc::Receiver<String>,
+    device_id: String,
+    navigate: impl Fn(&str),
+    driver_probe_cancel: CancellationToken,
+) {
+    if let Some(message) = credential_violation_rx.recv().await {
+        let url = format!(
+            "{}?device={}&err={}",
+            bundled_url("safe.html"),
+            url_encode(&device_id),
+            url_encode(&message),
+        );
+        navigate(&url);
+        driver_probe_cancel.cancel();
+    }
+}
+
+#[cfg(test)]
+mod hold_safe_after_credential_violation_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// TDD RED (Critical 2, before the fix): the prior implementation navigated to
+    /// `safe.html` but never cancelled anything shared with `driver`/`probe` — so this
+    /// assertion on `driver_probe_cancel.is_cancelled()` failed against that code, proving
+    /// the exact gap the review flagged (a subsequent `LinkChanged` could still reach the
+    /// FSM and repaint over `safe.html`). GREEN once `driver_probe_cancel.cancel()` was
+    /// added above.
+    #[tokio::test]
+    async fn a_reported_violation_navigates_and_holds_safe_mode() {
+        let (tx, rx) = mpsc::channel::<String>(1);
+        let navigated = Arc::new(Mutex::new(Vec::new()));
+        let navigated_task = navigated.clone();
+        let driver_probe_cancel = CancellationToken::new();
+        let driver_probe_cancel_task = driver_probe_cancel.clone();
+
+        let handle = tokio::spawn(hold_safe_after_credential_violation(
+            rx,
+            "lobby-01".into(),
+            move |url: &str| navigated_task.lock().unwrap().push(url.to_string()),
+            driver_probe_cancel_task,
+        ));
+
+        tx.send("credential file permissions are not owner-only".into())
+            .await
+            .unwrap();
+        handle.await.unwrap();
+
+        let urls = navigated.lock().unwrap();
+        assert_eq!(urls.len(), 1, "must navigate exactly once");
+        assert!(urls[0].contains("safe.html"));
+        assert!(urls[0].contains("device=lobby-01"));
+        assert!(
+            driver_probe_cancel.is_cancelled(),
+            "driver/probe must be cancelled so no later LinkChanged/idle event can \
+             dispatch a Navigate/ShowVideo effect over safe.html"
+        );
+    }
+
+    /// A channel closed without ever reporting a violation (e.g. `fetch::run` exited via
+    /// `cancel` at shutdown, not via the credential gate) must not spuriously trip safe
+    /// mode.
+    #[tokio::test]
+    async fn a_closed_channel_without_a_report_does_not_cancel() {
+        let (tx, rx) = mpsc::channel::<String>(1);
+        let driver_probe_cancel = CancellationToken::new();
+        let driver_probe_cancel_task = driver_probe_cancel.clone();
+        drop(tx);
+
+        hold_safe_after_credential_violation(
+            rx,
+            "lobby-01".into(),
+            |_| {},
+            driver_probe_cancel_task,
+        )
+        .await;
+
+        assert!(!driver_probe_cancel.is_cancelled());
+    }
+}
+
 /// Pure index-vs-count decision for `display.monitor` (spec §5.2): `requested`
 /// is the configured index, `count` is `available_monitors().len()`. `Some`
 /// is the in-range index to place the window on; `None` means fall back to
@@ -491,6 +584,19 @@ async fn main() {
     // reconnect recovery runs via rule 4 + the periodic poll. Not dead code.
     let refetch = Arc::new(Notify::new());
     let cancel = CancellationToken::new();
+    // SEC-09 (Critical 2 fix): once the reload gate reports a credential-DACL
+    // violation and the kiosk has navigated to `safe.html`, NOTHING may navigate the
+    // webview away from it again — but `probe::run` keeps emitting `LinkChanged` and
+    // `driver::run` keeps turning FSM events into `Navigate`/`ShowVideo` effects
+    // through the same sink, because `AppState::Safe` is entered out-of-band (no
+    // `Event` transitions into it, by design — see `kiosk_core::app::state`) and
+    // neither task was ever told to stop. A CHILD of `cancel` scoped to exactly
+    // `driver`/`probe`/`fetch` (never `idle`/`health`/`heartbeat`, which must keep
+    // running and reporting regardless of safe mode) lets the credential-violation
+    // handler in `.setup()` (below) permanently silence the only two tasks that can
+    // repaint over `safe.html`, without touching the rest of the process. A normal
+    // shutdown still cancels this too, since it is a child of `cancel`.
+    let driver_probe_cancel = cancel.child_token();
     let prober = Prober::new(clock.clone());
     // SEC-09 reload gate: `fetch::run` detects a credential-DACL violation on its
     // own poll cadence but has no window/`AppHandle` yet at the point it's spawned
@@ -499,7 +605,7 @@ async fn main() {
     // `.setup()`-spawned receiver below (which DOES have a `TauriSink`) does the
     // actual `safe.html` navigation — the same navigate path boot uses, not a
     // second mechanism.
-    let (credential_violation_tx, mut credential_violation_rx) = mpsc::channel::<String>(1);
+    let (credential_violation_tx, credential_violation_rx) = mpsc::channel::<String>(1);
 
     // The P1-B logger `Transport` is `reqwest::blocking`, which panics if it is built
     // OR driven inside a tokio runtime (it stands up and drops its own internal
@@ -512,6 +618,24 @@ async fn main() {
     // Credential read/parse was validated by `boot::load`; any later telemetry setup
     // fault degrades to `Telemetry::disabled()` without replacing the visible page.
     let app_version = kiosk_core::app_version().to_string();
+    // SEC-09 boot gate durability (Critical 1 fix): `telemetry::build` is never called
+    // below when `boot_fault_reason` is `credential_permissions` (see the thread
+    // closure), so `telem` resolves to `Telemetry::disabled()` and its later
+    // `config_error` call is a guaranteed no-op — nothing would ever reach disk. Write
+    // the SAME event directly to the local `Spool` here, BEFORE `bootstrap`/`device_id`/
+    // `clock` move into the thread closure: this needs no GCL client and no credential —
+    // exactly what must still work when the credential itself is refused.
+    if let Some(reason) = boot_fault_reason {
+        telemetry::spool_boot_config_error(
+            &data_dir,
+            &bootstrap,
+            &device_id,
+            app_version.clone(),
+            revision,
+            &clock,
+            reason,
+        );
+    }
     let cancel_log = cancel.clone();
     // Published by `telemetry::run` on the logger thread, read by `health::run`
     // (spawned below) — see `telemetry::run`'s doc comment for why this atomic,
@@ -568,14 +692,11 @@ async fn main() {
     install_panic_hook(telem.clone(), panic_hook_data_dir);
     telem.app_start();
     telem.config_applied(revision, &warnings);
-    // SEC-09 boot gate: best-effort — `telem` is `Telemetry::disabled()` in
-    // exactly this scenario (telemetry was never built, see above), so this
-    // is a documented no-op today. Called anyway so the plumbing matches the
-    // reload gate's live `telem.config_error` call and needs no revisiting if
-    // boot telemetry is ever decoupled from the credential it reports on.
-    if let Some(reason) = boot_fault_reason {
-        telem.config_error(reason);
-    }
+    // SEC-09 boot gate: the durable `config.error{credential_permissions}` write
+    // already happened above, directly against the local `Spool`, BEFORE `telem` even
+    // existed (`telem` is always `Telemetry::disabled()` in this exact scenario — see
+    // `spool_boot_config_error`'s call site). No `telem.config_error` call belongs
+    // here: it would be a guaranteed no-op against a disabled handle.
 
     // P1-F1 Task 2: `--safe` must make no remote request — no config fetch, no
     // prober, no remote content navigation. `booted.manager`/`network`/`prober` are
@@ -589,7 +710,7 @@ async fn main() {
             tx.clone(),
             telem.clone(),
             refetch.clone(),
-            cancel.clone(),
+            driver_probe_cancel.clone(),
             nav_policy_fetch,
             credential_path_for_reload,
             credential_violation_tx,
@@ -600,7 +721,7 @@ async fn main() {
             probe_url,
             tx.clone(),
             telem.clone(),
-            cancel.clone(),
+            driver_probe_cancel.clone(),
         ));
     }
     // P1-D2c Task 3: emits `IdleExpired` UNCONDITIONALLY — the FSM (rule 9) already
@@ -661,6 +782,7 @@ async fn main() {
     let refetch_setup = refetch.clone();
     let telem_setup = telem.clone();
     let cancel_setup = cancel.clone();
+    let driver_probe_cancel_setup = driver_probe_cancel.clone();
     let nav_policy_setup = nav_policy.clone();
     let exit_gesture_setup = exit_gesture.clone();
     let ready_setup = ready.clone();
@@ -837,17 +959,13 @@ async fn main() {
                 // never a second mechanism. One-shot: once tripped there is nothing
                 // left to watch for (`fetch::run` has already stopped polling).
                 let credential_violation_sink = sink.clone();
-                tokio::spawn(async move {
-                    if let Some(message) = credential_violation_rx.recv().await {
-                        let url = format!(
-                            "{}?device={}&err={}",
-                            bundled_url("safe.html"),
-                            url_encode(&device_id_for_reload),
-                            url_encode(&message),
-                        );
-                        credential_violation_sink.navigate(&url);
-                    }
-                });
+                let driver_probe_cancel_violation = driver_probe_cancel_setup.clone();
+                tokio::spawn(hold_safe_after_credential_violation(
+                    credential_violation_rx,
+                    device_id_for_reload,
+                    move |url| credential_violation_sink.navigate(url),
+                    driver_probe_cancel_violation,
+                ));
 
                 // P1-F1 Task 3: nightly-reload timer. Fires `IdleExpired` INTO the FSM
                 // rather than navigating the webview directly, so the reload obeys the
@@ -881,7 +999,7 @@ async fn main() {
                         machine: Machine::new(machine_cfg),
                     },
                     Box::new(sink),
-                    cancel_setup.clone(),
+                    driver_probe_cancel_setup.clone(),
                 ));
 
                 let tx_first = tx_setup.clone();
