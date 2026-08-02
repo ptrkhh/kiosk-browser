@@ -15,6 +15,7 @@ use kiosk_core::config::signature::VerifyingKey;
 use kiosk_core::config::store::ConfigStore;
 use kiosk_core::config::ConfigManager;
 use kiosk_core::error::ConfigError;
+use kiosk_core::logging::auth::ServiceAccount;
 
 /// Map the effective remote `content` onto the FSM's static config (spec §3.3).
 pub fn machine_config(content: &Content) -> MachineConfig {
@@ -44,6 +45,22 @@ pub struct Booted {
     pub machine_cfg: MachineConfig,
     pub first_event: AppEvent,
     pub warnings: Vec<String>,
+}
+
+/// Config/credential load decision. Faults carry a default-backed boot so the normal
+/// hardened window and safe-page path can still run without remote work.
+pub enum BootOutcome {
+    Ready(Booted),
+    RenderSafe { booted: Booted, error: String },
+}
+
+impl BootOutcome {
+    pub fn into_parts(self) -> (Booted, Option<String>) {
+        match self {
+            Self::Ready(booted) => (booted, None),
+            Self::RenderSafe { booted, error } => (booted, Some(error)),
+        }
+    }
 }
 
 /// The compiled-in Ed25519 verifying key (spec §8). `None` when no key was baked in at
@@ -77,6 +94,63 @@ pub fn boot(ini_text: &str, data_dir: &Path) -> Result<Booted, ConfigError> {
     })
 }
 
+/// Load boot config and credential without letting either fault abort the process.
+pub fn load(ini_path: &Path, data_dir: &Path, machine_id: Option<&str>) -> BootOutcome {
+    let loaded = std::fs::read_to_string(ini_path)
+        .map_err(|e| format!("kiosk-main: cannot read {} ({e})", ini_path.display()))
+        .and_then(|text| {
+            boot(&text, data_dir).map_err(|e| {
+                format!(
+                    "kiosk-main: {} is not a valid kiosk.ini: {e}",
+                    ini_path.display()
+                )
+            })
+        });
+
+    let booted = match loaded {
+        Ok(booted) => booted,
+        Err(error) => {
+            return BootOutcome::RenderSafe {
+                booted: safe_boot(data_dir, machine_id),
+                error,
+            }
+        }
+    };
+
+    let credential_path = ini_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(&booted.manager.bootstrap().credential);
+    let credential = std::fs::read_to_string(&credential_path)
+        .map_err(|e| format!("cannot read {} ({e})", credential_path.display()))
+        .and_then(|json| {
+            ServiceAccount::from_json(&json)
+                .map(|_| ())
+                .map_err(|e| format!("cannot parse {} ({e})", credential_path.display()))
+        });
+
+    match credential {
+        Ok(()) => BootOutcome::Ready(booted),
+        Err(error) => BootOutcome::RenderSafe {
+            booted,
+            error: format!("kiosk-main: {error}"),
+        },
+    }
+}
+
+fn safe_boot(data_dir: &Path, machine_id: Option<&str>) -> Booted {
+    let device_id = machine_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty() && !id.chars().any(|c| matches!(c, '\r' | '\n')))
+        .unwrap_or("unknown");
+    let ini = format!(
+        "[kiosk]\nconfig_url = https://invalid/\ndevice_id = {device_id}\nsite = safe\nproject_id = safe\ncredential = missing\n\n[bootstrap]\nurl = {APP_SAFE_URL}\n"
+    );
+    boot(&ini, data_dir).expect("built-in safe config is valid")
+}
+
+const APP_SAFE_URL: &str = "http://tauri.localhost/safe.html";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,6 +163,20 @@ mod tests {
             error_max_retries: retries,
             clear_data_on_reset: clear,
             ..Content::default()
+        }
+    }
+
+    fn valid_ini() -> &'static str {
+        "[kiosk]\nconfig_url = https://cfg.test/c.json\ndevice_id = test-device\nsite = s\nproject_id = p\ncredential = cred.json\n\n[bootstrap]\nurl = https://site.test/\n"
+    }
+
+    fn assert_render_safe(outcome: BootOutcome, error_fragment: &str) {
+        match outcome {
+            BootOutcome::RenderSafe { error, .. } => assert!(
+                error.contains(error_fragment),
+                "expected {error_fragment:?} in {error:?}"
+            ),
+            BootOutcome::Ready(_) => panic!("load fault must render safe"),
         }
     }
 
@@ -136,5 +224,46 @@ mod tests {
             AppEvent::ConfigApplied { url } => assert_eq!(url, "https://site.test/"),
             other => panic!("expected ConfigApplied, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn corrupt_config_load_returns_render_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini_path = dir.path().join("kiosk.ini");
+        std::fs::write(&ini_path, "not ini").unwrap();
+
+        match load(&ini_path, dir.path(), Some("machine-01")) {
+            BootOutcome::RenderSafe { booted, error } => {
+                assert_eq!(booted.manager.device_id(), "machine-01");
+                assert!(error.contains("not a valid kiosk.ini"));
+            }
+            BootOutcome::Ready(_) => panic!("config fault must render safe"),
+        }
+    }
+
+    #[test]
+    fn missing_config_load_returns_render_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_render_safe(
+            load(&dir.path().join("kiosk.ini"), dir.path(), None),
+            "cannot read",
+        );
+    }
+
+    #[test]
+    fn missing_credential_load_returns_render_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini_path = dir.path().join("kiosk.ini");
+        std::fs::write(&ini_path, valid_ini()).unwrap();
+        assert_render_safe(load(&ini_path, dir.path(), None), "cannot read");
+    }
+
+    #[test]
+    fn malformed_credential_load_returns_render_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini_path = dir.path().join("kiosk.ini");
+        std::fs::write(&ini_path, valid_ini()).unwrap();
+        std::fs::write(dir.path().join("cred.json"), "{}").unwrap();
+        assert_render_safe(load(&ini_path, dir.path(), None), "cannot parse");
     }
 }

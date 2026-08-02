@@ -92,7 +92,7 @@ mod url_encode_tests {
     }
 
     /// The 500-char cap the `--safe` path puts on `crash-panic.txt` before encoding
-    /// (main.rs `setup`). Guards the two ways that cap could break `safe.html`:
+    /// before building its diagnostic URL. Guards the two ways that cap could break `safe.html`:
     /// a cut landing mid-UTF-8 (byte slicing would panic / emit an undecodable
     /// %-sequence — `.chars()` cannot), and unbounded 3x encode expansion.
     #[test]
@@ -164,6 +164,45 @@ fn resolve_data_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join("kiosk")
+}
+
+#[cfg(windows)]
+fn machine_id() -> Option<String> {
+    use windows::core::w;
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+
+    let mut bytes = 0;
+    // Safety: fixed registry paths; first call sizes the buffer, second writes only that size.
+    unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            w!("SOFTWARE\\Microsoft\\Cryptography"),
+            w!("MachineGuid"),
+            RRF_RT_REG_SZ,
+            None,
+            None,
+            Some(&mut bytes),
+        )
+        .ok()?;
+        let mut value = vec![0u16; bytes as usize / 2];
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            w!("SOFTWARE\\Microsoft\\Cryptography"),
+            w!("MachineGuid"),
+            RRF_RT_REG_SZ,
+            None,
+            Some(value.as_mut_ptr().cast()),
+            Some(&mut bytes),
+        )
+        .ok()?;
+        value.truncate(value.iter().position(|&c| c == 0).unwrap_or(value.len()));
+        String::from_utf16(&value).ok()
+    }
+}
+
+#[cfg(not(windows))]
+fn machine_id() -> Option<String> {
+    None
 }
 
 /// File-only breadcrumb, installed before telemetry exists (see call site in `main`).
@@ -328,11 +367,7 @@ async fn main() {
     let args = cli::Args::parse(std::env::args());
     let config_dir = resolve_config_dir(args.config.as_deref());
 
-    // P1-D2e final-review Fix A: `data_dir` is pure/CLI-independent (spec §4), so it can
-    // be resolved before the two panic sites below (bad `--config` path / malformed
-    // `kiosk.ini`) rather than after them. Installing a file-only breadcrumb hook this
-    // early means BOTH panics still leave `crash-panic.txt` for the P1-E launcher —
-    // telemetry doesn't exist yet at this point, so there is nothing to send it to.
+    // `data_dir` is pure/CLI-independent (spec §4), so resolve it before config load.
     let data_dir = resolve_data_dir();
     // Best-effort: %ProgramData%\kiosk\ isn't created until spool.rs/store.rs run
     // later, both after the two early panic sites below. Without this, File::create
@@ -340,43 +375,45 @@ async fn main() {
     let _ = std::fs::create_dir_all(&data_dir);
     install_panic_hook_file_only(data_dir.clone());
 
-    // P1-F1 Task 2: safe mode's last-error breadcrumb, read now (before this run's own
-    // panic hook could ever overwrite it) — `Err` (missing file, first-ever boot) reads
-    // as "unknown" at render time. Read only when `--safe` needs it: the common non-safe
-    // boot never touches this file.
-    let last_error = args.safe.then(|| data_dir.join("crash-panic.txt"));
-
-    // KNOWN LIMITATION (P1-F1, to fix in P1-F2): safe mode does NOT cover config
-    // faults. Both panic sites below run on the `--safe` path too, so a device with
-    // an unreadable or invalid `kiosk.ini` (or a bad credential) crash-loops:
-    // escalate to `--safe` → panic here → `SAFE_FAIL_LIMIT` → `safe_mode_failed`,
-    // and the operator gets a 60 s black-screen loop with no safe page at all.
-    // P1-F2 owns rendering `safe.html` BEFORE config is parsed.
     let ini_path = config_dir.join("kiosk.ini");
-    let ini_text = std::fs::read_to_string(&ini_path).unwrap_or_else(|e| {
-        panic!(
-            "kiosk-main: cannot read {} ({e}); pass --config <dir> in dev",
-            ini_path.display()
-        )
-    });
-
-    let booted = boot::boot(&ini_text, &data_dir).unwrap_or_else(|e| {
-        panic!(
-            "kiosk-main: {} is not a valid kiosk.ini: {e}",
-            ini_path.display()
-        )
+    let machine_id = machine_id();
+    let (booted, config_error) =
+        boot::load(&ini_path, &data_dir, machine_id.as_deref()).into_parts();
+    let safe = args.safe || config_error.is_some();
+    // Config faults win over an older crash breadcrumb. Missing breadcrumb degrades to
+    // "unknown"; neither case can abort the safe renderer.
+    let safe_error = config_error.or_else(|| {
+        args.safe.then(|| {
+            std::fs::read_to_string(data_dir.join("crash-panic.txt"))
+                .unwrap_or_else(|_| "unknown".to_string())
+        })
     });
 
     // ---- Extract-before-move: every field this main needs from `booted.manager` is
     // read out HERE, before `booted.manager` moves into `fetch::run` below. ----
     let bootstrap = booted.manager.bootstrap().clone();
     let device_id = booted.manager.device_id().to_string();
-    // `device_id` itself is moved into the telemetry thread's closure below; safe
-    // mode needs its own copy to put in the safe.html query string, read much later
-    // in `.setup()`.
-    let device_id_safe = device_id.clone();
+    // Build once, before `device_id` moves into telemetry. Recovery uses this same
+    // diagnostic URL, never the configured remote home, while safe mode is active.
+    let safe_url = safe.then(|| {
+        // Cap before encoding: percent expansion cannot create an unusably long URL.
+        let error: String = safe_error
+            .as_deref()
+            .unwrap_or("unknown")
+            .chars()
+            .take(500)
+            .collect();
+        format!(
+            "{}?device={}&err={}",
+            bundled_url("safe.html"),
+            url_encode(&device_id),
+            url_encode(&error),
+        )
+    });
     let revision = booted.manager.revision();
-    let home_url = booted.manager.home_url();
+    let home_url = safe_url
+        .clone()
+        .unwrap_or_else(|| booted.manager.home_url());
     let network = booted.manager.current().network.clone();
     // P1-D2b Task 6: read once, at boot, for the document-start injection + zoom lock.
     // These are baked into the webview at BUILD time (`initialization_script`/
@@ -420,10 +457,12 @@ async fn main() {
     // the very first navigation is already judged by it. `fetch::run` (below) stores a
     // fresh one on every successful config apply; the guard install (Task 2) reads it
     // lock-free via `nav_policy.load()`.
-    let nav_policy: SharedNavPolicy = Arc::new(ArcSwap::from_pointee(NavPolicy::from_config(
-        &booted.manager.current().content,
-        &home_url,
-    )));
+    let policy = if safe {
+        NavPolicy::from_config(&kiosk_core::config::schema::Content::default(), &home_url)
+    } else {
+        NavPolicy::from_config(&booted.manager.current().content, &home_url)
+    };
+    let nav_policy: SharedNavPolicy = Arc::new(ArcSwap::from_pointee(policy));
     let nav_policy_fetch = nav_policy.clone();
 
     // TEL-01: ONE clock, cloned into both the logger stack and the prober. Two
@@ -449,11 +488,8 @@ async fn main() {
     // `std::sync::mpsc` channel. The thread hands the `Telemetry` handle back for the
     // async tasks to clone.
     //
-    // A telemetry-init failure (missing/malformed kiosk-credential.json) must NOT stop
-    // the kiosk from showing content — the whole point of the device is the screen. On
-    // error we log to stderr and run WITHOUT telemetry: `Telemetry::disabled()` is a
-    // handle whose every helper silently no-ops, so every clone handed to
-    // fetch/probe/driver/TauriSink/nav keeps working unchanged.
+    // Credential read/parse was validated by `boot::load`; any later telemetry setup
+    // fault degrades to `Telemetry::disabled()` without replacing the visible page.
     let app_version = kiosk_core::app_version().to_string();
     let cancel_log = cancel.clone();
     // Published by `telemetry::run` on the logger thread, read by `health::run`
@@ -507,7 +543,7 @@ async fn main() {
     // prober, no remote content navigation. `booted.manager`/`network`/`prober` are
     // simply left unmoved and drop here; everything `.setup()` needs from them was
     // already extracted above.
-    if !args.safe {
+    if !safe {
         tokio::spawn(fetch::run(
             booted.manager, // MOVES — every field needed above was extracted first.
             config_url,
@@ -581,7 +617,6 @@ async fn main() {
     }
 
     let windowed = args.windowed;
-    let safe = args.safe;
     let tx_setup = tx.clone();
     let refetch_setup = refetch.clone();
     let telem_setup = telem.clone();
@@ -748,30 +783,11 @@ async fn main() {
 
             // P1-F1 Task 2: `--safe` never drives the FSM (`AppState::Safe` has no
             // `Event` transitions in) or spawns the remote-content driver — it just
-            // renders the bundled safe page once, directly, with the device id +
-            // last crash breadcrumb. Must never fail to render: a missing/unreadable
-            // `crash-panic.txt` degrades to "unknown", never a panic or a blank
-            // screen.
-            if safe {
-                // Capped at 500 chars BEFORE encoding: percent-encoding expands up to
-                // 3x, and a multi-hundred-KB panic Display would make a URL WebView2
-                // refuses outright — i.e. safe.html renders NOTHING, defeating the one
-                // invariant this page has. `.chars()` (not byte slicing) so the cut
-                // never lands mid-UTF-8 and produces an undecodable %-sequence.
-                let last_error_text: String = last_error
-                    .as_deref()
-                    .and_then(|p| std::fs::read_to_string(p).ok())
-                    .unwrap_or_else(|| "unknown".to_string())
-                    .chars()
-                    .take(500)
-                    .collect();
-                let safe_url = format!(
-                    "{}?device={}&err={}",
-                    bundled_url("safe.html"),
-                    url_encode(&device_id_safe),
-                    url_encode(&last_error_text),
-                );
-                sink.navigate(&safe_url);
+            // renders the bundled safe page once, directly, with the device id plus
+            // config fault or last crash breadcrumb. Missing detail degrades to
+            // "unknown", never a panic or blank screen.
+            if let Some(safe_url) = safe_url.as_deref() {
+                sink.navigate(safe_url);
             } else {
                 // P1-F1 Task 3: nightly-reload timer. Fires `IdleExpired` INTO the FSM
                 // rather than navigating the webview directly, so the reload obeys the
