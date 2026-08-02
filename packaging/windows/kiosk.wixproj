@@ -6,6 +6,7 @@
     <DefineConstants>ProductVersion=$(ProductVersion);RepoRoot=$(MSBuildThisFileDirectory)..\..</DefineConstants>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Remove="bundle.wxs" />
     <PackageReference Include="WixToolset.Util.wixext" Version="5.0.2" />
   </ItemGroup>
 </Project>

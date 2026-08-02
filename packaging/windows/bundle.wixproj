@@ -1,0 +1,27 @@
+<Project Sdk="WixToolset.Sdk/5.0.2">
+  <PropertyGroup>
+    <InstallerPlatform>x64</InstallerPlatform>
+    <ProductVersion>0.1.0</ProductVersion>
+    <OutputName>kiosk-setup-$(ProductVersion)</OutputName>
+    <WebView2InstallerPath Condition="'$(WebView2InstallerPath)' == ''">$(IntermediateOutputPath)MicrosoftEdgeWebview2Setup.exe</WebView2InstallerPath>
+    <DefineConstants>ProductVersion=$(ProductVersion);MsiPath=$(MSBuildThisFileDirectory)bin\$(Configuration)\kiosk-$(ProductVersion).msi;WebView2InstallerPath=$(WebView2InstallerPath)</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Remove="kiosk.wxs" />
+    <ProjectReference Include="kiosk.wixproj" ReferenceOutputAssembly="false" />
+    <PackageReference Include="WixToolset.Bal.wixext" Version="5.0.2" />
+    <PackageReference Include="WixToolset.Util.wixext" Version="5.0.2" />
+  </ItemGroup>
+  <Target Name="DownloadWebView2Bootstrapper"
+          BeforeTargets="CoreCompile"
+          Condition="!Exists('$(WebView2InstallerPath)')">
+    <DownloadFile SourceUrl="https://go.microsoft.com/fwlink/p/?LinkId=2124703"
+                  DestinationFolder="$([System.IO.Path]::GetDirectoryName('$(WebView2InstallerPath)'))"
+                  DestinationFileName="$([System.IO.Path]::GetFileName('$(WebView2InstallerPath)'))" />
+  </Target>
+  <Target Name="VerifyWebView2Installer"
+          BeforeTargets="CoreCompile"
+          DependsOnTargets="DownloadWebView2Bootstrapper">
+    <Exec Command="powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;$(MSBuildThisFileDirectory)verify-webview2.ps1&quot; -Path &quot;$(WebView2InstallerPath)&quot;" />
+  </Target>
+</Project>

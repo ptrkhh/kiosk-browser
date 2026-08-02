@@ -1,0 +1,37 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Bundle Name="Kiosk Browser Setup"
+          Manufacturer="ptrkhh"
+          Version="$(var.ProductVersion)"
+          UpgradeCode="{AB70A2C8-A55A-4B0D-9172-FD9826E1F01A}"
+          Condition="VersionNT64"
+          Compressed="yes">
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication Theme="hyperlinkLicense" LicenseUrl="" />
+    </BootstrapperApplication>
+
+    <Variable Name="KIOSK_ACCOUNT" Type="string" Value="" bal:Overridable="yes" />
+
+    <util:RegistrySearch Id="WebView2RuntimeSearch"
+                         Variable="WebView2Version"
+                         Root="HKLM"
+                         Key="SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+                         Value="pv"
+                         Result="value"
+                         Bitness="always64" />
+
+    <Chain>
+      <ExePackage Id="WebView2Evergreen"
+                  SourceFile="$(var.WebView2InstallerPath)"
+                  InstallArguments="/silent /install"
+                  DetectCondition="WebView2Version AND WebView2Version &lt;&gt; &quot;0.0.0.0&quot;"
+                  PerMachine="yes"
+                  Permanent="yes"
+                  Vital="yes" />
+      <MsiPackage Id="KioskMsi" SourceFile="$(var.MsiPath)" Vital="yes">
+        <MsiProperty Name="KIOSK_ACCOUNT" Value="[KIOSK_ACCOUNT]" Condition="KIOSK_ACCOUNT" />
+      </MsiPackage>
+    </Chain>
+  </Bundle>
+</Wix>

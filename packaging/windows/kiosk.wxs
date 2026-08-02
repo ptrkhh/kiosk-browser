@@ -5,15 +5,25 @@
            Version="$(var.ProductVersion)"
            UpgradeCode="{74855634-8D61-4CFA-8FE1-A71BFCCC7A4D}"
            Scope="perMachine">
-    <MajorUpgrade DowngradeErrorMessage="A newer version of Kiosk Browser is already installed." />
+    <MajorUpgrade Schedule="afterInstallInitialize"
+                  DowngradeErrorMessage="A newer version of Kiosk Browser is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
     <Property Id="KIOSK_ACCOUNT" Secure="yes" />
+    <Property Id="INSTALLED_KIOSK_ACCOUNT">
+      <RegistrySearch Id="KioskAccountSearch"
+                      Root="HKLM"
+                      Key="Software\ptrkhh\Kiosk Browser"
+                      Name="KioskAccount"
+                      Type="raw"
+                      Bitness="always64" />
+    </Property>
     <SetProperty Id="KIOSK_ACCOUNT"
-                 Value="[LogonUser]"
-                 Before="CostFinalize"
+                 Value="[INSTALLED_KIOSK_ACCOUNT]"
+                 After="AppSearch"
                  Sequence="both"
-                 Condition="NOT KIOSK_ACCOUNT" />
+                 Condition="NOT KIOSK_ACCOUNT AND INSTALLED_KIOSK_ACCOUNT" />
+    <Launch Condition="Installed OR KIOSK_ACCOUNT" Message="KIOSK_ACCOUNT must name an existing enabled local non-administrator account." />
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="kiosk">
@@ -22,6 +32,20 @@
         </Component>
         <Component Id="LauncherExecutable" Guid="*">
           <File Id="LauncherExecutableFile" Source="$(var.RepoRoot)\target\release\kiosk-launcher.exe" KeyPath="yes" />
+        </Component>
+        <Component Id="ScheduledTaskDefinition" Guid="*">
+          <File Id="ScheduledTaskXmlFile" Source="$(var.RepoRoot)\packaging\windows\KioskLauncher.xml" KeyPath="yes" />
+        </Component>
+        <Component Id="ScheduledTaskHelper" Guid="*">
+          <File Id="ScheduledTaskHelperFile" Source="$(var.RepoRoot)\packaging\windows\install-task.ps1" KeyPath="yes" />
+        </Component>
+        <Component Id="KioskAccountRegistration" Guid="*">
+          <RegistryValue Root="HKLM"
+                         Key="Software\ptrkhh\Kiosk Browser"
+                         Name="KioskAccount"
+                         Type="string"
+                         Value="[KIOSK_ACCOUNT]"
+                         KeyPath="yes" />
         </Component>
         <Component Id="OfflineHtml" Guid="*">
           <File Id="OfflineHtmlFile" Source="$(var.RepoRoot)\crates\kiosk-main\bundled\offline.html" KeyPath="yes" />
@@ -73,6 +97,9 @@
     <Feature Id="Complete" Title="Kiosk Browser" Level="1">
       <ComponentRef Id="MainExecutable" />
       <ComponentRef Id="LauncherExecutable" />
+      <ComponentRef Id="ScheduledTaskDefinition" />
+      <ComponentRef Id="ScheduledTaskHelper" />
+      <ComponentRef Id="KioskAccountRegistration" />
       <ComponentRef Id="OfflineHtml" />
       <ComponentRef Id="SplashHtml" />
       <ComponentRef Id="ErrorHtml" />
@@ -83,5 +110,58 @@
       <ComponentRef Id="Credential" />
       <ComponentRef Id="KioskDataDirectory" />
     </Feature>
+
+    <SetProperty Id="RollbackKioskTaskInstall"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[#ScheduledTaskHelperFile]&quot; -Action Rollback"
+                 Before="RollbackKioskTaskInstall"
+                 Sequence="execute"
+                 Condition="NOT REMOVE~=&quot;ALL&quot;" />
+    <SetProperty Id="PrepareKioskTaskInstall"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[#ScheduledTaskHelperFile]&quot; -Action Prepare -ValidateAccount -Account &quot;[KIOSK_ACCOUNT]&quot;"
+                 Before="PrepareKioskTaskInstall"
+                 Sequence="execute"
+                 Condition="NOT REMOVE~=&quot;ALL&quot;" />
+    <SetProperty Id="RollbackKioskTaskUninstall"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[#ScheduledTaskHelperFile]&quot; -Action Rollback"
+                 Before="RollbackKioskTaskUninstall"
+                 Sequence="execute"
+                 Condition="REMOVE~=&quot;ALL&quot;" />
+    <SetProperty Id="PrepareKioskTaskUninstall"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[#ScheduledTaskHelperFile]&quot; -Action Prepare"
+                 Before="PrepareKioskTaskUninstall"
+                 Sequence="execute"
+                 Condition="REMOVE~=&quot;ALL&quot;" />
+    <SetProperty Id="RegisterKioskTask"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[#ScheduledTaskHelperFile]&quot; -Action Install -Account &quot;[KIOSK_ACCOUNT]&quot; -LauncherPath &quot;[#LauncherExecutableFile]&quot; -TemplatePath &quot;[#ScheduledTaskXmlFile]&quot;"
+                 Before="RegisterKioskTask"
+                 Sequence="execute"
+                 Condition="NOT REMOVE~=&quot;ALL&quot;" />
+    <SetProperty Id="UnregisterKioskTask"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[#ScheduledTaskHelperFile]&quot; -Action Uninstall"
+                 Before="UnregisterKioskTask"
+                 Sequence="execute"
+                 Condition="REMOVE~=&quot;ALL&quot;" />
+    <SetProperty Id="CommitKioskTask"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command &quot;Remove-Item -LiteralPath (Join-Path $env:ProgramData 'kiosk\.installer-task') -Recurse -Force -ErrorAction SilentlyContinue&quot;"
+                 Before="CommitKioskTask"
+                 Sequence="execute" />
+
+    <CustomAction Id="RollbackKioskTaskInstall" Directory="System64Folder" ExeCommand="[CustomActionData]" Execute="rollback" Impersonate="no" Return="ignore" />
+    <CustomAction Id="PrepareKioskTaskInstall" Directory="System64Folder" ExeCommand="[CustomActionData]" Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="RollbackKioskTaskUninstall" Directory="System64Folder" ExeCommand="[CustomActionData]" Execute="rollback" Impersonate="no" Return="ignore" />
+    <CustomAction Id="PrepareKioskTaskUninstall" Directory="System64Folder" ExeCommand="[CustomActionData]" Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="RegisterKioskTask" Directory="System64Folder" ExeCommand="[CustomActionData]" Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="UnregisterKioskTask" Directory="System64Folder" ExeCommand="[CustomActionData]" Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="CommitKioskTask" Directory="System64Folder" ExeCommand="[CustomActionData]" Execute="commit" Impersonate="no" Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="RollbackKioskTaskInstall" Before="PrepareKioskTaskInstall" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="PrepareKioskTaskInstall" Before="Wix4SchedSecureObjects_X64" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="RegisterKioskTask" After="PrepareKioskTaskInstall" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="RollbackKioskTaskUninstall" Before="PrepareKioskTaskUninstall" Condition="REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="PrepareKioskTaskUninstall" Before="UnregisterKioskTask" Condition="REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="UnregisterKioskTask" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="CommitKioskTask" After="UnregisterKioskTask" />
+    </InstallExecuteSequence>
   </Package>
 </Wix>
