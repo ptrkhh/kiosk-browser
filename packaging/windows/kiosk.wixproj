@@ -1,0 +1,11 @@
+<Project Sdk="WixToolset.Sdk/5.0.2">
+  <PropertyGroup>
+    <InstallerPlatform>x64</InstallerPlatform>
+    <ProductVersion>0.1.0</ProductVersion>
+    <OutputName>kiosk-$(ProductVersion)</OutputName>
+    <DefineConstants>ProductVersion=$(ProductVersion);RepoRoot=$(MSBuildThisFileDirectory)..\..</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="WixToolset.Util.wixext" Version="5.0.2" />
+  </ItemGroup>
+</Project>

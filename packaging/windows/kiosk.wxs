@@ -1,0 +1,87 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package Name="Kiosk Browser"
+           Manufacturer="ptrkhh"
+           Version="$(var.ProductVersion)"
+           UpgradeCode="{74855634-8D61-4CFA-8FE1-A71BFCCC7A4D}"
+           Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Kiosk Browser is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Property Id="KIOSK_ACCOUNT" Secure="yes" />
+    <SetProperty Id="KIOSK_ACCOUNT"
+                 Value="[LogonUser]"
+                 Before="CostFinalize"
+                 Sequence="both"
+                 Condition="NOT KIOSK_ACCOUNT" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="kiosk">
+        <Component Id="MainExecutable" Guid="*">
+          <File Id="MainExecutableFile" Source="$(var.RepoRoot)\target\release\kiosk-main.exe" KeyPath="yes" />
+        </Component>
+        <Component Id="LauncherExecutable" Guid="*">
+          <File Id="LauncherExecutableFile" Source="$(var.RepoRoot)\target\release\kiosk-launcher.exe" KeyPath="yes" />
+        </Component>
+        <Component Id="OfflineHtml" Guid="*">
+          <File Id="OfflineHtmlFile" Source="$(var.RepoRoot)\crates\kiosk-main\bundled\offline.html" KeyPath="yes" />
+        </Component>
+        <Component Id="SplashHtml" Guid="*">
+          <File Id="SplashHtmlFile" Source="$(var.RepoRoot)\crates\kiosk-main\bundled\splash.html" KeyPath="yes" />
+        </Component>
+        <Component Id="ErrorHtml" Guid="*">
+          <File Id="ErrorHtmlFile" Source="$(var.RepoRoot)\crates\kiosk-main\bundled\error.html" KeyPath="yes" />
+        </Component>
+        <Component Id="PinpadHtml" Guid="*">
+          <File Id="PinpadHtmlFile" Source="$(var.RepoRoot)\crates\kiosk-main\bundled\pinpad.html" KeyPath="yes" />
+        </Component>
+        <Component Id="SafeHtml" Guid="*">
+          <File Id="SafeHtmlFile" Source="$(var.RepoRoot)\crates\kiosk-main\bundled\safe.html" KeyPath="yes" />
+        </Component>
+        <Component Id="OfflineVideo" Guid="*">
+          <File Id="OfflineVideoFile" Source="$(var.RepoRoot)\dist-template\kiosk-offline.mp4" KeyPath="yes" />
+        </Component>
+        <Component Id="BootstrapConfig" Guid="*" Permanent="yes" NeverOverwrite="yes">
+          <File Id="BootstrapConfigFile" Source="$(var.RepoRoot)\dist-template\kiosk.ini" KeyPath="yes" />
+        </Component>
+        <Component Id="Credential" Guid="*" Permanent="yes" NeverOverwrite="yes">
+          <File Id="CredentialFile" Source="$(var.RepoRoot)\dist-template\kiosk-credential.json" KeyPath="yes">
+            <PermissionEx Id="CredentialProtectedDacl" Sddl="D:P(A;;FA;;;SY)" />
+            <util:PermissionEx User="[KIOSK_ACCOUNT]"
+                               Read="yes"
+                               ReadAttributes="yes"
+                               ReadExtendedAttributes="yes"
+                               ReadPermission="yes"
+                               Synchronize="yes"
+                               Inheritable="no" />
+          </File>
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="KioskDataFolder" Name="kiosk">
+        <Component Id="KioskDataDirectory" Guid="{25F0611A-8734-4EDB-918D-91C75065B4D4}" KeyPath="yes" Permanent="yes">
+          <CreateFolder>
+            <PermissionEx Id="DataProtectedDacl" Sddl="D:P(A;OICI;FA;;;SY)" />
+            <util:PermissionEx User="[KIOSK_ACCOUNT]" GenericAll="yes" Inheritable="yes" />
+          </CreateFolder>
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Complete" Title="Kiosk Browser" Level="1">
+      <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="LauncherExecutable" />
+      <ComponentRef Id="OfflineHtml" />
+      <ComponentRef Id="SplashHtml" />
+      <ComponentRef Id="ErrorHtml" />
+      <ComponentRef Id="PinpadHtml" />
+      <ComponentRef Id="SafeHtml" />
+      <ComponentRef Id="OfflineVideo" />
+      <ComponentRef Id="BootstrapConfig" />
+      <ComponentRef Id="Credential" />
+      <ComponentRef Id="KioskDataDirectory" />
+    </Feature>
+  </Package>
+</Wix>
