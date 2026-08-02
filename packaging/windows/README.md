@@ -61,3 +61,35 @@ Get-ItemProperty 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017
 ```
 
 Confirm logon trigger, kiosk account, `Run Level: Limited`, launcher path, no `RestartOnFailure`, then log on as the kiosk account and confirm launcher starts `kiosk-main`. Uninstall and confirm `schtasks /Query /TN KioskLauncher` returns not found. No VM result is recorded from this development host.
+
+## Authenticode signing
+
+Production release order matters because Burn embeds the MSI:
+
+```powershell
+# 1. Build and sign PE binaries.
+cargo build --release -p kiosk-main -p kiosk-launcher
+$env:KIOSK_SIGNING_PFX_PASSWORD = '<from your CI secret store>'
+.\packaging\windows\sign.ps1 -Stage Binaries `
+  -Path target\release\kiosk-main.exe,target\release\kiosk-launcher.exe `
+  -PfxPath C:\release-inputs\codesign.pfx -TimestampUrl https://timestamp.digicert.com
+
+# 2. Build and sign the MSI.
+dotnet build packaging\windows\kiosk.wixproj -c Release -p:ProductVersion=1.2.3
+.\packaging\windows\sign.ps1 -Stage Installers `
+  -Path packaging\windows\bin\Release\kiosk-1.2.3.msi `
+  -NewerThan target\release\kiosk-main.exe,target\release\kiosk-launcher.exe `
+  -PfxPath C:\release-inputs\codesign.pfx -TimestampUrl https://timestamp.digicert.com
+
+# 3. Build the bundle from the signed MSI, then sign the bundle.
+dotnet build packaging\windows\bundle.wixproj --no-dependencies -c Release -p:ProductVersion=1.2.3
+.\packaging\windows\sign.ps1 -Stage Installers `
+  -Path packaging\windows\bin\Release\kiosk-setup-1.2.3.exe `
+  -NewerThan packaging\windows\bin\Release\kiosk-1.2.3.msi `
+  -PfxPath C:\release-inputs\codesign.pfx -TimestampUrl https://timestamp.digicert.com
+Remove-Item Env:KIOSK_SIGNING_PFX_PASSWORD
+```
+
+`-Path` is explicit; `-NewerThan` rejects an installer older than its inputs, avoiding silent signing of an old glob match. For a certificate already installed with its private key, replace `-PfxPath ...` with `-Thumbprint <40-hex-thumbprint>`; Current User and Local Machine personal stores are searched. The PFX password comes only from the named environment variable (override with `-PfxPasswordEnvironmentVariable`), keeping it out of shell history and native process arguments. PFX mode preflights one code-signing leaf, then imports it into Current User's personal store and signs by thumbprint. A pre-installed same-thumbprint certificate with a private key is reused without importing; one without a private key fails before import. Certificates newly imported by the invocation are removed afterward, including their private keys; pre-installed certificates are never removed. Clear the environment variable after signing.
+
+Every signature is immediately checked with `signtool verify /pa /all`. The script fails on a missing certificate, target, Windows SDK `signtool.exe`, signing error, or verification error. A real certificate is operator/CI-supplied and never committed.

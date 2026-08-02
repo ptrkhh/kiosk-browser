@@ -28,6 +28,8 @@ cargo test --workspace
 Lint gates (CI + before every commit): `cargo fmt --check`,
 `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
 
+Release CI must sign `kiosk-main.exe` and `kiosk-launcher.exe`, build and sign the MSI, then build the Burn bundle from that signed MSI and sign the bundle. Use [`packaging/windows/sign.ps1`](packaging/windows/sign.ps1); store the PFX and its password as protected CI secrets, never repository files or command-line literals. The current CI workflow builds unsigned test artifacts only; unsigned releases must fail the release gate because SmartScreen and enterprise GPO can block them (spec §9). Full commands are in [`packaging/windows/README.md`](packaging/windows/README.md#authenticode-signing).
+
 **Windows deployment target: x64 (Intel/AMD, `x86_64-pc-windows-msvc`) only** — aarch64
 Windows is not a target. The section below is a build tip for developers whose *workstation*
 is ARM64; the output is still an x64 binary.
