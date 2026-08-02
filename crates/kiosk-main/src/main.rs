@@ -3,6 +3,7 @@
 mod boot;
 mod clear;
 mod cli;
+mod credential_acl;
 mod driver;
 mod effect;
 mod egress;
@@ -183,6 +184,7 @@ fn machine_id() -> Option<String> {
             None,
             Some(&mut bytes),
         )
+        .ok()
         .ok()?;
         let mut value = vec![0u16; bytes as usize / 2];
         RegGetValueW(
@@ -194,6 +196,7 @@ fn machine_id() -> Option<String> {
             Some(value.as_mut_ptr().cast()),
             Some(&mut bytes),
         )
+        .ok()
         .ok()?;
         value.truncate(value.iter().position(|&c| c == 0).unwrap_or(value.len()));
         String::from_utf16(&value).ok()
