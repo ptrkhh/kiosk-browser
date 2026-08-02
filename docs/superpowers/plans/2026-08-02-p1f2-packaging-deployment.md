@@ -33,6 +33,20 @@ Install dir: C:\Program Files\kiosk\        Data dir: %ProgramData%\kiosk\
 
 ---
 
+### Task 0: config-fault safe render (kiosk-main code — the F1 carry-forward)
+
+**Files:** Modify `crates/kiosk-main/src/main.rs` (+ `boot.rs` if the parse lives there)
+
+**Why:** P1-F1 left a field failure the F2 design owns (§"safe mode does not cover config faults"): `kiosk-main` parses `kiosk.ini`/the credential **before** the `--safe` branch and both sites `panic!`, so a device installed with an unreadable/invalid `kiosk.ini` crash-loops → `--safe` panics in the same place → `watchdog.safe_mode_failed` → a 60 s **black screen with no diagnostics**. This is the exact "black screen, can't tell why" failure the whole safe-mode design exists to prevent.
+
+- [ ] **Step 1:** make the config-parse failure render, not panic. When `kiosk.ini`/credential read-or-parse fails at boot (any mode), build the webview and navigate to `bundled_url("safe.html")` with the device id (best-effort: the machine id, since `kiosk.ini` may be unreadable) + the parse error string, keep window+input hardening, and DO NOT `panic!`/exit — sit on the safe page so the launcher's heartbeat still arms and the operator sees the fault. Reuse the Task-2-from-F1 `--safe` render path (safe.html + last-error substitution) — this is the same page, sourced from the parse error instead of `crash-panic.txt`.
+- [ ] **Step 2: host/Windows check.** A unit test that the config-load error path returns a "render safe" outcome (factor the decision to a pure fn if practical); Windows smoke: install with a deliberately-corrupt `kiosk.ini` → the device shows `safe.html` with the parse error, NOT a black screen, and does not crash-loop.
+- [ ] **Step 3:** commit `fix(main): render safe.html on a config-parse fault instead of panicking`.
+
+(Then the Task-4 runbook still notes the operational hint — "freshly-installed device black? suspect kiosk.ini/credential" — as belt-and-suspenders.)
+
+---
+
 ### Task 1: WiX MSI core — layout, components, credential ACL, upgrade
 
 **Files:** Create `packaging/windows/kiosk.wxs`, `packaging/windows/kiosk.wixproj` (or a `wix build` invocation), `packaging/windows/README.md` (build steps)
