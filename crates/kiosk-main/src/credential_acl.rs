@@ -257,12 +257,15 @@ mod tests {
     // Real-DACL integration coverage for `credential_is_owner_only` itself
     // (not just the pure `mask_grants_read` helper above). Exercises the
     // actual FFI path — `GetNamedSecurityInfoW`, the ACE-type dispatch in
-    // `read_grantee_sids`, the NULL-vs-empty-DACL branch is implicitly
-    // covered by the "present, owner-only" case below — against a real file
-    // whose DACL is manipulated with `icacls`. This crate's copy of
-    // `credential_acl.rs` is byte-identical to
-    // `crates/kiosk-launcher/src/credential_acl.rs`, so this coverage
-    // applies to both; do not duplicate this test into the launcher crate.
+    // `read_grantee_sids` — against a real file whose owner and DACL are
+    // manipulated with `icacls`. The NULL-vs-empty-DACL guard is NOT
+    // exercised here: `icacls` on a normal NTFS file always produces a
+    // present DACL, so this test only distinguishes "present, 1 ACE" from
+    // "present, 2 ACEs" — the null-DACL fail-closed branch remains untested
+    // by this integration test. This crate's copy of `credential_acl.rs` is
+    // byte-identical to `crates/kiosk-launcher/src/credential_acl.rs`, so
+    // this coverage applies to both; do not duplicate this test into the
+    // launcher crate.
     #[test]
     fn credential_is_owner_only_reflects_real_dacl() {
         use super::credential_is_owner_only;
@@ -272,19 +275,56 @@ mod tests {
         let file = dir.path().join("cred.json");
         std::fs::write(&file, b"{}").expect("create temp credential file");
 
-        // Resolve the current principal the way the file's owner will
-        // actually be recorded: DOMAIN\username (or COMPUTER\username for a
-        // local account), taken from the environment rather than hardcoded.
-        let domain = std::env::var("USERDOMAIN").expect("USERDOMAIN must be set on Windows");
-        let user = std::env::var("USERNAME").expect("USERNAME must be set on Windows");
-        let current_principal = format!("{domain}\\{user}");
+        // Resolve the current user's SID directly (not a name — locale- and
+        // hostname-independent) so the fixture can force ownership rather
+        // than assume it. `whoami /user /fo csv /nh` prints:
+        // "DOMAIN\user","S-1-5-21-...."
+        let out = Command::new("whoami")
+            .args(["/user", "/fo", "csv", "/nh"])
+            .output()
+            .expect("failed to spawn whoami");
+        assert!(
+            out.status.success(),
+            "whoami /user failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let sid = stdout
+            .trim()
+            .rsplit(',')
+            .next()
+            .expect("whoami /user csv output should have a SID field")
+            .trim_matches('"')
+            .to_string();
+        assert!(
+            sid.starts_with("S-1-5-"),
+            "unexpected SID format from whoami /user: {stdout:?}"
+        );
 
-        // Step 1: reset the DACL to inheritance-off, owner-only.
+        // Step 1: force ownership to the resolved SID. NTFS does not
+        // guarantee the creating process becomes the owner (hardened images,
+        // service accounts, CI runners may default to BUILTIN\Administrators
+        // instead) — `/setowner` makes ownership provable rather than
+        // assumed.
+        let out = Command::new("icacls")
+            .arg(&file)
+            .arg("/setowner")
+            .arg(format!("*{sid}"))
+            .output()
+            .expect("failed to spawn icacls /setowner");
+        assert!(
+            out.status.success(),
+            "icacls /setowner failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Step 2: reset the DACL to inheritance-off, granting read only to
+        // the same SID that now owns the file.
         let out = Command::new("icacls")
             .arg(&file)
             .arg("/inheritance:r")
             .arg("/grant:r")
-            .arg(format!("{current_principal}:(F)"))
+            .arg(format!("*{sid}:(F)"))
             .output()
             .expect("failed to spawn icacls");
         assert!(
@@ -299,7 +339,7 @@ mod tests {
             "expected Ok(true) for a DACL granting only the current user (owner)"
         );
 
-        // Step 2: additionally grant read to BUILTIN\Users, referenced by its
+        // Step 3: additionally grant read to BUILTIN\Users, referenced by its
         // well-known SID (S-1-5-32-545) so this test is locale-independent —
         // the English name "BUILTIN\Users" would not resolve on a non-English
         // Windows install.
@@ -322,7 +362,7 @@ mod tests {
             "expected Ok(false) once BUILTIN\\Users (S-1-5-32-545) can read the file"
         );
 
-        // Step 3: a path that does not exist must fail closed with Err.
+        // Step 4: a path that does not exist must fail closed with Err.
         let missing = dir.path().join("does-not-exist.json");
         assert!(
             credential_is_owner_only(&missing).is_err(),
