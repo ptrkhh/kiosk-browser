@@ -31,9 +31,18 @@ use kiosk_core::watchdog::{Action, Event, WatchdogEvent};
 use serde_json::{Map, Value};
 
 use crate::clock::now;
+use crate::credential_acl;
 use crate::job::Job;
 use crate::loop_::ActionSink;
 use crate::spawn::spawn_main;
+
+/// The exact message SEC-09's launcher gate reports (mirrors kiosk-main's boot
+/// gate — same wording, same fault, two separate binaries reading the same
+/// credential). Surfaces via `build_telemetry`'s `Err`, which `LauncherSink::new`
+/// already treats exactly like any other degraded-telemetry start: breadcrumb,
+/// `telemetry: None`, supervision continues unaffected.
+const CREDENTIAL_PERMISSIONS_MESSAGE: &str =
+    "credential file permissions are not owner-only — refusing to load";
 
 /// The launcher's telemetry: its own `Logger` (spooling to `spool/launcher`) plus
 /// a second `GclClient` used only to drain a dead main's orphaned spool. Both share
@@ -68,7 +77,19 @@ fn build_telemetry(
 ) -> Result<Telemetry, Box<dyn std::error::Error>> {
     // The ini's `credential` names a file next to `kiosk.ini` (spec §4), not
     // inline JSON — same resolution kiosk-main does.
-    let credential_json = std::fs::read_to_string(config_dir.join(&bootstrap.credential))?;
+    let credential_path = config_dir.join(&bootstrap.credential);
+
+    // SEC-09 launcher gate: verify the DACL before ever reading the credential's
+    // contents. `Ok(false)`/`Err` (fail closed) surfaces as an `Err` here, which
+    // `LauncherSink::new` already treats exactly like a missing/malformed
+    // credential — `telemetry: None`, a breadcrumb, and supervision (spawn/
+    // watch/restart, all in `dispatch`) is untouched because it never reads
+    // `self.telemetry` in the first place.
+    if credential_acl::is_violation(credential_acl::credential_is_owner_only(&credential_path)) {
+        return Err(CREDENTIAL_PERMISSIONS_MESSAGE.into());
+    }
+
+    let credential_json = std::fs::read_to_string(&credential_path)?;
     let service_account = ServiceAccount::from_json(&credential_json)?;
     let device_id =
         kiosk_core::identity::effective_device_id(bootstrap.device_id.as_deref(), None)?;
@@ -798,8 +819,14 @@ mod tests {
         assert!(data_dir.join(DEGRADED_FILE).exists());
 
         // A real, parseable credential next to `kiosk.ini`, exactly as
-        // `build_telemetry` expects to find it.
-        std::fs::write(config_dir.join("cred.json"), test_service_account_json()).unwrap();
+        // `build_telemetry` expects to find it. Forced owner-only (see
+        // `force_owner_only_acl`'s doc): a fresh temp file's inherited ACL is not
+        // guaranteed owner-only, and this test needs the SEC-09 gate to pass, not
+        // merely the JSON to parse.
+        let cred_path = config_dir.join("cred.json");
+        std::fs::write(&cred_path, test_service_account_json()).unwrap();
+        #[cfg(windows)]
+        force_owner_only_acl(&cred_path);
         let bootstrap = BootstrapConfig::parse(
             "[kiosk]\nconfig_url = https://e/c.json\nsite = hq\nproject_id = p\n\
              credential = cred.json\ndevice_id = lobby-01\n\n[bootstrap]\nurl = https://app.example.com/\n",
@@ -866,6 +893,140 @@ mod tests {
         assert!(
             data_dir.join(DEGRADED_FILE).exists(),
             "a degraded start must not erase a live warning"
+        );
+    }
+
+    /// Forces `path` to an owner-only DACL (current user only) — mirrors
+    /// `kiosk-main`'s `credential_acl::tests::credential_is_owner_only_reflects_real_dacl`
+    /// fixture setup: a freshly created temp file's inherited ACL is NOT
+    /// owner-only on a typical dev/CI host, so a test that needs a genuinely
+    /// TRUSTED credential (or a controlled starting point before widening it)
+    /// must force it rather than assume it.
+    #[cfg(windows)]
+    fn force_owner_only_acl(path: &Path) {
+        use std::process::Command;
+
+        let out = Command::new("whoami")
+            .args(["/user", "/fo", "csv", "/nh"])
+            .output()
+            .expect("failed to spawn whoami");
+        let sid = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .rsplit(',')
+            .next()
+            .expect("whoami /user csv output should have a SID field")
+            .trim_matches('"')
+            .to_string();
+
+        assert!(Command::new("icacls")
+            .arg(path)
+            .arg("/setowner")
+            .arg(format!("*{sid}"))
+            .output()
+            .expect("failed to spawn icacls /setowner")
+            .status
+            .success());
+        assert!(Command::new("icacls")
+            .arg(path)
+            .arg("/inheritance:r")
+            .arg("/grant:r")
+            .arg(format!("*{sid}:(F)"))
+            .output()
+            .expect("failed to spawn icacls /inheritance:r")
+            .status
+            .success());
+    }
+
+    /// Windows-host: SEC-09 launcher gate. A credential whose DACL grants read to
+    /// `BUILTIN\Users` (a non-owner principal) must refuse before the JSON is ever
+    /// read, with the distinct owner-only message — not the generic
+    /// `std::io::Error` a missing/malformed file would produce.
+    #[cfg(windows)]
+    #[test]
+    fn build_telemetry_fails_closed_on_a_bad_credential_dacl() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let cred_path = config_dir.join("cred.json");
+        std::fs::write(&cred_path, test_service_account_json()).unwrap();
+        force_owner_only_acl(&cred_path);
+
+        let out = Command::new("icacls")
+            .arg(&cred_path)
+            .arg("/grant")
+            .arg("*S-1-5-32-545:(R)")
+            .output()
+            .expect("failed to spawn icacls");
+        assert!(
+            out.status.success(),
+            "icacls /grant failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let bootstrap = BootstrapConfig::parse(
+            "[kiosk]\nconfig_url = https://e/c.json\nsite = hq\nproject_id = p\n\
+             credential = cred.json\ndevice_id = lobby-01\n\n[bootstrap]\nurl = https://app.example.com/\n",
+        )
+        .expect("valid ini");
+
+        match build_telemetry(&bootstrap, &config_dir, &data_dir) {
+            Err(e) => assert_eq!(e.to_string(), CREDENTIAL_PERMISSIONS_MESSAGE),
+            Ok(_) => panic!("a bad credential DACL must refuse to build telemetry"),
+        }
+    }
+
+    /// The same bad-DACL credential, driven through `LauncherSink::new` (not just
+    /// `build_telemetry` directly): telemetry degrades to `None` and a breadcrumb
+    /// is written — the launcher itself starts and would keep supervising exactly
+    /// as the missing-credential path already does (`dispatch`'s `spawn`/
+    /// `kill_child` never touch `self.telemetry`).
+    #[cfg(windows)]
+    #[test]
+    fn a_bad_credential_dacl_degrades_telemetry_but_still_constructs_the_sink() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let cred_path = config_dir.join("cred.json");
+        std::fs::write(&cred_path, test_service_account_json()).unwrap();
+        force_owner_only_acl(&cred_path);
+        Command::new("icacls")
+            .arg(&cred_path)
+            .arg("/grant")
+            .arg("*S-1-5-32-545:(R)")
+            .output()
+            .expect("failed to spawn icacls");
+
+        let bootstrap = BootstrapConfig::parse(
+            "[kiosk]\nconfig_url = https://e/c.json\nsite = hq\nproject_id = p\n\
+             credential = cred.json\ndevice_id = lobby-01\n\n[bootstrap]\nurl = https://app.example.com/\n",
+        )
+        .expect("valid ini");
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let sink = LauncherSink::new(
+            PathBuf::from("kiosk-main.exe"),
+            config_dir,
+            data_dir.clone(),
+            "test-pipe".into(),
+            tx,
+            Arc::new(AtomicU32::new(0)),
+            Some(&bootstrap),
+            None,
+        );
+
+        assert!(
+            sink.telemetry.is_none(),
+            "a bad credential DACL must skip building the GCL client"
+        );
+        assert!(
+            data_dir.join(DEGRADED_FILE).exists(),
+            "the refusal must leave the same degraded-start breadcrumb a missing credential does"
         );
     }
 

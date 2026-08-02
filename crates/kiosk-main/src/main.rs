@@ -279,6 +279,7 @@ fn install_panic_hook(telem: telemetry::Telemetry, data_dir: PathBuf) {
 /// Drives the FSM's effects into the live webview (spec §Architecture actor-spine).
 /// The `Effect` → page decision itself is `effect::page_for` (pure, host-tested); this
 /// only carries out what it decides.
+#[derive(Clone)]
 struct TauriSink {
     app: AppHandle,
     tx: mpsc::Sender<AppEvent>,
@@ -380,7 +381,7 @@ async fn main() {
 
     let ini_path = config_dir.join("kiosk.ini");
     let machine_id = machine_id();
-    let (booted, config_error) =
+    let (booted, config_error, boot_fault_reason) =
         boot::load(&ini_path, &data_dir, machine_id.as_deref()).into_parts();
     let safe = args.safe || config_error.is_some();
     // Config faults win over an older crash breadcrumb. Missing breadcrumb degrades to
@@ -396,6 +397,11 @@ async fn main() {
     // read out HERE, before `booted.manager` moves into `fetch::run` below. ----
     let bootstrap = booted.manager.bootstrap().clone();
     let device_id = booted.manager.device_id().to_string();
+    // SEC-09 reload gate: cloned before `device_id` moves into the telemetry
+    // thread's closure below — needed to build the `safe.html?device=` url if a
+    // credential-DACL violation trips mid-run (see `credential_violation_sink`
+    // in `.setup()`).
+    let device_id_for_reload = device_id.clone();
     // Build once, before `device_id` moves into telemetry. Recovery uses this same
     // diagnostic URL, never the configured remote home, while safe mode is active.
     let safe_url = safe.then(|| {
@@ -449,6 +455,10 @@ async fn main() {
         bootstrap.exit_gesture.as_ref(),
     );
     let credential_path = config_dir.join(&bootstrap.credential);
+    // SEC-09 reload gate: fetch::run re-checks the DACL on its own poll cadence
+    // and needs its own copy — `credential_path` itself moves into the
+    // telemetry thread's closure below.
+    let credential_path_for_reload = credential_path.clone();
     let config_url = bootstrap.config_url.clone();
     let poll_s = network.config_poll_s;
     let probe_url = resolve_probe_url(&network.connectivity_check_url, &home_url);
@@ -482,6 +492,14 @@ async fn main() {
     let refetch = Arc::new(Notify::new());
     let cancel = CancellationToken::new();
     let prober = Prober::new(clock.clone());
+    // SEC-09 reload gate: `fetch::run` detects a credential-DACL violation on its
+    // own poll cadence but has no window/`AppHandle` yet at the point it's spawned
+    // (below, before `tauri::Builder` even runs `.setup()`), so it cannot navigate
+    // directly. It reports the fault message once over this channel; the
+    // `.setup()`-spawned receiver below (which DOES have a `TauriSink`) does the
+    // actual `safe.html` navigation — the same navigate path boot uses, not a
+    // second mechanism.
+    let (credential_violation_tx, mut credential_violation_rx) = mpsc::channel::<String>(1);
 
     // The P1-B logger `Transport` is `reqwest::blocking`, which panics if it is built
     // OR driven inside a tokio runtime (it stands up and drops its own internal
@@ -507,6 +525,15 @@ async fn main() {
     let spawned = std::thread::Builder::new()
         .name("telemetry".into())
         .spawn(move || {
+            // SEC-09 boot gate: a credential-permissions violation was already
+            // detected in `boot::load` — never call `telemetry::build` in that
+            // case (it would be the very credential read this gate exists to
+            // prevent). Degrade exactly like a build failure: no telemetry, kiosk
+            // still shows content via the safe path.
+            if boot_fault_reason == Some(boot::CREDENTIAL_PERMISSIONS_REASON) {
+                let _ = handle_tx.send(None);
+                return;
+            }
             match telemetry::build(
                 &bootstrap,
                 &credential_path,
@@ -541,6 +568,14 @@ async fn main() {
     install_panic_hook(telem.clone(), panic_hook_data_dir);
     telem.app_start();
     telem.config_applied(revision, &warnings);
+    // SEC-09 boot gate: best-effort — `telem` is `Telemetry::disabled()` in
+    // exactly this scenario (telemetry was never built, see above), so this
+    // is a documented no-op today. Called anyway so the plumbing matches the
+    // reload gate's live `telem.config_error` call and needs no revisiting if
+    // boot telemetry is ever decoupled from the credential it reports on.
+    if let Some(reason) = boot_fault_reason {
+        telem.config_error(reason);
+    }
 
     // P1-F1 Task 2: `--safe` must make no remote request — no config fetch, no
     // prober, no remote content navigation. `booted.manager`/`network`/`prober` are
@@ -556,6 +591,8 @@ async fn main() {
             refetch.clone(),
             cancel.clone(),
             nav_policy_fetch,
+            credential_path_for_reload,
+            credential_violation_tx,
         ));
         tokio::spawn(probe::run(
             prober,
@@ -792,6 +829,26 @@ async fn main() {
             if let Some(safe_url) = safe_url.as_deref() {
                 sink.navigate(safe_url);
             } else {
+                // SEC-09 reload gate: `fetch::run` cannot navigate directly (it was
+                // spawned before this window existed — see the channel's doc comment
+                // at its creation), so it reports the violation message once here,
+                // where a real `TauriSink` exists, and THIS task performs the actual
+                // `safe.html` navigation — the exact same call `--safe` uses above,
+                // never a second mechanism. One-shot: once tripped there is nothing
+                // left to watch for (`fetch::run` has already stopped polling).
+                let credential_violation_sink = sink.clone();
+                tokio::spawn(async move {
+                    if let Some(message) = credential_violation_rx.recv().await {
+                        let url = format!(
+                            "{}?device={}&err={}",
+                            bundled_url("safe.html"),
+                            url_encode(&device_id_for_reload),
+                            url_encode(&message),
+                        );
+                        credential_violation_sink.navigate(&url);
+                    }
+                });
+
                 // P1-F1 Task 3: nightly-reload timer. Fires `IdleExpired` INTO the FSM
                 // rather than navigating the webview directly, so the reload obeys the
                 // machine's rules (state.rs rule 9): Online + idle_clear clears the

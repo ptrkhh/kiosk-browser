@@ -9,9 +9,21 @@
 //! Any error reading the security info (missing file, access denied, malformed
 //! ACL) is `Err`. The caller (boot/reload wiring, not this module) treats
 //! `Ok(false)` and `Err` identically — refuse to trust the credential.
+//!
+//! Wired into `sink::build_telemetry` (Task 3, SEC-09): a bad DACL skips
+//! building the GCL client but never stops supervision.
 
 use std::io;
 use std::path::Path;
+
+/// Fail-closed judgment on a raw [`credential_is_owner_only`] result (spec §8/
+/// SEC-09): only `Ok(true)` is trusted. `Ok(false)` (a non-owner principal can
+/// read the file) and `Err` (the security info could not be read at all) are
+/// both violations — every caller must refuse to use the credential on either
+/// outcome, never just log it.
+pub fn is_violation(check: io::Result<bool>) -> bool {
+    !matches!(check, Ok(true))
+}
 
 /// `Ok(true)` iff the file's DACL grants read to nobody but its owner or
 /// SYSTEM; `Ok(false)` if some other SID can read it; `Err` if the security
@@ -213,6 +225,27 @@ fn sid_to_string(sid: windows::Win32::Security::PSID) -> io::Result<String> {
         let _ = LocalFree(Some(HLOCAL(buf.0 as *mut _)));
     }
     result
+}
+
+#[cfg(test)]
+mod is_violation_tests {
+    use super::is_violation;
+    use std::io;
+
+    #[test]
+    fn ok_true_is_not_a_violation() {
+        assert!(!is_violation(Ok(true)));
+    }
+
+    #[test]
+    fn ok_false_is_a_violation() {
+        assert!(is_violation(Ok(false)));
+    }
+
+    #[test]
+    fn err_is_a_violation() {
+        assert!(is_violation(Err(io::Error::other("access denied"))));
+    }
 }
 
 #[cfg(all(test, windows))]
