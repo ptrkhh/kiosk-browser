@@ -94,6 +94,15 @@ provisioning tech separately (GPO/Assigned Access/BIOS).
   components).
 - Uninstall removes binaries + the task but should leave `%ProgramData%\kiosk` (spool/last-good)
   unless a full purge is requested — document the choice.
+- **Inherited from P1-F1: safe mode does not cover config faults.** `kiosk-main` reads and parses
+  `kiosk.ini` (and the credential) *before* the `--safe` branch, and both sites `panic!`. A device
+  installed with an unreadable/invalid `kiosk.ini` or a bad credential therefore crash-loops:
+  escalate to `--safe` → panic in the same place → `SAFE_FAIL_LIMIT` → `watchdog.safe_mode_failed`,
+  leaving a 60 s black-screen loop with **no safe page**. F2 owns the fix (render `safe.html`
+  before config is parsed, so a config fault shows the device id + error instead of a black
+  screen) and the **runbook must state it**: on a freshly installed device stuck black, suspect
+  `kiosk.ini` / the credential first — `safe.html` appearing is *not* a prerequisite for a config
+  problem.
 
 ## Testing / validation (packaging — no unit tests)
 

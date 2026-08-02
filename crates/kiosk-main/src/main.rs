@@ -13,6 +13,7 @@ mod health;
 mod heartbeat;
 mod idle;
 mod inject;
+mod maintenance;
 mod nav;
 mod nav_policy;
 mod pinpad;
@@ -56,6 +57,55 @@ const EVENT_CHANNEL_CAPACITY: usize = 64;
 
 fn bundled_url(page: &str) -> String {
     format!("{APP_ORIGIN}/{page}")
+}
+
+/// Minimal query-string percent-encoding (P1-F1 Task 2: `safe.html`'s `?device=&err=`
+/// params). No dependency pulls in a full `url`/`urlencoding` crate for two values —
+/// unreserved chars (RFC 3986: alnum, `-`, `_`, `.`, `~`) pass through, everything else
+/// (including `&`, `=`, `?`, newlines from a multi-line panic message) is `%XX`-encoded,
+/// so the receiving page's `URLSearchParams` decodes it back exactly.
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod url_encode_tests {
+    use super::url_encode;
+
+    #[test]
+    fn unreserved_chars_pass_through() {
+        assert_eq!(url_encode("device-01_A.B~C"), "device-01_A.B~C");
+    }
+
+    #[test]
+    fn reserved_and_control_chars_are_percent_encoded() {
+        assert_eq!(url_encode("a b&c=d\n"), "a%20b%26c%3Dd%0A");
+    }
+
+    /// The 500-char cap the `--safe` path puts on `crash-panic.txt` before encoding
+    /// (main.rs `setup`). Guards the two ways that cap could break `safe.html`:
+    /// a cut landing mid-UTF-8 (byte slicing would panic / emit an undecodable
+    /// %-sequence — `.chars()` cannot), and unbounded 3x encode expansion.
+    #[test]
+    fn capped_error_text_stays_valid_utf8_and_bounded() {
+        let huge: String = "パニック💥".repeat(10_000);
+        let capped: String = huge.chars().take(500).collect();
+        assert_eq!(capped.chars().count(), 500);
+        // 3 bytes/char worst case, x3 for percent-encoding: comfortably under any
+        // browser URL limit, which is the whole point of the cap.
+        assert!(url_encode(&capped).len() <= 500 * 4 * 3);
+        // Round-trips: every escape is a well-formed %XX of the original bytes.
+        assert_eq!(url_encode(&capped).matches('%').count(), capped.len());
+    }
 }
 
 /// Pure index-vs-count decision for `display.monitor` (spec §5.2): `requested`
@@ -290,6 +340,18 @@ async fn main() {
     let _ = std::fs::create_dir_all(&data_dir);
     install_panic_hook_file_only(data_dir.clone());
 
+    // P1-F1 Task 2: safe mode's last-error breadcrumb, read now (before this run's own
+    // panic hook could ever overwrite it) — `Err` (missing file, first-ever boot) reads
+    // as "unknown" at render time. Read only when `--safe` needs it: the common non-safe
+    // boot never touches this file.
+    let last_error = args.safe.then(|| data_dir.join("crash-panic.txt"));
+
+    // KNOWN LIMITATION (P1-F1, to fix in P1-F2): safe mode does NOT cover config
+    // faults. Both panic sites below run on the `--safe` path too, so a device with
+    // an unreadable or invalid `kiosk.ini` (or a bad credential) crash-loops:
+    // escalate to `--safe` → panic here → `SAFE_FAIL_LIMIT` → `safe_mode_failed`,
+    // and the operator gets a 60 s black-screen loop with no safe page at all.
+    // P1-F2 owns rendering `safe.html` BEFORE config is parsed.
     let ini_path = config_dir.join("kiosk.ini");
     let ini_text = std::fs::read_to_string(&ini_path).unwrap_or_else(|e| {
         panic!(
@@ -309,6 +371,10 @@ async fn main() {
     // read out HERE, before `booted.manager` moves into `fetch::run` below. ----
     let bootstrap = booted.manager.bootstrap().clone();
     let device_id = booted.manager.device_id().to_string();
+    // `device_id` itself is moved into the telemetry thread's closure below; safe
+    // mode needs its own copy to put in the safe.html query string, read much later
+    // in `.setup()`.
+    let device_id_safe = device_id.clone();
     let revision = booted.manager.revision();
     let home_url = booted.manager.home_url();
     let network = booted.manager.current().network.clone();
@@ -323,6 +389,12 @@ async fn main() {
     // process restart (this loop is spawned once, below, and never re-reads config).
     let idle_reset_seconds = booted.manager.current().content.idle_reset_seconds;
     let allow_text_selection = booted.manager.current().input.allow_text_selection;
+    // P1-F1 Task 3: same "read once, next-restart to change" convention as the fields
+    // above — the nightly-reload timer is spawned once, below, and never re-reads
+    // config (a later config fetch changing either field takes effect only on the
+    // next process restart).
+    let nightly_reload = booted.manager.current().maintenance.nightly_reload.clone();
+    let maintenance_timezone = booted.manager.current().maintenance.timezone.clone();
     // P1-D2e Task 2: same "read once, next-restart to change" convention as the
     // fields above — the health-sample timer is spawned once, below, and never
     // re-reads config.
@@ -431,24 +503,30 @@ async fn main() {
     telem.app_start();
     telem.config_applied(revision, &warnings);
 
-    tokio::spawn(fetch::run(
-        booted.manager, // MOVES — every field needed above was extracted first.
-        config_url,
-        poll_s,
-        tx.clone(),
-        telem.clone(),
-        refetch.clone(),
-        cancel.clone(),
-        nav_policy_fetch,
-    ));
-    tokio::spawn(probe::run(
-        prober,
-        network,
-        probe_url,
-        tx.clone(),
-        telem.clone(),
-        cancel.clone(),
-    ));
+    // P1-F1 Task 2: `--safe` must make no remote request — no config fetch, no
+    // prober, no remote content navigation. `booted.manager`/`network`/`prober` are
+    // simply left unmoved and drop here; everything `.setup()` needs from them was
+    // already extracted above.
+    if !args.safe {
+        tokio::spawn(fetch::run(
+            booted.manager, // MOVES — every field needed above was extracted first.
+            config_url,
+            poll_s,
+            tx.clone(),
+            telem.clone(),
+            refetch.clone(),
+            cancel.clone(),
+            nav_policy_fetch,
+        ));
+        tokio::spawn(probe::run(
+            prober,
+            network,
+            probe_url,
+            tx.clone(),
+            telem.clone(),
+            cancel.clone(),
+        ));
+    }
     // P1-D2c Task 3: emits `IdleExpired` UNCONDITIONALLY — the FSM (rule 9) already
     // no-ops it outside `Online`, so no state check belongs here too.
     tokio::spawn(idle::run(idle_reset_seconds, tx.clone(), cancel.clone()));
@@ -503,6 +581,7 @@ async fn main() {
     }
 
     let windowed = args.windowed;
+    let safe = args.safe;
     let tx_setup = tx.clone();
     let refetch_setup = refetch.clone();
     let telem_setup = telem.clone();
@@ -666,19 +745,74 @@ async fn main() {
                 telem: telem_setup.clone(),
                 cancel: cancel_setup.clone(),
             };
-            tokio::spawn(driver::run(
-                rx,
-                Driver {
-                    machine: Machine::new(machine_cfg),
-                },
-                Box::new(sink),
-                cancel_setup.clone(),
-            ));
 
-            let tx_first = tx_setup.clone();
-            tokio::spawn(async move {
-                let _ = tx_first.send(first_event).await;
-            });
+            // P1-F1 Task 2: `--safe` never drives the FSM (`AppState::Safe` has no
+            // `Event` transitions in) or spawns the remote-content driver — it just
+            // renders the bundled safe page once, directly, with the device id +
+            // last crash breadcrumb. Must never fail to render: a missing/unreadable
+            // `crash-panic.txt` degrades to "unknown", never a panic or a blank
+            // screen.
+            if safe {
+                // Capped at 500 chars BEFORE encoding: percent-encoding expands up to
+                // 3x, and a multi-hundred-KB panic Display would make a URL WebView2
+                // refuses outright — i.e. safe.html renders NOTHING, defeating the one
+                // invariant this page has. `.chars()` (not byte slicing) so the cut
+                // never lands mid-UTF-8 and produces an undecodable %-sequence.
+                let last_error_text: String = last_error
+                    .as_deref()
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+                    .unwrap_or_else(|| "unknown".to_string())
+                    .chars()
+                    .take(500)
+                    .collect();
+                let safe_url = format!(
+                    "{}?device={}&err={}",
+                    bundled_url("safe.html"),
+                    url_encode(&device_id_safe),
+                    url_encode(&last_error_text),
+                );
+                sink.navigate(&safe_url);
+            } else {
+                // P1-F1 Task 3: nightly-reload timer. Fires `IdleExpired` INTO the FSM
+                // rather than navigating the webview directly, so the reload obeys the
+                // machine's rules (state.rs rule 9): Online + idle_clear clears the
+                // profile first and re-navigates only after `ProfileCleared` (the
+                // privacy gate), Online without idle_clear reloads home, and any other
+                // state (Offline, ErrorPage, Clearing) is a no-op — a 04:00 reload must
+                // not replace the offline video with a doomed remote load, nor paint
+                // home over an in-progress clear. `--safe` never spawns this (same
+                // `if safe {} else {}` split as the FSM driver above).
+                let tx_reload = tx_setup.clone();
+                let maint_telem = telem_setup.clone();
+                tokio::spawn(maintenance::run(
+                    nightly_reload,
+                    maintenance_timezone,
+                    move || {
+                        let _ = tx_reload.try_send(AppEvent::IdleExpired);
+                    },
+                    move || {
+                        maint_telem.config_warn(
+                            "maintenance.nightly_reload",
+                            "unparseable HH:MM or unknown timezone; nightly reload disabled",
+                        )
+                    },
+                    cancel_setup.clone(),
+                ));
+
+                tokio::spawn(driver::run(
+                    rx,
+                    Driver {
+                        machine: Machine::new(machine_cfg),
+                    },
+                    Box::new(sink),
+                    cancel_setup.clone(),
+                ));
+
+                let tx_first = tx_setup.clone();
+                tokio::spawn(async move {
+                    let _ = tx_first.send(first_event).await;
+                });
+            }
 
             Ok(())
         })

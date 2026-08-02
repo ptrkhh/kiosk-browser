@@ -8,6 +8,7 @@
 //! same modules `main.rs` previously declared with `mod`.
 
 mod clock;
+pub mod job;
 pub mod loop_;
 pub mod pipe;
 pub mod sink;
