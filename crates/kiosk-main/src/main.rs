@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use driver::{Driver, EffectSink};
+use driver::{Driver, EffectSink, SafeLatchedSink, SafeModeLatch};
 use effect::PageTarget;
 use kiosk_core::app::state::{Effect, Event as AppEvent, Machine};
 use kiosk_core::logging::time::TrustedClock;
@@ -112,19 +112,28 @@ mod url_encode_tests {
 /// SEC-09 reload gate, Critical 2 fix: `fetch::run` cannot navigate directly (it was
 /// spawned before the window existed), so it reports the violation message once over
 /// `credential_violation_rx`; this is the task that performs the actual `safe.html`
-/// navigation — the exact same call `--safe` uses — and then holds that state by
-/// cancelling `driver_probe_cancel`. Without the cancel, `probe::run` keeps emitting
-/// `LinkChanged` and `driver::run` keeps dispatching `Navigate`/`ShowVideo` through the
-/// same sink (the FSM was never told about the violation — `AppState::Safe` has no
-/// `Event` transitions in, by design), so a later network flip can repaint the webview
-/// right over `safe.html`. Extracted from `.setup()` so this is host-testable without a
-/// real Tauri window. One-shot: once tripped there is nothing left to watch for
-/// (`fetch::run` has already stopped polling).
+/// navigation — the exact same call `--safe` uses — and then holds that state.
+///
+/// Cancelling `driver_probe_cancel` alone narrows the race but does not close it:
+/// `probe::run`'s in-flight `probe_once` and its unconditional `tx.send` aren't raced
+/// against cancellation, and `driver::run`'s `select!` has no `biased;`, so an
+/// `AppEvent` already buffered in the channel at the moment the token fires can still
+/// be dispatched. `safe_mode_latch.trip()` closes that: it trips the SAME latch
+/// `driver::run`'s `SafeLatchedSink` checks on every `dispatch`, so once tripped, no
+/// buffered event, in-flight probe result, or future producer can push a
+/// `Navigate`/`ShowVideo` through to the webview, however `select!` happens to
+/// schedule. Tripped before the cancel (belt-and-braces: the latch, not the token, is
+/// what makes this race-free).
+///
+/// Extracted from `.setup()` so this is host-testable without a real Tauri window.
+/// One-shot: once tripped there is nothing left to watch for (`fetch::run` has already
+/// stopped polling).
 async fn hold_safe_after_credential_violation(
     mut credential_violation_rx: mpsc::Receiver<String>,
     device_id: String,
     navigate: impl Fn(&str),
     driver_probe_cancel: CancellationToken,
+    safe_mode_latch: SafeModeLatch,
 ) {
     if let Some(message) = credential_violation_rx.recv().await {
         let url = format!(
@@ -133,6 +142,7 @@ async fn hold_safe_after_credential_violation(
             url_encode(&device_id),
             url_encode(&message),
         );
+        safe_mode_latch.trip();
         navigate(&url);
         driver_probe_cancel.cancel();
     }
@@ -143,12 +153,24 @@ mod hold_safe_after_credential_violation_tests {
     use super::*;
     use std::sync::Mutex;
 
+    /// A no-op `EffectSink`, only so tests can build a `SafeLatchedSink`/`SafeModeLatch`
+    /// pair without a real Tauri window.
+    #[derive(Default)]
+    struct NoopSink;
+    impl EffectSink for NoopSink {
+        fn dispatch(&mut self, _effect: Effect) {}
+    }
+
     /// TDD RED (Critical 2, before the fix): the prior implementation navigated to
     /// `safe.html` but never cancelled anything shared with `driver`/`probe` — so this
     /// assertion on `driver_probe_cancel.is_cancelled()` failed against that code, proving
     /// the exact gap the review flagged (a subsequent `LinkChanged` could still reach the
     /// FSM and repaint over `safe.html`). GREEN once `driver_probe_cancel.cancel()` was
-    /// added above.
+    /// added above. `safe_mode_latch.is_tripped()`-equivalent (`.latch_handle()` off the
+    /// same `SafeLatchedSink` `driver::run` would box) closes the residual race the review
+    /// found even after that first cancel fix — see `driver::tests::
+    /// a_buffered_event_never_reaches_the_sink_once_safe_mode_latches` for the mechanism
+    /// itself proven directly against `driver::run`.
     #[tokio::test]
     async fn a_reported_violation_navigates_and_holds_safe_mode() {
         let (tx, rx) = mpsc::channel::<String>(1);
@@ -156,12 +178,15 @@ mod hold_safe_after_credential_violation_tests {
         let navigated_task = navigated.clone();
         let driver_probe_cancel = CancellationToken::new();
         let driver_probe_cancel_task = driver_probe_cancel.clone();
+        let latched_sink = SafeLatchedSink::new(NoopSink);
+        let safe_mode_latch = latched_sink.latch_handle();
 
         let handle = tokio::spawn(hold_safe_after_credential_violation(
             rx,
             "lobby-01".into(),
             move |url: &str| navigated_task.lock().unwrap().push(url.to_string()),
             driver_probe_cancel_task,
+            safe_mode_latch,
         ));
 
         tx.send("credential file permissions are not owner-only".into())
@@ -178,6 +203,7 @@ mod hold_safe_after_credential_violation_tests {
             "driver/probe must be cancelled so no later LinkChanged/idle event can \
              dispatch a Navigate/ShowVideo effect over safe.html"
         );
+        drop(latched_sink); // kept alive only so `safe_mode_latch` above stays meaningful
     }
 
     /// A channel closed without ever reporting a violation (e.g. `fetch::run` exited via
@@ -188,6 +214,8 @@ mod hold_safe_after_credential_violation_tests {
         let (tx, rx) = mpsc::channel::<String>(1);
         let driver_probe_cancel = CancellationToken::new();
         let driver_probe_cancel_task = driver_probe_cancel.clone();
+        let latched_sink = SafeLatchedSink::new(NoopSink);
+        let safe_mode_latch = latched_sink.latch_handle();
         drop(tx);
 
         hold_safe_after_credential_violation(
@@ -195,6 +223,7 @@ mod hold_safe_after_credential_violation_tests {
             "lobby-01".into(),
             |_| {},
             driver_probe_cancel_task,
+            safe_mode_latch,
         )
         .await;
 
@@ -942,6 +971,12 @@ async fn main() {
                 telem: telem_setup.clone(),
                 cancel: cancel_setup.clone(),
             };
+            // SEC-09 Critical 2 fix: the ONE `EffectSink` `driver::run` ever dispatches
+            // through — see `latch_handle()`'s use below at the credential-violation
+            // spawn, and `driver::SafeLatchedSink`'s doc comment for why wrapping here
+            // (rather than hardening `probe::run`/`driver::run`'s `select!`
+            // separately) closes every producer, present or future, in one place.
+            let latched_sink = SafeLatchedSink::new(sink.clone());
 
             // P1-F1 Task 2: `--safe` never drives the FSM (`AppState::Safe` has no
             // `Event` transitions in) or spawns the remote-content driver — it just
@@ -958,13 +993,26 @@ async fn main() {
                 // `safe.html` navigation — the exact same call `--safe` uses above,
                 // never a second mechanism. One-shot: once tripped there is nothing
                 // left to watch for (`fetch::run` has already stopped polling).
+                // SEC-09 Critical 2 fix: `driver::run` below is handed a
+                // `SafeLatchedSink` wrapping `sink`, not `sink` directly — the choke
+                // point every `Navigate`/`ShowVideo` effect funnels through. This
+                // `latch_handle()` is a second, `Clone`+`Send` handle onto that SAME
+                // latch, so this task (which navigates through its own unwrapped
+                // `sink` clone, never through `dispatch`) can still trip it. Tripping
+                // it makes every later `dispatch` on the driver's sink a no-op,
+                // regardless of whether the event behind it was already buffered in
+                // the channel or produced by an in-flight probe that lands after
+                // `driver_probe_cancel.cancel()` — closing the residual race
+                // cancellation alone left open.
                 let credential_violation_sink = sink.clone();
                 let driver_probe_cancel_violation = driver_probe_cancel_setup.clone();
+                let safe_mode_latch = latched_sink.latch_handle();
                 tokio::spawn(hold_safe_after_credential_violation(
                     credential_violation_rx,
                     device_id_for_reload,
                     move |url| credential_violation_sink.navigate(url),
                     driver_probe_cancel_violation,
+                    safe_mode_latch,
                 ));
 
                 // P1-F1 Task 3: nightly-reload timer. Fires `IdleExpired` INTO the FSM
@@ -998,7 +1046,7 @@ async fn main() {
                     Driver {
                         machine: Machine::new(machine_cfg),
                     },
-                    Box::new(sink),
+                    Box::new(latched_sink),
                     driver_probe_cancel_setup.clone(),
                 ));
 
