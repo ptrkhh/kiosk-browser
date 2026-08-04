@@ -203,7 +203,10 @@ mod hold_safe_after_credential_violation_tests {
             "driver/probe must be cancelled so no later LinkChanged/idle event can \
              dispatch a Navigate/ShowVideo effect over safe.html"
         );
-        drop(latched_sink); // kept alive only so `safe_mode_latch` above stays meaningful
+        // `SafeModeLatch` holds its own `Arc` clone of the flag, so `safe_mode_latch`
+        // stays meaningful regardless of `latched_sink`'s lifetime; this drop only
+        // silences the unused-binding warning.
+        drop(latched_sink);
     }
 
     /// A channel closed without ever reporting a violation (e.g. `fetch::run` exited via

@@ -2,6 +2,7 @@
 //! `main.rs` (Task 6): `TauriSink` is the production `EffectSink`, constructed there
 //! together with a `Driver` and spawned via [`run`].
 
+use crate::effect;
 use kiosk_core::app::state::{Effect, Event as AppEvent, Machine};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -50,7 +51,14 @@ impl<S: EffectSink> SafeLatchedSink<S> {
 
 impl<S: EffectSink> EffectSink for SafeLatchedSink<S> {
     fn dispatch(&mut self, effect: Effect) {
-        if self.latched.load(Ordering::SeqCst) {
+        // Only navigating effects are gated: `effect::page_for` returns `Some` exactly
+        // for the ones that can move the webview off `safe.html` (`Navigate`,
+        // `ShowVideo`, `ShowSplash`, `ShowErrorPage`). `RefetchConfig`/`ClearProfile`
+        // never touch the page and must keep flowing even once latched -- in
+        // particular `ClearProfile`, which drives the idle-clear privacy control
+        // (`TauriSink` -> `clear::clear()` -> `AppEvent::ProfileCleared`) and has
+        // nothing to do with the navigation race this latch closes.
+        if effect::page_for(&effect).is_some() && self.latched.load(Ordering::SeqCst) {
             return;
         }
         self.inner.dispatch(effect);
@@ -241,6 +249,35 @@ mod tests {
             got.is_empty(),
             "no Navigate/ShowVideo may reach the sink once safe mode has latched, even \
              for events already buffered ahead of cancellation: got {got:?}"
+        );
+    }
+
+    /// Complement of the race test above: the latch must narrow to navigating effects
+    /// only. `ClearProfile` is the idle-clear privacy control's actual data wipe
+    /// (`TauriSink` -> `clear::clear()` -> `AppEvent::ProfileCleared`) and has nothing to
+    /// do with `fetch::run`/`probe::run`, so it must keep reaching the inner sink even
+    /// after `trip()` -- otherwise a device sitting in safe mode silently stops purging
+    /// cookies/cache/local storage on every idle cycle. `RefetchConfig` is included for
+    /// the same reason `effect::page_for` maps both to `None`. Fails against f8c458e,
+    /// where `dispatch` blocked unconditionally once latched.
+    #[test]
+    fn non_navigating_effects_still_reach_the_sink_once_latched() {
+        let mut sink = SafeLatchedSink::new(RecordingSink::default());
+        sink.latch_handle().trip();
+
+        sink.dispatch(Effect::ClearProfile { full: true });
+        sink.dispatch(Effect::ClearProfile { full: false });
+        sink.dispatch(Effect::RefetchConfig);
+        // Still blocked: this is the property the race test above pins.
+        sink.dispatch(Effect::ShowVideo);
+
+        assert_eq!(
+            sink.inner.effects,
+            vec![
+                Effect::ClearProfile { full: true },
+                Effect::ClearProfile { full: false },
+                Effect::RefetchConfig,
+            ]
         );
     }
 }
