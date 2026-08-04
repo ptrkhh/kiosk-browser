@@ -149,6 +149,27 @@ pub fn load(ini_path: &Path, data_dir: &Path, machine_id: Option<&str>) -> BootO
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(&booted.manager.bootstrap().credential);
+
+    // SEC-09 boot gate (FIX 4, final review): check the DACL BEFORE ever reading
+    // the credential's contents — never read-then-parse-then-check. Mirrors
+    // kiosk-launcher's `sink::build_telemetry`, which has always ordered it this
+    // way ("verify the DACL before ever reading the credential's contents").
+    // Reading/parsing first meant a credential that was BOTH a bad DACL AND
+    // malformed JSON reported the generic "cannot parse" with `reason: None` —
+    // no `config.error{credential_permissions}` was ever spooled, so an operator
+    // who fixed the JSON and rebooted would only THEN discover the ACL problem,
+    // one reboot later than necessary. `Ok(false)`/`Err` (fail closed — a
+    // missing file included, since `credential_is_owner_only` itself fails to
+    // read a nonexistent path's security info) is a violation; only `Ok(true)`
+    // proceeds to read and parse.
+    if credential_acl::is_violation(credential_acl::credential_is_owner_only(&credential_path)) {
+        return BootOutcome::RenderSafe {
+            booted,
+            error: CREDENTIAL_PERMISSIONS_MESSAGE.to_string(),
+            reason: Some(CREDENTIAL_PERMISSIONS_REASON),
+        };
+    }
+
     let credential = std::fs::read_to_string(&credential_path)
         .map_err(|e| format!("cannot read {} ({e})", credential_path.display()))
         .and_then(|json| {
@@ -158,22 +179,6 @@ pub fn load(ini_path: &Path, data_dir: &Path, machine_id: Option<&str>) -> BootO
         });
 
     match credential {
-        // SEC-09 boot gate: the credential parses fine, but that alone is not
-        // enough to trust it — check its DACL before letting `telemetry::build`
-        // ever touch it. `Ok(false)`/`Err` (fail closed) wins over `Ready`: a
-        // world-readable service-account key must never go live just because its
-        // JSON happens to be well-formed.
-        Ok(())
-            if credential_acl::is_violation(credential_acl::credential_is_owner_only(
-                &credential_path,
-            )) =>
-        {
-            BootOutcome::RenderSafe {
-                booted,
-                error: CREDENTIAL_PERMISSIONS_MESSAGE.to_string(),
-                reason: Some(CREDENTIAL_PERMISSIONS_REASON),
-            }
-        }
         Ok(()) => BootOutcome::Ready(booted),
         Err(error) => BootOutcome::RenderSafe {
             booted,
@@ -295,6 +300,13 @@ mod tests {
         );
     }
 
+    /// Non-Windows only: `credential_is_owner_only` is a stub that always returns
+    /// `Ok(true)` there (see its doc comment — no DACL to check), so the DACL gate
+    /// (FIX 4, checked before `read_to_string` now) never trips and this reaches
+    /// the read, which fails on the missing file with "cannot read" exactly as
+    /// before. On Windows this is a DIFFERENT path — see
+    /// `missing_credential_load_returns_render_safe_via_the_dacl_gate` below.
+    #[cfg(not(windows))]
     #[test]
     fn missing_credential_load_returns_render_safe() {
         let dir = tempfile::tempdir().unwrap();
@@ -303,6 +315,38 @@ mod tests {
         assert_render_safe(load(&ini_path, dir.path(), None), "cannot read");
     }
 
+    /// FIX 4 (SEC-09 final review): on Windows, `is_violation` now runs BEFORE
+    /// `read_to_string` — a missing file makes `credential_is_owner_only` itself
+    /// fail (`GetNamedSecurityInfoW` cannot read the security info of a path that
+    /// does not exist), which is a violation exactly like a bad DACL, so a missing
+    /// credential now surfaces via the SAME `credential_permissions` gate as a
+    /// widened DACL — matching `kiosk-launcher`'s `build_telemetry`, which has
+    /// always ordered it this way. Not a regression: fail-closed already treated
+    /// `Err` as a violation; this only changes WHICH generic-vs-specific message
+    /// reaches the operator for this one case.
+    #[cfg(windows)]
+    #[test]
+    fn missing_credential_load_returns_render_safe_via_the_dacl_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini_path = dir.path().join("kiosk.ini");
+        std::fs::write(&ini_path, valid_ini()).unwrap();
+        // No cred.json written — the file the ini names never exists.
+        match load(&ini_path, dir.path(), None) {
+            BootOutcome::RenderSafe { error, reason, .. } => {
+                assert_eq!(reason, Some(CREDENTIAL_PERMISSIONS_REASON));
+                assert_eq!(error, CREDENTIAL_PERMISSIONS_MESSAGE);
+            }
+            BootOutcome::Ready(_) => panic!("a missing credential must render safe"),
+        }
+    }
+
+    /// Non-Windows only: with no DACL to check, this reaches the parse and fails
+    /// with "cannot parse" exactly as before. On Windows the DACL gate must be
+    /// cleared FIRST (a fresh temp file's inherited ACL is not owner-only — see
+    /// `force_owner_only_acl`'s doc below) or this would report
+    /// `credential_permissions` instead, for the wrong reason — see
+    /// `malformed_credential_with_an_owner_only_dacl_load_returns_render_safe`.
+    #[cfg(not(windows))]
     #[test]
     fn malformed_credential_load_returns_render_safe() {
         let dir = tempfile::tempdir().unwrap();
@@ -310,6 +354,72 @@ mod tests {
         std::fs::write(&ini_path, valid_ini()).unwrap();
         std::fs::write(dir.path().join("cred.json"), "{}").unwrap();
         assert_render_safe(load(&ini_path, dir.path(), None), "cannot parse");
+    }
+
+    /// FIX 4 (SEC-09 final review): the Windows counterpart of
+    /// `malformed_credential_load_returns_render_safe` above — the DACL gate now
+    /// runs FIRST, so this forces an owner-only ACL (mirroring
+    /// `valid_credential_load_is_ready_not_render_safe`) so the malformed-JSON
+    /// path underneath the gate is what's actually under test, not an accidental
+    /// DACL violation from the temp file's default inherited ACL.
+    #[cfg(windows)]
+    #[test]
+    fn malformed_credential_with_an_owner_only_dacl_load_returns_render_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini_path = dir.path().join("kiosk.ini");
+        std::fs::write(&ini_path, valid_ini()).unwrap();
+        let cred_path = dir.path().join("cred.json");
+        std::fs::write(&cred_path, "{}").unwrap();
+        force_owner_only_acl(&cred_path);
+        assert_render_safe(load(&ini_path, dir.path(), None), "cannot parse");
+    }
+
+    /// FIX 4 (SEC-09 final review): the case the review specifically flagged — a
+    /// credential that is BOTH a bad DACL AND malformed JSON. Before this fix,
+    /// read-then-parse ran first and this reported the generic "cannot parse"
+    /// with `reason: None`, so no `config.error{credential_permissions}` was ever
+    /// spooled and an operator who fixed the JSON alone would only discover the
+    /// ACL problem on the NEXT reboot. After the reorder, the DACL gate — checked
+    /// before the file is ever read — wins, reporting `credential_permissions`
+    /// even though the JSON underneath is also broken.
+    #[cfg(windows)]
+    #[test]
+    fn a_bad_dacl_and_malformed_json_load_reports_credential_permissions_not_cannot_parse() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ini_path = dir.path().join("kiosk.ini");
+        std::fs::write(&ini_path, valid_ini()).unwrap();
+        let cred_path = dir.path().join("cred.json");
+        // Malformed: "{}" fails `ServiceAccount::from_json` (missing required
+        // fields) exactly like `malformed_credential_load_returns_render_safe`.
+        std::fs::write(&cred_path, "{}").unwrap();
+        force_owner_only_acl(&cred_path);
+        let out = Command::new("icacls")
+            .arg(&cred_path)
+            .arg("/grant")
+            .arg("*S-1-5-32-545:(R)")
+            .output()
+            .expect("failed to spawn icacls");
+        assert!(
+            out.status.success(),
+            "icacls /grant failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        match load(&ini_path, dir.path(), None) {
+            BootOutcome::RenderSafe { error, reason, .. } => {
+                assert_eq!(
+                    reason,
+                    Some(CREDENTIAL_PERMISSIONS_REASON),
+                    "the DACL violation must win over the JSON also being malformed"
+                );
+                assert_eq!(error, CREDENTIAL_PERMISSIONS_MESSAGE);
+            }
+            BootOutcome::Ready(_) => {
+                panic!("a bad-DACL, malformed-JSON credential must render safe")
+            }
+        }
     }
 
     /// A syntactically valid service-account JSON (no PEM validation — see

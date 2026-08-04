@@ -995,12 +995,17 @@ mod tests {
         let cred_path = config_dir.join("cred.json");
         std::fs::write(&cred_path, test_service_account_json()).unwrap();
         force_owner_only_acl(&cred_path);
-        Command::new("icacls")
+        let out = Command::new("icacls")
             .arg(&cred_path)
             .arg("/grant")
             .arg("*S-1-5-32-545:(R)")
             .output()
             .expect("failed to spawn icacls");
+        assert!(
+            out.status.success(),
+            "icacls /grant failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
 
         let bootstrap = BootstrapConfig::parse(
             "[kiosk]\nconfig_url = https://e/c.json\nsite = hq\nproject_id = p\n\

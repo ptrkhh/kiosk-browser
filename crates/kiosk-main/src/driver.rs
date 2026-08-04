@@ -17,7 +17,7 @@ pub trait EffectSink {
 
 /// SEC-09 Critical 2 fix: once the credential-DACL reload gate navigates to
 /// `safe.html`, NOTHING may navigate the webview away again — but cancelling
-/// `driver_probe_cancel` (see `main.rs`'s `hold_safe_after_credential_violation`) only
+/// `fetch_probe_cancel` (see `main.rs`'s `hold_safe_after_credential_violation`) only
 /// narrows the race, it doesn't close it: `probe::run`'s in-flight `probe_once` and its
 /// unconditional `tx.send` aren't raced against cancellation at all, and `driver::run`'s
 /// `select!` has no `biased;`, so an `AppEvent` already buffered in the channel at the
@@ -27,6 +27,14 @@ pub trait EffectSink {
 /// producer, present or future, passes through `EffectSink::dispatch` — so wrapping the
 /// sink and refusing to forward once latched closes the whole class at the one place
 /// it all funnels through.
+///
+/// SEC-09 final review, FIX 2: `fetch_probe_cancel` is scoped to `fetch::run`/
+/// `probe::run` ONLY — `driver::run` (below) is deliberately handed the top-level
+/// shutdown token instead and is never cancelled by a credential-DACL violation, so
+/// this latch (not task exit) is the ONLY thing standing between a post-violation
+/// `AppEvent` and the webview. `ClearProfile`/`RefetchConfig` pass through
+/// unconditionally (see `dispatch` below) precisely because the driver task keeps
+/// running: the idle-clear privacy control depends on it.
 pub struct SafeLatchedSink<S> {
     inner: S,
     latched: Arc<AtomicBool>,

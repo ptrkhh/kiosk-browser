@@ -184,15 +184,50 @@ fn read_grantee_sids(dacl: *const windows::Win32::Security::ACL) -> io::Result<V
 }
 
 /// True iff `mask` grants any bit this module treats as "can read the file's
-/// contents": `FILE_GENERIC_READ`, `GENERIC_READ`, or the narrower
-/// `FILE_READ_DATA` (the actual bit set inside `FILE_GENERIC_READ`).
+/// contents": `FILE_GENERIC_READ`, `GENERIC_READ`, `FILE_READ_DATA` (the
+/// actual bit set inside `FILE_GENERIC_READ`), any of the generic rights
+/// (`GENERIC_ALL`, `GENERIC_READ`, `GENERIC_WRITE`, `GENERIC_EXECUTE` —
+/// `GENERIC_ALL` is `0x1000_0000`, which does not intersect the
+/// specific-rights bits above as a raw bit), or `MAXIMUM_ALLOWED`
+/// (`0x0200_0000`).
+///
+/// `MapGenericMask` performs the same generic->specific expansion the OS
+/// itself does when it evaluates access checks, so a `GENERIC_*` bit in
+/// `mask` is judged exactly as Windows would. `MAXIMUM_ALLOWED` is NOT one
+/// of the four bits `MapGenericMask` touches (it maps only
+/// `GENERIC_{READ,WRITE,EXECUTE,ALL}`), so it is checked directly instead;
+/// Windows does not accept `MAXIMUM_ALLOWED` in a stored ACE at all (it is
+/// only meaningful in an access-check request), so this is defense in depth
+/// against an already-invalid mask rather than a real access grant this
+/// function has ever been observed to receive — same as the `GENERIC_*` bits
+/// above (verified empirically while building this fix: a real on-disk NTFS
+/// ACE never carries them either, since `SetNamedSecurityInfoW`/NTFS maps
+/// generic rights to specific rights at write time — see this module's
+/// `generic_all_is_a_read_grant` test doc comment for the trace). Kept as
+/// cheap, correct defense in depth against a caller or filesystem this
+/// module has not been observed to encounter, not a fix for a
+/// currently-reachable fail-open.
 #[cfg(windows)]
 fn mask_grants_read(mask: u32) -> bool {
     use windows::Win32::Foundation::GENERIC_READ;
-    use windows::Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_READ_DATA};
+    use windows::Win32::Security::{MapGenericMask, GENERIC_MAPPING};
+    use windows::Win32::Storage::FileSystem::{FILE_ALL_ACCESS, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_GENERIC_EXECUTE, FILE_READ_DATA};
 
-    const READ_BITS: u32 = FILE_GENERIC_READ.0 | GENERIC_READ.0 | FILE_READ_DATA.0;
-    mask & READ_BITS != 0
+    let mut mapped = mask;
+    let mapping = GENERIC_MAPPING {
+        GenericRead: FILE_GENERIC_READ.0,
+        GenericWrite: FILE_GENERIC_WRITE.0,
+        GenericExecute: FILE_GENERIC_EXECUTE.0,
+        GenericAll: FILE_ALL_ACCESS.0,
+    };
+    // Safety: `mapped` is a valid local `u32` out-param; `mapping` is a fully
+    // populated, stack-local `GENERIC_MAPPING` alive for the call. Pure bit
+    // manipulation on the caller's own memory — no handles, no allocation.
+    unsafe { MapGenericMask(&mut mapped, &mapping) };
+
+    const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+    const READ_BITS: u32 = FILE_GENERIC_READ.0 | GENERIC_READ.0 | FILE_READ_DATA.0 | MAXIMUM_ALLOWED;
+    mapped & READ_BITS != 0
 }
 
 /// Converts a Win32 `PSID` to its string form (`S-1-5-...`), freeing the
@@ -279,5 +314,33 @@ mod tests {
     #[test]
     fn zero_mask_is_not_a_read_grant() {
         assert!(!mask_grants_read(0));
+    }
+
+    /// FIX 1 (SEC-09 final review, Critical): `GENERIC_ALL` (0x1000_0000) does not
+    /// intersect any of `FILE_GENERIC_READ`/`GENERIC_READ`/`FILE_READ_DATA` as raw
+    /// bits, so a naive bitmask check misses a mask carrying only this bit. Pins
+    /// `mask_grants_read`'s contract directly at the unit level; fails against the
+    /// pre-fix `READ_BITS`-only check. NOTE: verified empirically while building
+    /// this fix that a REAL on-disk NTFS ACE never actually carries this literal
+    /// value — `SetNamedSecurityInfoW`/NTFS maps `GENERIC_ALL` to the specific
+    /// `FILE_ALL_ACCESS` mask at write time, for both `icacls`'s `(GA)` shorthand
+    /// and a hand-built SDDL string passed straight to the Win32 API — so this is
+    /// defense in depth against a caller (or filesystem) this module has not been
+    /// observed to encounter, not a currently-reachable fail-open.
+    #[test]
+    fn generic_all_is_a_read_grant() {
+        use windows::Win32::Foundation::GENERIC_ALL;
+        assert!(mask_grants_read(GENERIC_ALL.0));
+    }
+
+    /// Same gap as `GENERIC_ALL`: `MAXIMUM_ALLOWED` (0x0200_0000) also does not
+    /// intersect the specific-rights bits directly. Windows does not accept
+    /// `MAXIMUM_ALLOWED` inside a stored ACE at all (it is only meaningful in an
+    /// access-check request) — this pins `mask_grants_read`'s behavior on the raw
+    /// value regardless, since the function has no way to know that.
+    #[test]
+    fn maximum_allowed_is_a_read_grant() {
+        const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+        assert!(mask_grants_read(MAXIMUM_ALLOWED));
     }
 }

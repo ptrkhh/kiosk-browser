@@ -273,6 +273,21 @@ fn entry_context(
 /// network — exactly what must still work when the credential itself is refused. Best-
 /// effort: a spool that fails to open/append here is no worse than the boot fault it is
 /// trying to report, and must never turn into a second reason the kiosk fails to boot.
+///
+/// `logging` (SEC-09 final review, minor): the caller's LAST-GOOD `[logging]` block, not
+/// a fresh `Logging::default()` — `Spool::open` reopens the SAME on-disk partition
+/// `telemetry::build`'s live `Logger` would, so a site that tuned `max_mb`/`segment_mb`
+/// away from spec defaults gets the SAME `SpoolConfig` here as everywhere else this
+/// partition is opened, not a mismatched one for this one write. The boot-fault caller
+/// (`main`) always still has a `ConfigManager` at this point — even the credential-DACL
+/// fault path parses `kiosk.ini` fine and only refuses the credential — so its last-good
+/// `current().logging` (spec defaults on a genuinely first boot, same as before) is
+/// always available to pass here.
+// One over clippy's 7-arg threshold, same call as `fetch::run`'s: every parameter is a
+// distinct, already-resolved piece of the one boot-fault write this function makes —
+// there is exactly one production caller (`main`) — and a params struct here would
+// just be a second name for the same seven-plus-one fields.
+#[allow(clippy::too_many_arguments)]
 pub fn spool_boot_config_error(
     data_dir: &Path,
     bootstrap: &BootstrapConfig,
@@ -281,11 +296,11 @@ pub fn spool_boot_config_error(
     revision: Option<i64>,
     clock: &TrustedClock,
     reason: &str,
+    logging: &Logging,
 ) {
-    let logging = Logging::default();
     let Ok(mut spool) = Spool::open(
         &data_dir.join("spool").join("main"),
-        SpoolConfig::from_logging(&logging),
+        SpoolConfig::from_logging(logging),
     ) else {
         return;
     };
@@ -692,6 +707,7 @@ mod tests {
             None,
             &clock,
             "credential_permissions",
+            &Logging::default(),
         );
 
         let mut spool = Spool::open(
@@ -735,6 +751,7 @@ mod tests {
             None,
             &clock,
             "credential_permissions",
+            &Logging::default(),
         );
         // No assertion beyond "did not panic".
     }

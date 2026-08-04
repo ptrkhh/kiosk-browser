@@ -184,15 +184,50 @@ fn read_grantee_sids(dacl: *const windows::Win32::Security::ACL) -> io::Result<V
 }
 
 /// True iff `mask` grants any bit this module treats as "can read the file's
-/// contents": `FILE_GENERIC_READ`, `GENERIC_READ`, or the narrower
-/// `FILE_READ_DATA` (the actual bit set inside `FILE_GENERIC_READ`).
+/// contents": `FILE_GENERIC_READ`, `GENERIC_READ`, `FILE_READ_DATA` (the
+/// actual bit set inside `FILE_GENERIC_READ`), any of the generic rights
+/// (`GENERIC_ALL`, `GENERIC_READ`, `GENERIC_WRITE`, `GENERIC_EXECUTE` —
+/// `GENERIC_ALL` is `0x1000_0000`, which does not intersect the
+/// specific-rights bits above as a raw bit), or `MAXIMUM_ALLOWED`
+/// (`0x0200_0000`).
+///
+/// `MapGenericMask` performs the same generic->specific expansion the OS
+/// itself does when it evaluates access checks, so a `GENERIC_*` bit in
+/// `mask` is judged exactly as Windows would. `MAXIMUM_ALLOWED` is NOT one
+/// of the four bits `MapGenericMask` touches (it maps only
+/// `GENERIC_{READ,WRITE,EXECUTE,ALL}`), so it is checked directly instead;
+/// Windows does not accept `MAXIMUM_ALLOWED` in a stored ACE at all (it is
+/// only meaningful in an access-check request), so this is defense in depth
+/// against an already-invalid mask rather than a real access grant this
+/// function has ever been observed to receive — same as the `GENERIC_*` bits
+/// above (verified empirically while building this fix: a real on-disk NTFS
+/// ACE never carries them either, since `SetNamedSecurityInfoW`/NTFS maps
+/// generic rights to specific rights at write time — see this module's
+/// `generic_all_is_a_read_grant` test doc comment for the trace). Kept as
+/// cheap, correct defense in depth against a caller or filesystem this
+/// module has not been observed to encounter, not a fix for a
+/// currently-reachable fail-open.
 #[cfg(windows)]
 fn mask_grants_read(mask: u32) -> bool {
     use windows::Win32::Foundation::GENERIC_READ;
-    use windows::Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_READ_DATA};
+    use windows::Win32::Security::{MapGenericMask, GENERIC_MAPPING};
+    use windows::Win32::Storage::FileSystem::{FILE_ALL_ACCESS, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_GENERIC_EXECUTE, FILE_READ_DATA};
 
-    const READ_BITS: u32 = FILE_GENERIC_READ.0 | GENERIC_READ.0 | FILE_READ_DATA.0;
-    mask & READ_BITS != 0
+    let mut mapped = mask;
+    let mapping = GENERIC_MAPPING {
+        GenericRead: FILE_GENERIC_READ.0,
+        GenericWrite: FILE_GENERIC_WRITE.0,
+        GenericExecute: FILE_GENERIC_EXECUTE.0,
+        GenericAll: FILE_ALL_ACCESS.0,
+    };
+    // Safety: `mapped` is a valid local `u32` out-param; `mapping` is a fully
+    // populated, stack-local `GENERIC_MAPPING` alive for the call. Pure bit
+    // manipulation on the caller's own memory — no handles, no allocation.
+    unsafe { MapGenericMask(&mut mapped, &mapping) };
+
+    const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+    const READ_BITS: u32 = FILE_GENERIC_READ.0 | GENERIC_READ.0 | FILE_READ_DATA.0 | MAXIMUM_ALLOWED;
+    mapped & READ_BITS != 0
 }
 
 /// Converts a Win32 `PSID` to its string form (`S-1-5-...`), freeing the
@@ -281,6 +316,34 @@ mod tests {
         assert!(!mask_grants_read(0));
     }
 
+    /// FIX 1 (SEC-09 final review, Critical): `GENERIC_ALL` (0x1000_0000) does not
+    /// intersect any of `FILE_GENERIC_READ`/`GENERIC_READ`/`FILE_READ_DATA` as raw
+    /// bits, so a naive bitmask check misses a mask carrying only this bit. Pins
+    /// `mask_grants_read`'s contract directly at the unit level; fails against the
+    /// pre-fix `READ_BITS`-only check. NOTE: verified empirically while building
+    /// this fix that a REAL on-disk NTFS ACE never actually carries this literal
+    /// value — `SetNamedSecurityInfoW`/NTFS maps `GENERIC_ALL` to the specific
+    /// `FILE_ALL_ACCESS` mask at write time, for both `icacls`'s `(GA)` shorthand
+    /// and a hand-built SDDL string passed straight to the Win32 API — so this is
+    /// defense in depth against a caller (or filesystem) this module has not been
+    /// observed to encounter, not a currently-reachable fail-open.
+    #[test]
+    fn generic_all_is_a_read_grant() {
+        use windows::Win32::Foundation::GENERIC_ALL;
+        assert!(mask_grants_read(GENERIC_ALL.0));
+    }
+
+    /// Same gap as `GENERIC_ALL`: `MAXIMUM_ALLOWED` (0x0200_0000) also does not
+    /// intersect the specific-rights bits directly. Windows does not accept
+    /// `MAXIMUM_ALLOWED` inside a stored ACE at all (it is only meaningful in an
+    /// access-check request) — this pins `mask_grants_read`'s behavior on the raw
+    /// value regardless, since the function has no way to know that.
+    #[test]
+    fn maximum_allowed_is_a_read_grant() {
+        const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+        assert!(mask_grants_read(MAXIMUM_ALLOWED));
+    }
+
     // Real-DACL integration coverage for `credential_is_owner_only` itself
     // (not just the pure `mask_grants_read` helper above). Exercises the
     // actual FFI path — `GetNamedSecurityInfoW`, the ACE-type dispatch in
@@ -289,10 +352,14 @@ mod tests {
     // exercised here: `icacls` on a normal NTFS file always produces a
     // present DACL, so this test only distinguishes "present, 1 ACE" from
     // "present, 2 ACEs" — the null-DACL fail-closed branch remains untested
-    // by this integration test. This crate's copy of `credential_acl.rs` is
-    // byte-identical to `crates/kiosk-launcher/src/credential_acl.rs`, so
-    // this coverage applies to both; do not duplicate this test into the
-    // launcher crate.
+    // by this integration test. The FFI functions in this module
+    // (`credential_is_owner_only`, `read_grantee_sids`, `mask_grants_read`)
+    // are currently identical, statement-for-statement, to
+    // `crates/kiosk-launcher/src/credential_acl.rs` — keep the two in sync
+    // when either changes (see `drift_guard_tests` below, which checks this
+    // mechanically rather than by convention alone). This crate owns the
+    // only real-DACL integration test for the shared logic; the launcher
+    // crate deliberately does not duplicate it.
     #[test]
     fn credential_is_owner_only_reflects_real_dacl() {
         use super::credential_is_owner_only;
@@ -396,7 +463,133 @@ mod tests {
             "expected Err for a nonexistent path"
         );
 
+        // Step 5 (FIX 1, SEC-09 final review): reset to owner-only, then widen
+        // to Everyone (S-1-1-0) via the `(GA)` shorthand. NOTE, verified
+        // empirically while implementing this fix (see the review-response
+        // report for the full trace): this step does NOT, on this Windows
+        // build, reproduce the raw-generic-bit fail-open the review
+        // described — `SetNamedSecurityInfoW`/NTFS maps `GENERIC_ALL`
+        // (0x1000_0000) to the specific `FILE_ALL_ACCESS` mask (0x1F01FF)
+        // at the moment the DACL is written to disk, regardless of whether
+        // the caller is `icacls`'s `(GA)` shorthand or a hand-built SDDL
+        // string passed straight to `SetNamedSecurityInfoW`. So the ACE this
+        // test's `credential_is_owner_only` call reads back already carries
+        // the mapped, specific bits — which the PRE-FIX `mask_grants_read`
+        // already classified as read-granting via its `FILE_GENERIC_READ`
+        // overlap alone. This assertion therefore passes both before and
+        // after FIX 1 and is kept only as regression coverage for a
+        // full-control widening via the `(GA)` shorthand, not as proof of
+        // FIX 1 — `mask_grants_read`'s own `generic_all_is_a_read_grant`/
+        // `maximum_allowed_is_a_read_grant` unit tests below are the actual
+        // RED/GREEN evidence for that gap (a synthetic mask value no real
+        // on-disk NTFS ACE has been observed to carry, but which some other
+        // FFI caller of this same function — or a non-NTFS filesystem —
+        // could still hand it in the future; `MapGenericMask` is kept as
+        // cheap, correct defense in depth for that case).
+        let out = Command::new("icacls")
+            .arg(&file)
+            .arg("/inheritance:r")
+            .arg("/grant:r")
+            .arg(format!("*{sid}:(F)"))
+            .output()
+            .expect("failed to spawn icacls");
+        assert!(
+            out.status.success(),
+            "icacls /inheritance:r /grant:r (reset) failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let out = Command::new("icacls")
+            .arg(&file)
+            .arg("/grant")
+            .arg("*S-1-1-0:(GA)")
+            .output()
+            .expect("failed to spawn icacls");
+        assert!(
+            out.status.success(),
+            "icacls /grant *S-1-1-0:(GA) failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let result = credential_is_owner_only(&file)
+            .expect("a DACL widened via (GA) should still read cleanly");
+        assert!(
+            !result,
+            "expected Ok(false) once Everyone (S-1-1-0) has been granted (GA)/full control"
+        );
+
         // `dir` (a `tempfile::TempDir`) removes itself and its contents on
         // drop here, regardless of whether the assertions above passed.
+    }
+}
+
+/// FIX 5 (SEC-09 final review): the two crates' `credential_acl.rs` are Win32
+/// FFI edges that must stay in lockstep (see this module's doc comment on
+/// `credential_is_owner_only_reflects_real_dacl`) but are deliberately NOT
+/// merged into kiosk-core (the Win32 read stays a per-binary edge, per the
+/// P1-G plan). A comment saying "keep in sync" enforces nothing by itself —
+/// this mechanically diffs the three shared functions' source text against
+/// `kiosk-launcher`'s copy so drift fails CI instead of rotting silently.
+/// Deliberately crude (brace-counting, not real parsing): good enough to
+/// catch the class of change that actually matters here (someone edits one
+/// copy's logic and forgets the other), and cheap to keep robust against
+/// unrelated doc-comment/whitespace differences, since those are stripped
+/// out below before comparing.
+#[cfg(all(test, windows))]
+mod drift_guard_tests {
+    const THIS_FILE: &str = include_str!("credential_acl.rs");
+    const LAUNCHER_FILE: &str =
+        include_str!("../../kiosk-launcher/src/credential_acl.rs");
+
+    /// Extracts `fn {name}`'s source, from the `fn` keyword through its
+    /// matching closing brace (by simple brace counting — good enough for
+    /// this file's straight-line, comment-free-of-stray-braces functions),
+    /// with every line's leading/trailing whitespace stripped and blank
+    /// lines dropped, so only the two files' identical DOC COMMENTS or
+    /// incidental reindentation never causes a false failure.
+    fn extract_fn(source: &str, name: &str) -> String {
+        let needle = format!("fn {name}(");
+        let start = source
+            .find(&needle)
+            .unwrap_or_else(|| panic!("`fn {name}` not found in source"));
+        let body_start = source[start..]
+            .find('{')
+            .map(|i| start + i)
+            .unwrap_or_else(|| panic!("no `{{` found after `fn {name}(`"));
+        let bytes = source.as_bytes();
+        let mut depth = 0i32;
+        let mut end = body_start;
+        for (i, &b) in bytes[body_start..].iter().enumerate() {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = body_start + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        source[start..=end]
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn shared_functions_match_the_launcher_crates_copy() {
+        for name in ["credential_is_owner_only", "read_grantee_sids", "mask_grants_read"] {
+            let mine = extract_fn(THIS_FILE, name);
+            let theirs = extract_fn(LAUNCHER_FILE, name);
+            assert_eq!(
+                mine, theirs,
+                "`{name}` has drifted between kiosk-main's and kiosk-launcher's \
+                 credential_acl.rs — keep the two FFI copies in sync (see this \
+                 module's doc comment on why they aren't merged)"
+            );
+        }
     }
 }
