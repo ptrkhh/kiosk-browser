@@ -7,6 +7,7 @@
 //! Wired into `main.rs` (Task 6): `main` extracts the real `ConfigManager`/URL/`poll_s`
 //! from a `Booted` and spawns [`run`].
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,6 +16,7 @@ use kiosk_core::config::ConfigManager;
 use tokio::sync::{mpsc, Notify};
 use tokio_util::sync::CancellationToken;
 
+use crate::credential_acl;
 use crate::nav_policy::{NavPolicy, SharedNavPolicy};
 
 /// The result of one fetch-and-apply attempt.
@@ -67,8 +69,9 @@ pub async fn fetch_bytes(url: &str) -> Result<Vec<u8>, ()> {
 /// Emits `AppEvent::ConfigApplied{url}` AT LEVEL on every successful apply — re-sent every
 /// poll, even when the url is unchanged; the FSM handles a repeated or changed url naturally.
 /// `Unreachable` is silently ignored: the prober (not this task) owns connectivity signaling.
-// One param over clippy's 7-arg threshold since the live nav policy was threaded in; a
-// struct wrapper is out of scope for T1 and would obscure the call site.
+// Two params over clippy's 7-arg threshold: the live nav policy (pre-existing) plus the
+// SEC-09 reload gate's credential path/violation channel. A struct wrapper would obscure
+// the call site for what is still a flat, one-purpose parameter list.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     mut manager: ConfigManager,
@@ -79,6 +82,8 @@ pub async fn run(
     refetch: Arc<Notify>,
     cancel: CancellationToken,
     nav_policy: SharedNavPolicy,
+    credential_path: PathBuf,
+    credential_violation_tx: mpsc::Sender<String>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(poll_s.max(1)));
     loop {
@@ -86,6 +91,18 @@ pub async fn run(
             _ = cancel.cancelled() => break,
             _ = interval.tick() => {}
             _ = refetch.notified() => {}
+        }
+        // SEC-09 reload gate: a cheap security-info read (never the credential's
+        // own contents) on every poll tick — a DACL that went bad since boot must
+        // stop this task from ever applying another fetched config. `try_send`
+        // (capacity 1): the receiver only ever needs the FIRST report, and this
+        // loop breaks right after, so there is at most one send per process life.
+        if credential_acl::is_violation(credential_acl::credential_is_owner_only(&credential_path))
+        {
+            telem.config_error(crate::boot::CREDENTIAL_PERMISSIONS_REASON);
+            let _ = credential_violation_tx
+                .try_send(crate::boot::CREDENTIAL_PERMISSIONS_MESSAGE.to_string());
+            break;
         }
         match apply(&mut manager, fetch_bytes(&url).await) {
             FetchOutcome::Applied {

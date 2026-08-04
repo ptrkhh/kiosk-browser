@@ -19,7 +19,7 @@ use kiosk_core::config::bootstrap::BootstrapConfig;
 use kiosk_core::config::schema::{Logging, UrlDetail};
 use kiosk_core::logging::auth::{ServiceAccount, TokenSource};
 use kiosk_core::logging::client::GclClient;
-use kiosk_core::logging::entry::{redact_url, EntryContext};
+use kiosk_core::logging::entry::{redact_url, EntryContext, LogEntry};
 use kiosk_core::logging::event::Event as LogEvent;
 use kiosk_core::logging::ratelimit::RateLimiter;
 use kiosk_core::logging::spool::{Spool, SpoolConfig};
@@ -227,7 +227,31 @@ pub fn build(
     )?;
     let limiter = RateLimiter::new(clock.clone());
 
-    let ctx = EntryContext {
+    let ctx = entry_context(
+        bootstrap,
+        device_id,
+        app_version,
+        revision,
+        logging.url_detail,
+    );
+
+    let logger = Logger::new(ctx, spool, client, limiter, clock);
+    let (tx, rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+    Ok((Telemetry { tx }, logger, rx))
+}
+
+/// The one place `EntryContext` is assembled from a `BootstrapConfig` — shared by
+/// [`build`] (the live, GCL-backed path) and [`spool_boot_config_error`] (the
+/// credential-less boot-gate path), so a `config.error` written by either produces the
+/// byte-identical label/context shape.
+fn entry_context(
+    bootstrap: &BootstrapConfig,
+    device_id: &str,
+    app_version: String,
+    revision: Option<i64>,
+    url_detail: kiosk_core::config::schema::UrlDetail,
+) -> EntryContext {
+    EntryContext {
         project_id: bootstrap.project_id.clone(),
         device_id: device_id.to_string(),
         site: bootstrap.site.clone(),
@@ -237,12 +261,63 @@ pub fn build(
             .unwrap_or_else(|| bootstrap.site.clone()),
         app_version,
         config_revision: revision,
-        url_detail: logging.url_detail,
-    };
+        url_detail,
+    }
+}
 
-    let logger = Logger::new(ctx, spool, client, limiter, clock);
-    let (tx, rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
-    Ok((Telemetry { tx }, logger, rx))
+/// SEC-09 boot gate durability (Critical 1 fix): `build` above is never called when the
+/// boot gate trips on a bad credential DACL — that would be the very credential read the
+/// gate exists to prevent — so there is no live `Logger`/`GclClient` for `telem.config_error`
+/// to reach. This writes the SAME event shape (`ConfigError`, `reason` field, identical
+/// `EntryContext`) directly to the local [`Spool`], which needs no credential and no
+/// network — exactly what must still work when the credential itself is refused. Best-
+/// effort: a spool that fails to open/append here is no worse than the boot fault it is
+/// trying to report, and must never turn into a second reason the kiosk fails to boot.
+///
+/// `logging` (SEC-09 final review, minor): the caller's LAST-GOOD `[logging]` block, not
+/// a fresh `Logging::default()` — `Spool::open` reopens the SAME on-disk partition
+/// `telemetry::build`'s live `Logger` would, so a site that tuned `max_mb`/`segment_mb`
+/// away from spec defaults gets the SAME `SpoolConfig` here as everywhere else this
+/// partition is opened, not a mismatched one for this one write. The boot-fault caller
+/// (`main`) always still has a `ConfigManager` at this point — even the credential-DACL
+/// fault path parses `kiosk.ini` fine and only refuses the credential — so its last-good
+/// `current().logging` (spec defaults on a genuinely first boot, same as before) is
+/// always available to pass here.
+// One over clippy's 7-arg threshold, same call as `fetch::run`'s: every parameter is a
+// distinct, already-resolved piece of the one boot-fault write this function makes —
+// there is exactly one production caller (`main`) — and a params struct here would
+// just be a second name for the same seven-plus-one fields.
+#[allow(clippy::too_many_arguments)]
+pub fn spool_boot_config_error(
+    data_dir: &Path,
+    bootstrap: &BootstrapConfig,
+    device_id: &str,
+    app_version: String,
+    revision: Option<i64>,
+    clock: &TrustedClock,
+    reason: &str,
+    logging: &Logging,
+) {
+    let Ok(mut spool) = Spool::open(
+        &data_dir.join("spool").join("main"),
+        SpoolConfig::from_logging(logging),
+    ) else {
+        return;
+    };
+    let ctx = entry_context(
+        bootstrap,
+        device_id,
+        app_version,
+        revision,
+        logging.url_detail,
+    );
+    let mut fields = Map::new();
+    fields.insert("error".into(), Value::from(reason));
+    let Ok(seq) = spool.next_seq() else {
+        return;
+    };
+    let entry = LogEntry::new(LogEvent::ConfigError, &ctx, seq, clock, fields);
+    let _ = spool.append(&entry);
 }
 
 /// The logger loop — run on a DEDICATED OS THREAD (`std::thread`), never a tokio
@@ -593,5 +668,91 @@ mod tests {
         telem.panic("boom");
         // No assertion beyond "did not panic": the whole contract is that a dropped
         // receiver turns every `try_send` into a discarded `Err(Closed)`.
+    }
+
+    fn test_bootstrap() -> BootstrapConfig {
+        BootstrapConfig {
+            config_url: "https://cfg.test/c.json".into(),
+            device_id: None,
+            site: "hq".into(),
+            region: None,
+            project_id: "proj".into(),
+            credential: "cred.json".into(),
+            startup_grace_s: 0,
+            healthy_run_s: 0,
+            channel_grace_s: 0,
+            demo_mode: false,
+            bootstrap_url: "https://site.test/".into(),
+            exit_gesture: None,
+        }
+    }
+
+    /// Critical 1 (SEC-09 review): `telem.config_error(reason)` at boot is a
+    /// guaranteed no-op — `telem` is always `Telemetry::disabled()` in the exact
+    /// scenario the boot gate exists for, since `telemetry::build` (the only thing
+    /// that would ever produce a live `Logger`) is never called. This asserts the
+    /// event actually lands on DISK — draining the same on-disk `Spool` a fresh
+    /// process would reopen — not merely that some call was made.
+    #[test]
+    fn spool_boot_config_error_writes_a_durable_config_error_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let bootstrap = test_bootstrap();
+        let clock = established_clock();
+
+        spool_boot_config_error(
+            dir.path(),
+            &bootstrap,
+            "lobby-01",
+            "0.1.0".into(),
+            None,
+            &clock,
+            "credential_permissions",
+            &Logging::default(),
+        );
+
+        let mut spool = Spool::open(
+            &dir.path().join("spool").join("main"),
+            SpoolConfig {
+                max_mb: 50,
+                reserve_high_mb: 10,
+                segment_mb: 5,
+            },
+        )
+        .expect("spool reopens");
+        let batch = spool.drain_batch(10).expect("drain succeeds");
+        assert_eq!(
+            batch.len(),
+            1,
+            "the config.error entry must actually be on disk, not just attempted"
+        );
+        assert_eq!(batch[0].json_payload["event"], Value::from("config.error"));
+        assert_eq!(
+            batch[0].json_payload["error"],
+            Value::from("credential_permissions")
+        );
+        assert_eq!(batch[0].labels["device_id"], Value::from("lobby-01"));
+    }
+
+    /// A spool that cannot be opened (e.g. an unwritable path) must degrade silently —
+    /// this is a best-effort durability write at boot, not a second reason to fail
+    /// startup.
+    #[test]
+    fn spool_boot_config_error_never_panics_on_an_unusable_path() {
+        let bootstrap = test_bootstrap();
+        let clock = established_clock();
+        // A file, not a directory, as the "data dir" — `Spool::open`'s `create_dir_all`
+        // must fail against it.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        spool_boot_config_error(
+            file.path(),
+            &bootstrap,
+            "lobby-01",
+            "0.1.0".into(),
+            None,
+            &clock,
+            "credential_permissions",
+            &Logging::default(),
+        );
+        // No assertion beyond "did not panic".
     }
 }

@@ -12,6 +12,16 @@
 //! threshold), so a kiosk left untouched for hours doesn't re-fire every second.
 //! `threshold == 0` means the feature is off — never fires (spec: `idle_reset_seconds:
 //! 0` disables idle reset).
+//!
+//! SEC-09 final review: this task is never cancelled by a credential-DACL violation
+//! (its `cancel` is the top-level shutdown token, not `main::fetch_probe_cancel`), so
+//! it keeps `tx.send`ing `IdleExpired` into `driver::run`'s channel after a violation
+//! exactly as before one. That's intentional, not a leak: `driver::run` also stays
+//! alive post-violation (see `driver::SafeLatchedSink`'s doc comment), so these events
+//! are still drained and handled by the FSM — `Online + idle_clear` still emits
+//! `Effect::ClearProfile`, which the latch deliberately lets through, and any
+//! `Navigate`/`ShowVideo` the FSM might otherwise emit is blocked at the sink, not by
+//! starving this producer.
 
 use kiosk_core::app::state::Event as AppEvent;
 
