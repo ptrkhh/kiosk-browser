@@ -13,6 +13,18 @@ displays. Spec of record: [`docs/superpowers/specs/2026-07-05-kiosk-browser-desi
 > credential-DACL check + OS-keystore protection — see `packaging/windows/README.md`).
 > Linux (P2, WebKitGTK) and Android (P3) are later phases.
 
+### What's in P1 (Windows MVP)
+
+- **Config** — `kiosk.ini` bootstrap + remote JSON, **Ed25519-signed** (RFC 8785 JCS) with per-device binding + anti-rollback, whole-document validation, last-good store.
+- **Telemetry** — Google Cloud Logging (RS256 JWT auth), NTP-independent trusted time, crash-durable severity-tiered spool, rate limiting.
+- **Connectivity + navigation** — damped online/offline prober, default-deny URLPattern allowlist + scheme guard (`nav::decide`).
+- **Webview hardening (§7)** — context-menu/devtools/zoom/pinch/autofill off, script-dialog + permission policy, egress containment (subresource allowlist), document-start injection, shortcut blocking, renderer crash/hang recovery.
+- **Native input (§3.5)** — idle-session reset with an async **profile-clear privacy gate**, tap + technician-chord exit gesture, **argon2id PIN pad** (exit code 86) with persisted lockout.
+- **Supervision** — `kiosk-launcher` watchdog: named-pipe heartbeat, READY arming, backoff, **safe mode + escalation**, Job-Object kill-on-close, single-instance mutex, orphan-spool drain.
+- **Lifecycle + security** — `--safe` page, DST-safe nightly reload, **SEC-09 fail-closed credential-DACL check**, WiX MSI + Authenticode + the §7.2 OS-lockdown runbook.
+
+All subsystems host-tested where pure (700+ tests across the crates); the Windows layers are hardware-smoked (supervision + the security gates proven on a real device against real GCP). Design of record: the spec linked above; per-phase specs/plans live under [`docs/superpowers/`](docs/superpowers/).
+
 ## Workspace layout (spec §4)
 
 | Crate | Role |
