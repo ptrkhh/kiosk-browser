@@ -8,7 +8,8 @@
 > `crates/kiosk-main/src/{nav,recovery,clear}.rs` real bodies, and moves the parts that a
 > shipped Tauri/wry API already covers onto that API instead of hand-writing them.
 
-**Status:** rev 2, 2026-08-06 — revised after adversarial design review. Executes on a Linux
+**Status:** rev 3, 2026-08-06 — rev 2 (adversarial design review) verified against the
+codebase and vendored sources; rev 3 restores popup navigate-in-place per parent §7. Executes on a Linux
 host (Wayland). Pure additions (origin constants, event mappings, the Unix credential-mode
 check) are host-tested; GTK signal wiring is covered by an in-session headless-compositor
 smoke, which is the merge gate.
@@ -49,7 +50,7 @@ Tauri. Use it; do not re-derive it:
 | Need | Route | Not this |
 |---|---|---|
 | Nav blocking | `WebviewWindowBuilder::on_navigation` (`tauri-2.11.5/src/webview/webview_window.rs:266`) | a hand-written `decide-policy` handler |
-| Popups | `WebviewWindowBuilder::on_new_window` → `NewWindowResponse::Deny` (`webview_window.rs:315`, `webview/mod.rs:253`) | `NEW_WINDOW_ACTION` plumbing |
+| Popups | `WebviewWindowBuilder::on_new_window` → navigate-in-place + `NewWindowResponse::Deny` (`webview_window.rs:315`, `webview/mod.rs:253`; see Components) | `NEW_WINDOW_ACTION` plumbing |
 | Crash recovery action | `WebviewWindow::navigate(Url)` (`webview/mod.rs:1689`) | any GTK call |
 
 The direct `webkit2gtk` dependency is therefore justified by **three signals plus one
@@ -125,7 +126,11 @@ builder = builder.on_navigation(move |url| {
         None => true,
     }
 });
-builder = builder.on_new_window(|_url, _features| NewWindowResponse::Deny);
+let handle = app.handle().clone();
+builder = builder.on_new_window(move |url, _features| {
+    let _ = handle.get_webview_window(WINDOW_LABEL).map(|w| w.navigate(url));
+    NewWindowResponse::Deny
+});
 ```
 
 wry already installs the `decide-policy` handler this drives
@@ -152,9 +157,17 @@ main-frame-only; that does not transfer). It is a deliberate Linux decision: enf
   allowed on **both** platforms — on Linux via `tauri-runtime-wry-2.11.4/src/lib.rs:4903`'s
   `unwrap_or(true)`, on Windows via `should_block`'s `is_remote_origin` short-circuit at
   `nav.rs:57`. Same fail-open, same trust boundary, pre-existing.
-- *Popups:* Windows redirects them into the main window where they re-enter the guard
-  (`nav.rs:191-207`); Linux denies outright. Fail-closed either way — the difference is UX,
-  not control. Deny explicitly rather than relying on wry not connecting `connect_create`.
+- *Popups — parity, corrected in rev 3:* rev 2 denied outright, reasoning "fail-closed either
+  way, the difference is UX, not control" — but navigate-in-place is a requirement of the
+  parent spec of record, not a UX nicety: §7's hardening table, "Downloads / popups / file
+  pickers — blocked; **new windows navigate in place**". So `on_new_window` hands the URL
+  back into the main webview and *then* denies (snippet above): `navigate` is a
+  dispatcher-proxied non-blocking send, safe from the event-loop thread, and the resulting
+  load re-enters `on_navigation` and faces the guard — exactly Windows' `SetHandled(true)` +
+  `Navigate` take-over (`nav.rs:186-207`, which cites the same requirement). A blocked popup
+  still yields exactly one `nav.blocked`: the guard emits it, and the interrupted load's
+  `load-failed` is dropped by the policy filter below. Deny explicitly rather than relying on
+  wry not connecting `connect_create`.
 
 Amend `telemetry.rs:120-121`'s doc comment: "A navigation was cancelled by the native guard
 (main-frame on Windows; any frame on Linux — see `nav.rs`)." Doc-only, `cfg`-free.
@@ -278,7 +291,8 @@ serving a **signed** config via the P1 `kioskctl` signing harness; telemetry ass
 **on-disk spool** (the durable record — no fake-GCL endpoint needed).
 
 1. boot → splash → remote home `nav.committed` (local httpd allowlisted);
-2. off-list navigation → exactly one `nav.blocked`, page unchanged;
+2. off-list navigation → exactly one `nav.blocked`, page unchanged; a `target=_blank` click
+   navigates in place (no second window; an off-list one → exactly one `nav.blocked`);
 3. config/network down → offline fallback page loads from app origin;
 4. kill the `WebKitWebProcess` → `webview.crash` spooled + recovery navigate-home;
 5. **iframe:** an in-allowlist iframe loads; an off-allowlist iframe is blocked with
