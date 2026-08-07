@@ -52,25 +52,60 @@ Architecture-level, not citation-level:
 | V15 | G | Parent §7.2 "disable DPMS/screensaver in the cage session" + §7 PRIMARY keep-awake (compositor no-blank) have **no runbook step**; H3 asserts an outcome nothing produces. |
 | V16 | ALL | 8 UNOWNED P2 obligations: JS-ping hang detection (arch-04), pinch intercept (PF-04), `inject_css`/`inject_js` (RT-16), remote log level, `restart_app`, WebKitGTK `print` signal (H1), PDF Linux column (M4/OD-8), Windows-runner leak soak (§10). |
 
-## Change register
+## Thread status
 
-Populated at the start of each thread from the Writer's opening turn (one row per change,
-dependencies declared upfront).
+| Thread | Changes | Objections (R1 + later) | Rounds used | State |
+|---|---|---|---|---|
+| P2-B | B1–B12 | 9 + 4 = 13 | 3 | Critic closing turn in flight |
+| P2-C | C1–C16 | 7 + 3 = 10 | 3 | **CONVERGED** — both confirmations given |
+| P2-D | D1–D13 | 8 + 2 = 10 | 3 | **CONVERGED** — both confirmations given |
+| P2-E | E1–E8 | 11 + 3 = 14 | 3 | Critic closing turn in flight |
+| P2-F | F1–F16 | 12 + 2 = 14 | 3 | Writer round 3 in flight |
+| P2-G | G1–G16 | 12 | 3 | Writer round 3 in flight |
 
-| ID | Spec | Change | Deps | Verdict | Round |
-|---|---|---|---|---|---|
-| _(pending)_ | | | | | |
+Totals so far: **71 objections raised**, 0 struck, 0 frivolous. No Critic has needed a
+fast-track veto. Every thread's Critic accepted its full Round-1 set after the Writer's
+revisions; every thread then found new defects *in the replacements* — which is the
+protocol earning its cost.
 
-## Objection register
+## Converged threads — verdicts
 
-| ID | Change | Objection (one line) | Sev | Evidence tier | Disposition |
-|---|---|---|---|---|---|
-| _(pending)_ | | | | | |
+### P2-C — adopted-with-revisions
+16 changes (3 added during debate: C12 orphan-kill parity, C13 single-instance parity,
+C16 launcher-owned `resolve_data_dir`). Both HIGHs closed by construction and probed:
+OB-1's waiter/reaper race (waiter owns the `Child`, sole status consumer; `ESRCH` 200/200)
+and NEW-1's `pidfd_open`-denial black screen (`pidfd: Option<OwnedFd>`, WARN + breadcrumb +
+continue; gate-skip 200/200 with `events == 1`). 10 spec claims withdrawn, 4 open decisions
+closed. Residuals each carry a named carrier (wedged cage → P2-G; degraded-mode reuse
+window → `ponytail:` in C6; non-root manual run → unsupported, loudly degrading; cage
+0.1.4-vs-0.1.5 → P2-G smoke 13 records the version it proved).
+
+### P2-D — adopted-with-revisions
+13 changes. Central mechanism **withdrawn**: `gdk::Event::set_handler` replaces GTK's own
+dispatch (objdump-proven, reproduced by both roles), so a handler defect kills all input —
+the un-exitable device parent §3.5:319-320 forbids. Replaced by GTK widget-signal
+observation (keys on `gtk::ApplicationWindow`, pointer/touch on the webview), a split the
+Critic showed is *required* by GTK3's asymmetry. Net deletion: a module, a `main.rs` diff,
+an edit to shared reviewed code, an invented cross-spec obligation, a runtime gate.
+PF-04 gains an owner (D implements `GestureZoom` capture-phase intercept; G H10 gates it).
+Residual: N-finger tap over-counts vs Windows — safe for the lock, not free for
+availability; H4 gates, deadband recorded and deliberately not built.
+
+## Cross-spec items accumulating for integration
+
+| # | Item | Raised in | Touches |
+|---|---|---|---|
+| X1 | M4 / OD-8 PDF default-block — **unowned**, parent never defers it | B (conceded, escalated) | B, parent |
+| X2 | B9 `systemd-inhibit` child is inert on both axes under G's runbook; parent §11's "confirm cage honours idle-inhibit" answered **negatively** | G OB-7 | B, G, parent §11 |
+| X3 | Linux touch keyboard: squeekboard/onboard impossible under cage (verified both roles); substitute rests on **unowned** `inject_js` | G OB-3 (escalated HIGH) | G, D, parent §7 |
+| X4 | E↔F parameter coupling — F copied E's R1 numbers; rule adopted: *cite the sibling's scenario, don't restate its parameters* | F OB-2/9/14, E OB-3 | E, F, G |
+| X5 | C16 launcher `resolve_data_dir` needs hard co-landing with P2-A's `/var/lib/kiosk/` | C OB-3 | C, A |
+| X6 | Remaining UNOWNED P2-row items from `verify-COVERAGE.md` | Moderator | all |
 
 ## Moderator rulings
 
-_(none yet)_
+_(none required yet — no deadlock, no round-cap exhaustion, nothing struck)_
 
 ## Struck arguments
 
-_(none yet)_
+_(none — no role has argued from an unchecked checkable claim)_
