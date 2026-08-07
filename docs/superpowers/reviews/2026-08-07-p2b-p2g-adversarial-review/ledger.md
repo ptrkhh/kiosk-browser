@@ -102,9 +102,60 @@ availability; H4 gates, deadband recorded and deliberately not built.
 | X5 | C16 launcher `resolve_data_dir` needs hard co-landing with P2-A's `/var/lib/kiosk/` | C OB-3 | C, A |
 | X6 | Remaining UNOWNED P2-row items from `verify-COVERAGE.md` | Moderator | all |
 
+## HIGH integration items (standalone — NOT resolved inside any one spec)
+
+Recorded here so they are visible to the requirement matrix rather than buried in a
+spec's prose. The P2-G Critic made this placement an explicit condition of accepting the
+keyboard escalation.
+
+| # | Item | Status | Evidence |
+|---|---|---|---|
+| **I1** | **Linux touch keyboard + RT-16 `inject_css`/`inject_js` — ONE unowned row, not two.** Both live in `inject.rs` on the shipped P1 engine (`inject.rs:1-19`, wired at `main.rs:1041-1046`). squeekboard/onboard are *impossible* under cage — verified independently by both roles: cage 0.1.4/0.1.5 exposes no layer-shell, no input-method-v2, no virtual-keyboard, no text-input. A **bundled** always-on keyboard (parent §7's actual wording; `pinpad.html` is the precedent) needs no live-reinjection path and does **not** depend on RT-16 landing. | **OPEN — HIGH.** Owner: whoever picks up RT-16; fallback a new `inject.rs`-scoped sub-project. Phase P2. Discoverability: G's H4 + runbook prerequisite. Not P2-G's (packaging, not `kiosk-main` code) and explicitly **Out** in P2-D (`p2d:26`, `:162`). Windows has the identical PF-02 gap (`grep tabtip\|InputPane` → zero), so Linux is not diverging downward. | G OB-3, both roles |
+| **I2** | **M4 / OD-8 PDF default-block, Linux column.** Parent §12 records OD-8 as **applied**, not deferred; P2-B's factual claim (unwired on Windows too) is correct but symmetric non-delivery does not discharge a live parent requirement. | **OPEN — HIGH.** No owner. Conceded outright by P2-B's Writer rather than given an invented owner. | B OB-8 |
+| **I3** | Remaining UNOWNED P2-row items from `verify-COVERAGE.md` not otherwise resolved: JS-ping webview-hang detection (arch-04/RT-02 — `watchdog.hang` has no Linux producer, arch-15 case (c) unreachable), remote log level, `restart_app`, WebKitGTK `print` signal (H1). | **OPEN.** To be dispositioned in the integration round. | coverage matrix |
+
 ## Moderator rulings
 
-_(none required yet — no deadlock, no round-cap exhaustion, nothing struck)_
+### R1 — Parent §4 install path (`/opt/kiosk/` vs `/usr/lib/kiosk/` + `/etc/kiosk/`)
+
+**Ruling: G's layout is adopted; parent §4's Linux install-dir cell is recorded as an
+erratum requiring an owner-level amendment to the spec of record.**
+
+Rationale. The parent is tier 1 and a spec under review cannot overrule it by fiat — that
+was the correct objection. But the conflict here is not preference against requirement, it
+is requirement against a verified external constraint: `/opt` triggers lintian
+`dir-or-file-in-opt` at severity **error**, which G's own §Testing gate ("lintian clean")
+would fail, and Debian Policy 9.1.1/10.7.2 give the blessed alternative. Both roles
+verified this independently. The frame's evidence order settles it — a verified
+counterexample defeats a general claim regardless of tier — but the *amendment* is the
+owner's call, not the Moderator's, so it is flagged rather than silently absorbed.
+Survivable fallback if the owner refuses: ship under `/opt/kiosk/` with a documented
+lintian override.
+
+### R2 — Parent §7 Linux touch-keyboard cell (squeekboard/onboard)
+
+**Ruling: erratum, on the same standard as R1; the obligation itself is NOT discharged and
+becomes integration item I1.**
+
+Rationale. The named mechanisms are not merely inconvenient, they are impossible under the
+compositor the same parent mandates — verified from cage's source by both roles. G's
+contribution (deployment prerequisite stated unhedged + H4 enumeration per device class)
+is the achievable fraction and a Q3 win, and G is right that it is not a discharge. Left
+in G alone the requirement would vanish from the matrix, so it is lifted to I1.
+
+### R3 — Fast-tracked mechanical items (frame §6; no Critic veto lodged)
+
+- **P2-B:** corpus-implication test must assert in `H(u)` terms, not `re.is_match(u) ⇒
+  allow.allows(u)` — the latter is R2's withdrawn full-URL claim and cannot pass
+  (falsified by the banked path divergence at `allowlist.rs:641` and the home-origin
+  widening at `:387-397`). Add `ws://`/`wss://` and `http://` rows to the battery corpus,
+  which is https-only while the compiler accepts four schemes.
+- **P2-E:** the authoritative parameter table names two keys that do not exist —
+  `input.idle_clear` → `content.clear_data_on_reset` (default `true`, so the fixture must
+  set it `false`), `content.home` → `content.url`. Matters because F now consumes that
+  table by reference.
+- **P2-C:** smoke 13 uses `cage -v` (`--version` exits 1 and would fail the script under
+  `set -e`).
 
 ## Struck arguments
 
