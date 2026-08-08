@@ -1,16 +1,24 @@
 # P2-G — Linux Packaging, OS Image Runbook, Hardware Validation (Design)
 
 > Seventh and final sub-project of P2. Parent spec of record:
-> `docs/superpowers/specs/2026-07-05-kiosk-browser-design.md` (rev 2), §3.4 (GStreamer
-> element set, the pinned image), §4 (paths), §7 (keyboard, keep-awake), §7.2 (Linux OS
-> lockdown), §9, §10 (RT-05, escape-vector sweep), §11. **Sibling precedent is P1-F2**
+> `docs/superpowers/specs/2026-07-05-kiosk-browser-design.md` (rev 2, **with the 2026-08-07
+> rev 2.1 errata to §4, §7 and §9 applied** — every citation below is to the amended text),
+> §3.4 (GStreamer element set, the pinned image), §4 (paths, as amended), §7 (keyboard row +
+> errata block, keep-awake), §7.2 (Linux OS lockdown), §9, §10 (RT-05, escape-vector sweep),
+> §11. **Sibling precedent is P1-F2**
 > (`2026-08-02-p1f2-packaging-deployment-design.md`): the installer owns app-scoped setup, a
 > lockdown *runbook* owns OS hardening, secrets never ship in the package. G consumes C's
 > unit shape and `--config` forwarding, D's chord note, B's relabelled inhibitor, E's mp4
 > path, and B/C/D/E's accumulated hardware deferrals.
 
 **Status:** rev 2, 2026-08-07 — adversarial design review; see
-`docs/superpowers/reviews/2026-08-07-p2b-p2g-adversarial-review/`.
+`docs/superpowers/reviews/2026-08-07-p2b-p2g-adversarial-review/`. **rev 2.1, 2026-08-08 —
+owner decision applied, no analysis reopened:** the Linux touch keyboard is built now as
+**P2-B's B13** (bundled, always-on, injected document-start through the P1 engine), RT-16's
+`inject_css`/`inject_js` knobs are **deferred out of P2**, and the parent's rev 2.1 amendments
+(§4's install-dir row / R1, §7's keyboard cell + errata block / R2, §9's P2 row — §7's PDF row
+and §12/OD-8 also moved, but G cites neither) are cited as amended. Ledger item **I1** is
+closed by that decision and no longer exists.
 
 ## Goal
 
@@ -33,8 +41,11 @@ P2-C's (C11); nav/egress is P2-B's; input is P2-D's; the video asset is the oper
 CI jobs themselves are P2-F's and G declares its additions to them.
 
 **Change register:** G1–G16. Cross-spec edges are tabulated at the end; every one is declared
-in both directions. One obligation G does **not** discharge — the Linux touch keyboard — is
-ledger item **I1** and is stated as such rather than resolved here.
+in both directions. The one obligation G raised and could not itself discharge — the Linux
+touch keyboard — is **discharged by P2-B's change B13**, a bundled, always-on on-screen
+keyboard injected document-start through the shipped P1 injection engine. G ships none of it:
+G owns the evidence that forced the bundled route, the `Depends:` consequence, the runbook's
+operator-facing statement, and **H4b**'s per-device-class validation on real touch hardware.
 
 **Every cage claim in this spec is version-stamped.** cage **0.1.4-4** is the C7 floor
 (Debian 12, `sources.debian.org`); cage **0.1.5** is what was run in-session and what P2-C
@@ -58,9 +69,12 @@ The two trees are joined by the already-shipped `--config` flag:
 ExecStart=cage -- /usr/lib/kiosk/kiosk-launcher --config /etc/kiosk
 ```
 
-**Parent §4's `/opt/kiosk/` cell is recorded as an erratum requiring an owner-level
-amendment to the spec of record.** The conflict is not preference against requirement, it is
-requirement against a verified external constraint:
+**Parent §4's `/opt/kiosk/` cell was recorded as an erratum requiring an owner-level
+amendment, and the owner has made it** — parent §4's install-dir row now reads `/usr/lib/kiosk/`
+(binaries + bundled assets) with the operator files in `/etc/kiosk/` passed via `--config`
+(parent §4 erratum, 2026-08-07 rev 2.1, ruling **R1**). The evidence is kept because it is
+also the reason the layout is what it is; the conflict was never preference against
+requirement, it was requirement against a verified external constraint:
 
 - `/opt` trips lintian `dir-or-file-in-opt` at **severity: error** (lintian 2.139.0, tag page
   fetched by both roles) — *"Debian packages should not install into /opt, because it is
@@ -76,18 +90,20 @@ requirement against a verified external constraint:
 - Policy 10.7.2 requires configuration in `/etc`. Under the parent's literal row 2 ("same" —
   next to the binaries) `kiosk.ini`, the credential and the mp4 all land under `/usr`.
 
-**Divergence statement (C3), both directions.** *Stricter:* the operator files move out of
-the install dir into `/etc/kiosk`, so `/usr` can be mounted read-only and the config is where
-Policy says it is. *Looser:* the install directory is not `/opt/kiosk/`. **What must change,
-named:** parent §4 table row 1 Linux cell (`/opt/kiosk/` → `/usr/lib/kiosk/`) and row 2 Linux
-cell (`same` → `/etc/kiosk/ (--config)`).
+**Divergence statement (C3), both directions — now closed.** *Stricter:* the operator files
+move out of the install dir into `/etc/kiosk`, so `/usr` can be mounted read-only and the
+config is where Policy says it is. *Looser:* the install directory is not `/opt/kiosk/`.
+**What changed, named:** parent §4 table row 1 Linux cell (`/opt/kiosk/` → `/usr/lib/kiosk/`)
+and row 2 Linux cell (`same` → `/etc/kiosk/ (--config)`) — both are carried in the parent's
+rev 2.1 erratum, so G1 conforms to §4 as amended rather than diverging from it.
 
-**The amendment is the owner's call, not this spec's.** G asserts an erratum and escalates it;
-it does not overrule a tier-1 document by fiat. **Survivable fallback if the owner refuses:**
-ship the binaries under `/opt/kiosk/` with a documented `dir-or-file-in-opt` override in
-`debian/source/lintian-overrides`, carrying a comment. Either way the config, credential and
-mp4 move to `/etc/kiosk` — that half is not optional, because it is Policy 10.7.2 and because
-it is what makes a read-only `/usr` possible.
+**The amendment was the owner's call, not this spec's, and the owner made it.** G asserted an
+erratum and escalated it; it did not overrule a tier-1 document by fiat. *Fallback withdrawn,
+recorded:* shipping the binaries under `/opt/kiosk/` with a documented `dir-or-file-in-opt`
+override in `debian/source/lintian-overrides` existed only for the refusal branch, which did
+not occur; `debian/source/lintian-overrides` carries no `/opt` entry. The config, credential
+and mp4 under `/etc/kiosk` was never the optional half in either branch, because it is Policy
+10.7.2 and because it is what makes a read-only `/usr` possible.
 
 **The split costs zero product code, on one condition.** `crates/kiosk-launcher/src/main.rs:27-42`
 already parses `--config <dir>`; `resolve_main_exe` (`main.rs:56-62`) resolves the child from
@@ -146,7 +162,10 @@ and the failure is silent. G15 asserts `grep -q '\${shlibs' <extracted control> 
 cannot ship.
 
 **No keyboard `Depends:`, stated explicitly** — see the keyboard section; no installable OS
-package solves it under cage, and declaring one would ship a broken dependency.
+package solves it under cage (no layer-shell, so nothing can display itself over the
+fullscreen client) and declaring one would ship a broken dependency. Under B13 that absence is
+**unnecessary rather than a gap**: the keyboard is bundled in the app and injected in-page, so
+there is nothing for `Depends:` to name.
 
 `Conflicts:` is the continuous enforcement of the no-blanking rule (G11), not a hint. Policy
 §7.4: *"`dpkg` will refuse to allow them to be unpacked on the system at the same time …
@@ -522,16 +541,25 @@ re-derived; owner = H1.
   black, suspect `kiosk.ini` / the credential first — `safe.html` appearing is not a
   prerequisite for a config problem."*
 
-#### On-screen keyboard — ruling R2, and ledger item I1
+#### On-screen keyboard — ruling R2, discharged by P2-B's B13
 
-**This build ships no on-screen keyboard, and G does not discharge the parent §7 Linux
-keyboard obligation.** Stated unhedged, because the achievable fraction of "deployment docs"
-is precisely a hard constraint an integrator must check before deployment.
+**This build ships an on-screen keyboard: a bundled, always-on control injected at
+document-start through the shipped P1 injection engine — P2-B's change B13.** The parent §7
+Linux keyboard obligation is therefore discharged, in P2-B and not here. G does not restate
+B13's design (F-CITE); G owns four things around it — the evidence that forced the bundled
+route, the `Depends:` consequence (G3), the runbook's operator-facing statement of what the
+keyboard serves and what it cannot, and **H4b**, which validates it on the device class's own
+touch hardware.
 
-**Erratum — parent §7 keyboard row, Linux cell.** The cell reads *"Linux:
-squeekboard/onboard deployment docs"*. Both named mechanisms are non-viable under the
-compositor parent §7.2 mandates, and Moderator ruling **R2** records this as an erratum on the
-same standard as R1.
+**Erratum — parent §7 keyboard row, Linux cell — ruled, and carried into the parent.** The
+cell read *"Linux: squeekboard/onboard deployment docs"*. Both named mechanisms are non-viable
+under the compositor parent §7.2 mandates; Moderator ruling **R2** recorded this as an erratum
+on the same standard as R1, and the spec of record now carries it: §7's Linux cell reads *"the
+bundled JS on-screen keyboard, injected document-start; squeekboard/onboard are NOT usable
+under the mandated compositor"*, with the reasoning in §7's 2026-08-07 errata block and the
+deliverable in §9's P2 row. **The evidence below is why B13 takes the bundled route** — it is
+now the justification for a design, not for an escalation, and it is kept intact for that
+reason.
 
 - **squeekboard cannot run.** cage's complete protocol surface is its `*_create(` list —
   enumerated exhaustively on **cage 0.1.4** at `cage.c:297-455`: `wl_display`,
@@ -563,48 +591,62 @@ same standard as R1.
   `ActivityClock`; a virtual-keyboard client would not, but has no way to display itself under
   cage on either version.*
 
-**The `inject_js` route is withdrawn entirely** — not the default, not the fallback, not
-mentioned as an option. The draft called it *"a named P2-row deliverable … so the mechanism
-has an owner"*; being named in the parent's P2 row is not the same as being owned by a spec.
-`grep -rniE "inject_css|inject_js|RT-16"` over all seven P2 specs returns zero, and
-`crates/kiosk-core/src/config/validate.rs:15-21` still carries
+**The `inject_js` *operator-knob* route is withdrawn entirely** — not the default, not the
+fallback, not mentioned as an option. The draft called it *"a named P2-row deliverable … so the
+mechanism has an owner"*; being named in the parent's P2 row is not the same as being owned by
+a spec. `grep -rniE "inject_css|inject_js|RT-16"` over all seven P2 specs returned zero at
+review time — no sub-project had claimed the knobs, which is what the deferral below settles —
+and `crates/kiosk-core/src/config/validate.rs:15-21` still carries
 `("content.inject_css","P2"), ("content.inject_js","P2")` in `UNIMPLEMENTED`, so an operator
-who sets `inject_js` today gets an RT-08 `config.warn` and **no behaviour**. Discharging G's
-obligation with it would have moved the gap one indirection further from view.
+who sets `inject_js` today gets an RT-08 `config.warn` and **no behaviour**. Discharging the
+keyboard obligation through that knob would have moved the gap one indirection further from
+view — and would have made a shipped control depend on a row that has since been deferred.
+B13 does not use it: it is a bundled control on the engine itself, the same shape as the
+cursor-autohide timer already inside `build_injection`.
 
-**The obligation is ledger item I1**, not G's prose, and not a second unowned row: the
-keyboard and RT-16's knobs are **the same gap in the same file**,
-`crates/kiosk-main/src/inject.rs` (shipping and host-tested, wired at `main.rs:1041-1046`).
-A **bundled, always-on** keyboard needs no live reinjection and therefore does **not** depend
-on RT-16 landing — `inject.rs:12-18` records that `initialization_script` *"may be called only
-ONCE per webview … there is no live-reinjection path, by design"*, which is why the operator
-knob is `UNIMPLEMENTED` while a bundled control (the cursor-autohide timer already inside
-`build_injection`) is not. Owner: whoever picks up RT-16; fallback, a new `inject.rs`-scoped
-sub-project. Phase P2 unless the parent defers RT-16. **G is not the owner** — this is code in
-`kiosk-main`, and a usable OSK is layout + shift/symbols + focus tracking + viewport shift, a
-feature and not a line; P2-D disclaims it explicitly (`p2d:26`, `:162`).
+**RT-16 is deferred out of P2 by owner decision, and B13 does not depend on it** (parent §9's
+P2 row, struck through, 2026-08-07 rev 2.1): no deployment has requested a per-device tweak,
+parent §11 rates the row *"RCE on every device"*, and the current validate-and-warn behaviour
+is honest and free. **The two separated cleanly for exactly the reason the analysis above
+established.** The keyboard and RT-16's knobs are the same gap in the same file,
+`crates/kiosk-main/src/inject.rs` (shipping and host-tested, wired at `main.rs:1041-1046`) —
+one file, one decision, routed two ways. A **bundled, always-on** keyboard needs no live
+reinjection and therefore never depended on RT-16 landing: `inject.rs:12-18` records that
+`initialization_script` *"may be called only ONCE per webview … there is no live-reinjection
+path, by design"*, which is why the operator knob is `UNIMPLEMENTED` while a bundled control
+is not. `UNIMPLEMENTED` stays, the `config.warn` stays, and nothing in G changes if RT-16 later
+lands or never does. **G is still not the owner of either** — the keyboard is code in
+`kiosk-main` and a usable OSK is layout + shift/symbols + focus tracking + viewport shift, a
+feature and not a line (P2-D disclaims it explicitly, `p2d:26`, `:162`); B13 is P2-B's.
 
-**Scope finding that bounds the gap.** `grep -n '<input\|<textarea\|contenteditable'
+**Scope finding that bounds what B13 has to serve.** `grep -n '<input\|<textarea\|contenteditable'
 crates/kiosk-main/bundled/*.html` → **zero hits across all five pages**; `pinpad.html` is a
 `<button>` grid writing into a `<div>`, not a text field. **No app-owned surface in this
-product has a text input**, so nothing P2-G installs is broken today; the gap is confined to a
-**deployed site** that renders text inputs on touch hardware. Parity note (C3): `grep -rn -i
-"tabtip\|InputPane"` over `crates/` returns nothing — Windows shipped P1 with PF-02 open too,
-so Linux is not diverging downward.
+product has a text input**, so B13's only consumer is a **deployed site** that renders text
+inputs on touch hardware — which is precisely the surface an in-page, document-start-injected
+keyboard reaches. Parity note (C3): the bundled route is the one parent §7's Windows cell
+already sanctions, and `grep -rn -i "tabtip\|InputPane"` over `crates/` returns nothing, so
+this is the shared route rather than a Linux-only shape.
 
-**Runbook section `On-screen keyboard`, shipped regardless of the ruling:**
+**Runbook section `On-screen keyboard`, shipped alongside the control:**
 
 1. **squeekboard ruled out, with the protocol evidence above**, so nobody re-litigates it.
-2. **`onboard` + `GDK_BACKEND=x11` inside cage's Xwayland — the fallback-if-the-§7-cell-binds**,
-   labelled as such and not as an appendix curiosity, with its cost stated: it forfeits the
-   Wayland input path P2-D is built on and the GDK event stream D's `ActivityClock` depends
-   on.
-3. **`Depends:` — none, stated explicitly.** No installable package solves this under cage.
-4. **The operator-facing prerequisite, unhedged:** *"This build ships no on-screen keyboard. A
-   deployed site that requires text entry on a touch device must render its own input UI.
-   Verify this against the site before deployment — it is a deployment prerequisite, not an
-   app capability."* Verify: walk the site's forms on the device before sign-off; record the
-   result in **H4b**.
+2. **`onboard` + `GDK_BACKEND=x11` inside cage's Xwayland is withdrawn as a fallback**, and
+   survives only as the recorded reason not to reach for it: it forfeits the Wayland input path
+   P2-D is built on and the GDK event stream D's `ActivityClock` depends on. B13 removes the
+   need for any fallback; the cost statement stays so the route is not rediscovered.
+3. **`Depends:` — none, stated explicitly.** No installable OS package solves this under cage,
+   and none is needed — the keyboard ships inside the app (G3).
+4. **The operator-facing prerequisite, rewritten:** *"This build ships a bundled on-screen
+   keyboard. It is injected into the deployed page at document start and serves that page's own
+   text inputs. It cannot serve anything outside the page: there is no native UI and no browser
+   chrome on this device, and no OS keyboard can display itself under cage. It is page-world
+   code, so it is a **usability feature and not a security control** — a compromised page can
+   see it and alter it, as it can any injected control, and nothing about the keyboard should be
+   read as a boundary. Walk the site's text-entry surfaces on the device before sign-off: the
+   keyboard is bundled, but its fit to a given site's forms is per-deployment."* Verify: type
+   into every input of the deployed site on the device's own touch panel; record the result in
+   **H4b**.
 
 #### Service user and seat access (G16)
 
@@ -680,7 +722,7 @@ defers to exists here by ID.
 | H2 | `RestartPreventExitStatus=86` **and `SuccessExitStatus=86`** end-to-end via systemctl: technician exit stays exited **and** `systemctl status` reads `inactive (dead)`, not `failed`. Plus **`is-active` → `active` after boot** — the assertion no container can make (G15) | C `p2c:155-156` (smoke 14's systemd half); G8's `StartLimitIntervalSec=0` residual is pinned here |
 | H3 | Keep-awake positive: G11's no-idle-consumer gate re-verified on the device; display never blanks over 24 h; panel OSD sleep timer observed. `systemd-inhibit --list` is a **regression check that B's spawn path ran**, not a keep-awake proof | B `p2b:193-196` + G11 |
 | **H4a** | **Touch (the restored touch row):** corner-tap opens the pin pad on the device's own touch panel. Record: taps counted per single-finger tap; taps counted per N-finger tap (Windows counts 1 — the over-count is D's declared C3 divergence); whether `GDK_TOUCH_CANCEL` is emitted at all on this panel | D5/D11 (`GDK_TOUCH_CANCEL`, N-finger deadband); smoke 17's cage-headless fallback |
-| **H4b** | **Text entry:** verify the deployed site's text-entry surfaces on the device class; record whether any input has no usable keyboard | Ledger **I1** discoverability; parent §7 keyboard row |
+| **H4b** | **Text entry:** validate **B13's bundled keyboard** on the device class's own touch panel — every text-entry surface of the deployed site reaches it, types into it, and dismisses it; record any input it fails to fit, cover or restore scroll position for | **P2-B's B13** — validation of a control that exists, not discovery of a gap; parent §7 keyboard row as amended (ruling R2) |
 | H5 | ≥72 h offline-video soak, RSS trend, loop count; visual black-frame check | E `p2e:99` / RT-05 |
 | H6 | Escape-vector sweep under the locked session: parent §7.2's vectors (VT chords, zap, sleep) plus §7's shortcut/dialog/edge rows | parent §7.2 + §10:879-881. **Corrected:** §10 does not enumerate a hardening list, it points at `docs/testing.md`, which does not exist — the checklist file G creates is `docs/testing/linux-hardening-checklist.md`, matching the existing directory convention |
 | H7 | Egress + nav guard against a real network: DNS failure modes, captive-portal interference | parent §3.3 (captive portals) + §7 SEC-10. *"A/B" was invented and is withdrawn*; the row stays because SEC-10's residual-gap documentation is a P2 obligation and B's smoke runs against a local httpd only |
@@ -691,7 +733,9 @@ defers to exists here by ID.
 
 **Why H4 split.** It began as the touch row and eroded into the text-entry row across two
 revisions while a sibling kept routing touch deferrals into it. H4a restores the touch content
-verbatim; H4b keeps the text-entry text. Both IDs are now cited by name from P2-D.
+verbatim; H4b keeps the text-entry text, now aimed at a control that exists rather than at a
+gap's discoverability. Both IDs are cited by name from P2-D; H4b is additionally cited from
+P2-B as B13's hardware gate.
 
 ## Testing (G15)
 
@@ -764,8 +808,8 @@ the residual is bounded by the app's fail-closed gate.
 
 | Risk | Carrier |
 |---|---|
-| **Linux touch keyboard — NOT discharged.** Parent §7 Linux cell is an erratum (ruling R2); both named packages impossible under cage | **Ledger item I1** — HIGH, open, owner = whoever picks up RT-16 (fallback: a new `inject.rs`-scoped sub-project), phase P2. Discoverability: the runbook prerequisite + **H4b** |
-| Parent §4 install-path erratum awaiting an owner-level amendment | **Ruling R1**; fallback stated and survivable (`/opt/kiosk/` + documented lintian override) |
+| Linux touch keyboard is **page-world code** — a usability feature, not a security control, and its fit to a given site's forms is per-deployment | **Discharged by P2-B's B13** (ruling R2, parent §7 as amended); **H4b** validates it per device class; the runbook states both limits verbatim |
+| Parent §4 install-path erratum | **Ruling R1, amended into parent §4 (rev 2.1)** — G1 conforms to the amended rows; the `/opt/kiosk/` + lintian-override fallback is withdrawn, unused |
 | Root by default is looser than Windows' unprivileged kiosk account | C3 divergence declared in G16; **H1** promotes or rejects the `seatd` recipe |
 | `Conflicts:` removal risk — `apt -y` pulling an idle daemon proposes removing `kiosk` | Loud, not silent; bounded by G12's update discipline |
 | `StartLimitIntervalSec=0` — a permanently broken install loops at 30 s forever | `Storage=persistent` + a computed ≥7-day journal floor preserve the cause; **H2** |
@@ -789,9 +833,9 @@ Values and file layout only; no mechanism is left unpinned.
 
 | ID | Change | Discharges | Depends on |
 |---|---|---|---|
-| G1 | `/usr/lib/kiosk/` binaries+assets, `/etc/kiosk/` operator files, joined by `--config`; parent §4 erratum named and escalated; `/opt` + lintian override the stated fallback | parent §4 (both rows), Policy 9.1.1 / 10.7.2 | **Ruling R1**; C11's `ExecStart`; **C5's Linux `spawn_main` must carry `--config`** |
+| G1 | `/usr/lib/kiosk/` binaries+assets, `/etc/kiosk/` operator files, joined by `--config`; parent §4 erratum escalated, ruled **R1** and amended into the parent (rev 2.1); `/opt` + lintian-override fallback withdrawn, unused | parent §4 as amended (both rows), Policy 9.1.1 / 10.7.2 | **Ruling R1**; C11's `ExecStart`; **C5's Linux `spawn_main` must carry `--config`** |
 | G2 | Payload = 2 binaries + `bundled/` + unit + `kiosk.ini.example` + `kiosk-provision-credential`; `kioskctl` withdrawn | parent §9 P2 (".deb"); SEC-08/SEC-11 | G1 |
-| G3 | `${shlibs:Depends}` via `dpkg-shlibdeps` → `dpkg-gencontrol` → `dpkg-deb -b`; `cage` + 4 GStreamer hand-written; `Conflicts:` on idle daemons; no keyboard `Depends:`, stated | parent §3.4 verbatim; PF-05; PF-07 | F release job (three tools named) |
+| G3 | `${shlibs:Depends}` via `dpkg-shlibdeps` → `dpkg-gencontrol` → `dpkg-deb -b`; `cage` + 4 GStreamer hand-written; `Conflicts:` on idle daemons; no keyboard `Depends:`, stated — unnecessary under B13, not a gap | parent §3.4 verbatim; PF-05; PF-07 | F release job (three tools named); P2-B's B13 (the keyboard is in-app) |
 | G4 | `/var/lib/kiosk` `0750`; create + `chown` **first-install-only** (`[ -z "$2" ]`), modes-only on upgrade | parent §4 row 3; A's `resolve_data_dir` | G16, P2-A |
 | G5 | Ship nothing at the credential path; `/etc/kiosk` `0750` a **traversal barrier only**; `kiosk-provision-credential` sets the mode; upgrade-only `chmod` re-assert; C3 asymmetry vs F2 declared; visibility bounded by spool retention | SEC-09; parent §8 | G1, G16, P2-A |
 | G6 | mp4 operator-provisioned; postinst warns on absence; no conffile; four grounds recorded | parent §3.4, §9 (silent-black-video class); Policy 10.7.3 | G1, E |
@@ -802,7 +846,7 @@ Values and file layout only; no mechanism is left unpinned.
 | G11 | `Conflicts:` as continuous enforcement, grep as the verify line; parent §11 closed **negatively**; H3 loses `--list`; B's child relabelled | PF-07 / M8 / H5; parent §7 keep-awake row, §7.2 DPMS | B (finding stated against it) |
 | G12 | Sleep-target masking, cosmetics, journald `Storage=persistent` + computed floor, `unattended-upgrades` off, WebKitGTK `apt-mark hold`, SSH, the recovery step | parent §7.2, §3.4:289, §10:874; F §4 | F §4; C17 residual |
 | G13 | `dpkg -l` + `dpkg-query -W -f=…` + `cage -v` capture per device class | parent §3.4, §10 | G12 |
-| G14 | **H1–H11**, with H4 split into **H4a** (touch) and **H4b** (text entry); H8 gains the SEC-10 spool assertion | parent §10; A–E deferrals | G8, G11, G16 |
+| G14 | **H1–H11**, with H4 split into **H4a** (touch) and **H4b** (text entry — now the hardware gate on B13's bundled keyboard); H8 gains the SEC-10 spool assertion | parent §10; A–E deferrals | G8, G11, G16; **P2-B's B13** (H4b) |
 | G15 | Container assertions (incl. `pkill -9` orphan-kill and `cage -v` floor) on F's nightly `debian:12`; `active` moved to H2; lintian + the three-tool pipeline on F's release job | C9; parent §10 | F nightly + F release |
 | G16 | Default root (no `User=`); C3 Windows-parity divergence declared; full `seatd` recipe + flip-list; postinst never re-asserts ownership after first install | parent §7.2 (dedicated seat); SEC-09 uid interaction | A `p2a:275-276`; H1 |
 
@@ -813,6 +857,11 @@ recorded floor `0.1.4`). C12/C17 residual → G H11 + G12's runbook power-cycle 
 D3 → G10 (the chord sentence's reserved slot). D13 → G H10 (PF-04 pinch intercept).
 D5/D11 → G H4a (`GDK_TOUCH_CANCEL`, N-finger count), and smoke 17's cage-headless fallback.
 E7 → G6 (the mp4 path). B9 → G11 (relabelled inert defence-in-depth; labelling only, no code).
+**B13 → G H4b** (hardware validation of the bundled keyboard per device class) and → G's
+runbook `On-screen keyboard` section (what it serves, what it cannot, and that it is not a
+security control); **G → B13** in the other direction: the layer-shell evidence recorded here
+is why the route is bundled rather than packaged, and G3's absent keyboard `Depends:` follows
+from the same evidence.
 B's C4-vs-C5 loudness → G H8 (the spool assertion that makes it real). G15 → F5/F8/F12
 (the container assertions, the three-tool pipeline, `lintian --fail-on error`) — F's nightly
 and release jobs each need a stated addition, declared as a dependency on F, not assumed.
@@ -823,7 +872,10 @@ G lands **after** C, B, D and E and **before** F in the committed merge order.
 Automated image build (recorded ponytail, promoted by fleet size); apt repo / fleet update
 mechanics (F's ponytail); Android packaging (P3); target-hardware selection (explicitly TBD —
 the checklist is hardware-parameterized and ready for whatever the answer is). The Linux touch
-keyboard and RT-16's `inject_css`/`inject_js` knobs are **one gap in one file** and are ledger
-item **I1**, owned outside this spec at owner level, phase P2; G contributes the deployment
-prerequisite stated unhedged and H4b's per-device-class enumeration, and claims neither as a
-discharge.
+keyboard and RT-16's `inject_css`/`inject_js` knobs were **one gap in one file**
+(`crates/kiosk-main/src/inject.rs`) and the owner routed the two halves differently: the
+keyboard is **built now, as P2-B's change B13**; the RT-16 operator knobs are **deferred out of
+P2** (parent §9, rev 2.1). Both dispositions are the owner's, recorded rather than absorbed. G
+ships neither line of code — it contributes the runbook's statement of what the bundled
+keyboard serves and what it cannot, the no-keyboard-`Depends:` consequence (G3), and **H4b**'s
+per-device-class validation on touch hardware.
