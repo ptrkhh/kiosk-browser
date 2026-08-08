@@ -9,8 +9,13 @@
 > route exists, behavior parity with what Windows *actually enforces* — not with what P1
 > descoped.
 
-**Status:** rev 2, 2026-08-07 — adversarial design review; see
-docs/superpowers/reviews/2026-08-07-p2b-p2g-adversarial-review/.
+**Status:** rev 3, 2026-08-08 — owner amendment on top of rev 2 (adversarial design review;
+see docs/superpowers/reviews/2026-08-07-p2b-p2g-adversarial-review/). Rev 3 adds **B13** (the
+bundled on-screen keyboard) and **B14** (the native `print` signal), and replaces §M4's
+"unowned and escalated" text with a recorded disposition that adds no code and no gate.
+Authority for B13 and B14 is parent §7's errata block (rev 2.1, 2026-08-07, immediately above
+§7.2); authority for the M4 disposition is the owner's ruling that the content origin is
+operator-controlled. Everything else is rev 2 unchanged.
 
 Closes the P2-A residual (`p2a:42`, "do not field a Linux device before P2-B") at
 **(scheme, host, port)** granularity for subresources, with one declared looser divergence on
@@ -21,17 +26,21 @@ host-tested; GTK/WebKit wiring extends the A smoke harness.
 
 The three Windows-only control groups get Linux bodies with honest parity: `hardening.rs`
 (settings flags, script dialogs, permissions), `egress.rs` (SEC-10 subresource containment),
-`scheme_guard.rs` (downloads), plus `display.keep_awake`. "Honest parity" cuts both ways: PDF
-blocking is **not** wired on Windows (`scheme_guard::pdf_decision` is `#[allow(dead_code)]`,
-`scheme_guard.rs:36-40`, reason on record at `:161-175`), so B does not wire it on Linux
-either — see §M4 below, which states plainly that this leaves a live parent requirement
-**unowned**.
+`scheme_guard.rs` (downloads), plus `display.keep_awake`. Rev 3 adds the two controls parent
+§7's errata assign here, both on the P1 document-start engine's side of the line: the
+**bundled on-screen keyboard** (B13, a new component section) and the native half of H1's
+printing block (B14, one row in the hardening mapping). "Honest parity" still cuts both ways —
+`hardening.rs`'s autofill row is a documented no-op and clipboard-read is unsatisfiable — and
+for PDF it now cuts a third way: M4/OD-8 is **not a live control for this deployment** and B
+adds no code for it (§M4).
 
 ## Scope
 
 **In:** Linux bodies for `hardening.rs` and `egress.rs`; downloads deny in the builder;
 keep-awake; the pure helpers each needs (allowlist→content-filter compiler in `kiosk-core`,
-allowlist→CSP origin derivation, WebKit permission classifier); smoke scenarios 8–12.
+allowlist→CSP origin derivation, WebKit permission classifier); the bundled on-screen keyboard
+(B13 — one more block in `inject::build_injection` plus its `keyboard.js` asset, Linux wiring
+only); the `connect_print` suppression that completes H1 on Linux (B14); smoke scenarios 8–12.
 
 **Out:** launcher/heartbeat/systemd → P2-C; idle/gesture → P2-D; video soak → P2-E;
 CI automation of the harness → P2-F; OS image + logind config + WebKitGTK pin → P2-G.
@@ -46,6 +55,10 @@ CI automation of the harness → P2-F; OS image + logind config + WebKitGTK pin 
 - *Stricter, over-block only* — userinfo forms, uppercase hosts and raw-string spelling
   variants under a wildcard-host pattern are blocked by Layer 1 where the allowlist allows
   them (enumerated in §egress; safe direction, availability cost only).
+- *A capability Linux gains and Windows does not, declared rather than left implicit* — the
+  bundled on-screen keyboard (B13). Windows carries the identical PF-02 gap
+  (`grep -rniE 'tabtip|InputPane' crates/` → zero hits) and P2-B ships **Linux wiring only**;
+  the Windows string is byte-identical to today (§B13, C8).
 - *Deliberate hardening, tighter than the allowlist* — `object-src 'none'`, `base-uri 'none'`,
   `frame-ancestors 'none'` in the CSP belt. Not derivation output; a decision, declared here.
 - *Residual, not a divergence* — the declared WebKitGTK feature minimum is a review
@@ -59,7 +72,8 @@ CI automation of the harness → P2-F; OS image + logind config + WebKitGTK pin 
 | Content filter (SEC-10 enforcement) | contained `unsafe` sys-FFI shim — the safe `add_filter`/`remove_filter` are commented out of webkit2gtk-rs 2.0.2 (`user_content_manager.rs:53,147`) because gir could not bind `WebKitUserContentFilter` (`src/auto/` has no `user_content_filter*.rs`; enabling `v2_24` would not un-comment them), but `webkit2gtk-sys` is complete (`lib.rs:5411` store new, `:5467` save, `:5477` save_finish, `:5511` add_filter); removal via the safe `remove_filter_by_id` (`user_content_manager.rs:154`, `v2_26`) | waiting for a bindings release; any cancel-capable request-level signal (none exists — see §egress) |
 | Egress telemetry | `WebViewExt::connect_resource_load_started` (`web_view.rs:2523`, ungated) + `WebResource::connect_failed` (`web_resource.rs:118`) | `connect_local`/`connect_closure` on any signal (banned outright — see §egress) |
 | CSP belt inject/swap | `UserContentManager::{add_script, remove_script}` (safe bindings, `user_content_manager.rs:58` ungated, `:166` `v2_32`) | `initialization_script` (single-caller contract, `nav_policy.rs:146-150`); `remove_all_scripts` (`:131`) |
-| Settings/signals | safe webkit2gtk bindings: `set_enable_developer_extras` (`settings.rs:1475`), `set_zoom_level` (`web_view.rs:1980`), `set_zoom_text_only` (`settings.rs:1953`), `connect_context_menu` (`:2074`), `connect_permission_request` (`:2428`), `connect_script_dialog` (`:2649`, `v2_24`) | anything sys-level |
+| Settings/signals | safe webkit2gtk bindings: `set_enable_developer_extras` (`settings.rs:1475`), `set_zoom_level` (`web_view.rs:1980`), `set_zoom_text_only` (`settings.rs:1953`), `connect_context_menu` (`:2074`), `connect_permission_request` (`:2428`), `connect_script_dialog` (`:2649`, `v2_24`), `connect_print` (`:2461`, ungated) | anything sys-level |
+| On-screen keyboard (B13) | the **existing P1 document-start engine**: one more block in `inject::build_injection` (`inject.rs:29-61`), reaching the webview through `main.rs`'s single `initialization_script` call (`main.rs:1041-1048`) | squeekboard / onboard (no layer-shell under cage on any version — §B13); RT-16's `inject_css`/`inject_js` (needs the live-reinjection path `inject.rs:12-18` says does not exist, and is deferred out of P2); a second `initialization_script` call (single-caller contract, `inject.rs:12-13`) |
 | Keep-awake | `systemd-inhibit` child process (below) | `gtk::Application::inhibit` or a `zbus` dependency |
 
 ### Feature/floor accounting
@@ -385,6 +399,7 @@ boundary and the belt is **not** injected there.
 | devtools off | `set_enable_developer_extras(false)` explicitly (`settings.rs:1475`); wry only enables it when `attributes.devtools` is set (`wry-0.55.1/src/webkitgtk/mod.rs:443-446`), whose default is `true` under `debug_assertions` and `false` otherwise (`wry-0.55.1/src/lib.rs:834-837`), and tauri-runtime-wry calls `with_devtools(…unwrap_or(true))` under `#[cfg(any(debug_assertions, feature = "devtools"))]` (`tauri-runtime-wry-2.11.4/src/lib.rs:5209-5211`). The explicit set is belt against a feature-flag mistake |
 | autofill/password-save off | documented **no-op** — WebKitGTK ships no password manager/autofill store and `settings.rs` exposes no such setter. An honest no-op beats an invented setting |
 | script dialogs: none ever paints; `beforeunload` auto-leave (`hardening.rs:259-272`) | `connect_script_dialog` → return `true` always (`web_view.rs:2649`, `v2_24`; no dialog chrome exists to paint); `ScriptDialogType::BeforeUnloadConfirm` (`enums.rs:3297`) → `confirm_set_confirmed(true)` (`script_dialog.rs:28`), leaving the page, matching Windows |
+| printing off (H1): the document-start `window.print` override (`inject.rs:46-48`, pinned by `inject.rs:75-77`) is the whole of it — WebView2 exposes no API to disable printing (parent §7, WebView2Feedback #3545) — plus Ctrl+P in the §7.2 swallow list | **B14.** `connect_print` → return `true` (`web_view.rs:2461`, `Fn(&Self, &PrintOperation) -> bool`, **ungated** — no `#[cfg(feature = …)]`, so B10's declared floor is unchanged). Same shape as the `context-menu` and `script-dialog` rows above. Parent §7 removes *both* entry points on purpose and either alone is insufficient: the JS override is page-world, the native signal catches whatever reaches the engine without going through `window.print`. Ctrl+P is the compositor's under cage, not the app's (§7.2) |
 | `PermissionRequested` → `classify_permission_kind(i32)` → `permission_allowed` (`hardening.rs:72`, `nav_policy.rs:219-228`) | `connect_permission_request` (`web_view.rs:2428`) → classify by the request's **runtime type** (WebKit subtypes are GObject classes, not an enum): `GeolocationPermissionRequest` → `Geolocation`; `NotificationPermissionRequest` → `Notifications`; `UserMediaPermissionRequest` → `classify_user_media` (below); everything else (`DeviceInfo`, `MediaKeySystem`, `PointerLock`, `WebsiteDataAccess`, unknown) → `Other` → deny. `request.allow()`/`deny()` (`permission_request.rs:27,34`) + return `true` |
 
 *Rejected, recorded:* mirroring Windows' script-dialog budget. `SCRIPT_DIALOG_BUDGET`
@@ -435,11 +450,164 @@ doc comment on `schema.rs:89` (the field has none today; adding it is a change t
 `ponytail:` revisit only on a bindings/floor bump.
 
 **Declared assumption, pinned:** that returning `true` from `connect_context_menu` /
-`connect_script_dialog` / `connect_permission_request` suppresses the default handler, and that
-`confirm_set_confirmed(true)` means "leave the page". The bindings give signatures only; no
-tier 1–4 artifact settles the semantics. Pinned by smoke scenarios 10 and 11, both blocking:
-every one of these fails *visibly* (chrome paints, a prompt appears, a flipped permission does
-not take), not silently in the field.
+`connect_script_dialog` / `connect_permission_request` / `connect_print` suppresses the default
+handler, and that `confirm_set_confirmed(true)` means "leave the page". The bindings give
+signatures only; no tier 1–4 artifact settles the semantics. Pinned by smoke scenarios 10 and
+11, both blocking: every one of these fails *visibly* (chrome paints, a prompt appears, a print
+dialog appears, a flipped permission does not take), not silently in the field.
+
+**Honest limit on B14's gate.** With the JS override in place a page cannot call `window.print`
+at all (`Object.defineProperty(…, writable:false, configurable:false)`, `inject.rs:46-48`), so
+from the main document the native handler is *unfalsifiable* — an assertion there would pass
+whether or not `connect_print` is wired, which is not a test. Scenario 10's print arm therefore
+drives it from a page-created `about:blank` iframe, where whether the injection reaches the
+child frame at all is itself unknown at tier 1–4; the assertion is on the outcome ("no print
+dialog paints"), which fails if *neither* entry point covers it. That is exactly the
+belt-and-braces the parent's "both entry points are removed" wording asks for, and it is why
+B14 ships despite being cheap to mistake for redundant.
+
+### On-screen keyboard — bundled, injected document-start (B13)
+
+Parent §7's touch-keyboard row, Linux cell (erratum rev 2.1), assigns this to P2-B. Two facts
+pick the route; neither is a preference.
+
+**squeekboard and onboard cannot display themselves under cage.** cage exposes **no
+layer-shell protocol on any version** — verified on 0.1.4, the C7 floor, whose complete
+`*_create(` surface is `cage.c:297-455` (no `zwlr_layer_shell_v1`, no `zwp_input_method_v2`,
+no `zwp_virtual_keyboard_v1`, no `zwp_text_input_v3`), and on 0.1.5, where
+`strings /usr/bin/cage | grep -iE 'layer_shell|input_method|text_input'` returns rc=1. An OSK
+is by construction an overlay over a fullscreen client, and without layer-shell it has nowhere
+to put itself. **Input *injection* is not the missing half:**
+`wlr_virtual_keyboard_manager_v1_create` **is** present on cage 0.1.5 (absent on 0.1.4) — that
+is the `zwp_virtual_keyboard_manager_v1` global. Display is what is impossible, on both
+versions. *Recorded because it was wrong once and will be re-derived otherwise:* the claim that
+any separate-process OSK would break P2-D's per-process `ActivityClock` holds for the
+XTEST/onboard-under-Xwayland route only and is **false** for a `zwp_virtual_keyboard_v1`
+client, which injects at the seat so the compositor delivers real `wl_keyboard` (hence real
+GDK) events to the focused client. It must not be reused as an argument.
+
+**The engine already ships, and it is the one P1 built for exactly this shape.**
+`inject::build_injection` (`inject.rs:29-61`) is pure and host-tested — it assembles a `String`
+of JS and touches no webview — and its one caller is `main.rs`'s `.setup()`, which passes the
+result to `WebviewWindowBuilder::initialization_script` (`main.rs:1041-1048`), run before any
+page script on every navigation. Controls that must survive every navigation **without
+re-injection** already live there: the cursor-autohide timer (`inject.rs:50-57`). An always-on
+keyboard is that same shape.
+
+**This is why B13 does not wait on RT-16, and it is the whole reason the two were separable.**
+`initialization_script` may be called only once per webview and is set at build time from the
+just-booted config — *"there is no live-reinjection path, by design"* (`inject.rs:12-18`). An
+operator-supplied `inject_js` needs precisely that path, which is why it is `UNIMPLEMENTED`
+(`validate.rs:16-17`) and why the owner has **deferred RT-16 out of P2**. A bundled, always-on
+keyboard needs no reinjection at all, so it is the strictly easier half of the same file and
+carries none of RT-16's dependency.
+
+`pinpad.html` is the in-repo precedent for an app-owned key grid: a `<button>` grid writing
+into a `<div>` (`pinpad.html:43-56,73-78`), no text field anywhere.
+
+**Who this is for, verified.** `grep -nE '<input|<textarea|contenteditable'
+crates/kiosk-main/bundled/*.html` → **zero hits across all five pages** (`error.html`,
+`offline.html`, `pinpad.html`, `safe.html`, `splash.html`). No app-owned surface in this
+product has a text input; the one input path the kiosk owns ships its own keys. B13 therefore
+exists for **deployed sites**, not for app-owned surfaces — nothing P2-G installs is broken
+today by its absence, and nothing in this repo regresses if it misbehaves.
+
+**What ships.** One `keyboard.js` asset, `include_str!`d by `inject.rs` and appended by
+`build_injection` as one more block. It is kept **out of `bundled/`**: that directory is the
+served frontend dist (`tauri.conf.json:6` `"frontendDist": "./bundled"`, reachable as
+`APP_ORIGIN/<page>` via `bundled_url`, `main.rs:59-61`), and the keyboard is injected code, not
+a navigable page — shipping it there would expose a second, pointless surface.
+
+**Platform gating keeps `build_injection` pure.** The block is selected by a **third parameter**
+(`on_screen_keyboard: bool`), not by `cfg!` inside the function, so both arms stay host-testable
+on the one job that runs tests (ubuntu, `ci.yml:25`); `main.rs` passes
+`cfg!(target_os = "linux")` at the single call site (`main.rs:1046-1048`). With the flag
+`false` the emitted string is byte-identical to today's, which is a host assertion, not a claim
+— **C8 (Windows stays green) holds by test.**
+
+**Shape, and why it needs nothing from either CSP layer.** The block is appended **last** and
+wrapped in its own `try{…}catch(e){}` IIFE, so a defect in it cannot prevent the blocks before
+it (selection, drag/drop, print override, autohide) from having already run. The markup is
+built with `document.createElement`, direct `.style` property writes and `addEventListener` —
+**no `<style>` element, no inline handler, no external asset, no `data:` URI, no font** — so
+there is nothing for a deployed site's own `script-src`/`style-src` to refuse and nothing
+Layer 2's belt has to permit. (Layer 2 *does* open `'unsafe-inline'` on `script-src` and
+`style-src` — §Layer 2 point 3 — so the belt would not have blocked it either. The point is
+that B13 does not depend on that decision, which is the confirmation `nav_policy.rs:169-184`'s
+CSP note demands of anything new arriving in the injection path.)
+
+**Show/hide.** `focusin`/`focusout` on `document`, capture phase (`true`, matching
+`inject.rs:42-43`) — `focus`/`blur` do not bubble and would miss every field. Show when the
+target is a text-entry surface: `<textarea>`, an element with `isContentEditable`, or an
+`<input>` whose effective type is text-entry (`text`, `search`, `url`, `tel`, `email`,
+`password`, `number` — not `button`/`checkbox`/`radio`/`file`/`range`/`color`/`submit`). Hide
+on `focusout`. The keys must never take focus: `pointerdown` → `preventDefault()` so the field
+keeps focus and caret, and the keystroke is applied on that same event. **"Always-on" means "no
+config knob", not "always visible"** — with no focused text field the keyboard is not in the
+DOM at all.
+
+*Rejected, recorded:* a `display.on_screen_keyboard` config key. `initialization_script` is
+built once at boot (`inject.rs:12-18`), so it could only ever be a boot-time knob, for a
+control that already self-gates on focus; it would add a schema field, a `validate.rs` entry
+and an RT-08 row to buy nothing. *Also rejected:* rendering the keyboard as an iframe on a
+bundled page. It would be cross-origin to the deployed site and could not reach the focused
+field, and Layer 2's belt sets `frame-ancestors 'none'` (§Layer 2 point 4) — the app-origin
+frame would be blocked in exactly the configuration where the belt is present.
+
+**Key delivery, and its ceiling.** For `<input>`/`<textarea>`: splice at
+`selectionStart`/`selectionEnd`, restore the caret, then dispatch
+`new InputEvent('input',{bubbles:true})` (and `change` on hide) so a framework-managed field
+observes the write. For contenteditable: `document.execCommand('insertText', …)`. Backspace,
+shift and a symbols layer are the minimum usable set; there is no autocomplete, no IME and no
+non-Latin layout. **Synthetic events carry `isTrusted === false`, and no `KeyboardEvent` is
+delivered at all**, so a site that gates on trusted key events, or that reads `keydown` instead
+of `input`, will not update. That is a real ceiling, recorded here rather than discovered on a
+device; H4b is where it surfaces per site.
+
+**What it must not do.** No security-relevant decision passes through page-world JS. B13 adds
+**no Tauri command and no ACL entry** — P2-B still touches neither `main.rs:990`'s
+`tauri::generate_handler!` nor `capabilities/default.json` (§Layer 2's rejected listener) — so
+there is no IPC surface for a page to reach. It does not participate in the exit gesture
+(SEC-02) or the idle clock (SEC-06); both stay native. It does not need to: a real finger on
+the panel produces the GDK touch events P2-D observes, so typing registers as activity
+natively, with no page-JS path into the timer.
+
+**Interaction with the existing injected controls.** `input.allow_text_selection = false` (the
+default, `schema.rs:188`) installs `*{user-select:none}` with an `input,textarea` carve-out
+(`inject.rs:34-38`), which is already right for the keys. When the operator opts in (`true`)
+that rule is omitted entirely and a long-press on a key could start a selection, so the
+keyboard sets `user-select:none` on its own container **either way** — the same
+"applies regardless of the text-selection choice" rule `inject.rs:26-28` already states for
+drag/drop and print. The autohide timer is unaffected: it keys on `mousemove`
+(`inject.rs:50-57`) and the keyboard is touch-driven.
+
+**Failure mode (C4).** `build_injection` is pure string assembly and cannot fail, so no boot
+path exists to block; the `try/catch` exists only to keep a keyboard defect from costing the
+controls injected before it. There is no native error channel here — `initialization_script`
+reports nothing back — so a keyboard that fails to appear is **silent**. That is the honest
+reason its gate is a checklist row plus one smoke arm rather than a `config.warn`: there is
+nothing for the Rust side to observe.
+
+**Gate.** P2-G's **H4b** — *"verify the deployed site's text-entry surfaces on the device
+class; record whether any input has no usable keyboard, per device class"* — is the carrier.
+With B13 landing, what H4b records changes from "whether any input has no keyboard at all" to
+"whether the bundled keyboard appears and types into each text-entry surface on that site".
+Declared as an edge onto G; **P2-B does not rewrite G's row.** Mechanically, smoke scenario 10
+gains an arm that can actually fail (below), and `build_injection`'s two arms are host-tested.
+
+**Limitation, stated plainly.** An in-page keyboard can only serve in-page fields. It cannot
+serve native UI or browser chrome — there is none in this product, which is why the limitation
+is survivable — and it is page-world code running on a page the deployed site controls. It is
+a **usability feature, not a security control**; nothing in SEC-* depends on it, and no
+divergence in it changes an enforcement boundary.
+
+**Windows, and the scope line.** Parent §7's Windows cell already sanctions *"the bundled JS
+on-screen keyboard"* as one of the two Windows routes, and Windows has the identical PF-02 gap
+(`grep -rniE 'tabtip|InputPane' crates/` → zero hits), so Linux is not diverging downward. A
+shared bundled asset is the obvious future consolidation — the JS is platform-free by
+construction. **P2-B ships the Linux wiring only**, declares no Windows edge, and changes no
+Windows behaviour. `ponytail:` lift `keyboard.js` to a shared asset when someone takes PF-02
+on Windows; nothing here has to move for that to happen.
 
 ### Downloads — builder line, `scheme_guard.rs` stays a stub
 
@@ -452,20 +620,30 @@ asserted. External schemes were already covered in A (`nav::decide`'s scheme all
 the nav guard, P2-A:175-177). `scheme_guard.rs`'s `#[cfg(not(windows))]` stub message
 (`scheme_guard.rs:58-63`) updates to say downloads are covered by the builder hook.
 
-### M4 / OD-8 — PDF default-block: **unowned and escalated**
+### M4 / OD-8 — PDF default-block: not a live control for this deployment
 
-M4 is **undischarged on both platforms**. P2-B does not close it and **asserts no owner.**
-Parent §12:930 records OD-8 as *applied* — "block by default, `content.pdf_view=true` opt-in
-(applied)" — not deferred, and the §7 PDF row names the per-platform interceptors to confirm.
-The existing P1 descope note (`scheme_guard.rs:161-175`) ends "left for a follow-up once one of
-those is confirmed available" and is equally ownerless.
+Owner disposition, recorded rather than implemented. **P2-B adds no PDF enforcement, no PDF
+detection and no PDF assertion**, and the reason is upstream of the platform: the content
+origin is operator-controlled and serves no `application/pdf`, so the navigation this control
+exists to intercept does not occur. Two independent reasons it would not bite on Linux even if
+it did: WebKitGTK ships **no built-in PDF viewer** — `grep -rni pdf` over `webkit2gtk-2.0.2`,
+`webkit2gtk-sys-2.0.2` and `wry-0.55.1/src/webkitgtk/` returns **zero hits in all three**,
+while the Edge viewer's Print/Save toolbar is M4's entire stated rationale (parent §7 PDF row,
+§12/OD-8) — and P2-B already denies **every** download at `WebviewWindowBuilder::on_download`
+(§Downloads above), so the one route a non-rendered `application/pdf` response can take is
+already closed. `content.pdf_view` is inert in both positions on Linux: no viewer to route to
+when `true`, nothing to block when `false`.
 
-Wiring Linux alone would be an undeclared *stricter* divergence and would drag
-`ResponsePolicyDecision` back across P2-A:71-74's floor rule, so the technical position
-(parity with what Windows actually enforces) stands. The defect is ownership, and this spec
-does not manufacture an owner it has no authority to assign. **This is an integration defect
-against P2 as a whole, not a P2-B design decision; it needs an owner assigned outside this
-spec**, and is carried as HIGH integration item I2 in the review record.
+`scheme_guard::pdf_decision` stays `#[allow(dead_code)]` and host-tested, wired to nothing on
+either platform (`scheme_guard.rs:36-40`, tests at `:203-226`). **The recorded reason changes**
+from "descoped, parity" to: *no call site is needed while content is operator-controlled and no
+engine on either platform exposes a viewer toolbar.* The `#[cfg(not(windows))]` stub message
+(`scheme_guard.rs:58-63`) says so alongside its downloads update.
+
+**The assumption this rests on, made visible.** It rests on the deployment owning its content.
+If the fleet is ever pointed at a site the operator does not control, M4 becomes live again —
+on Windows first, where the Edge viewer and its toolbar do exist. Recorded so the assumption is
+inspectable, **not as a task**: no follow-up item, no owner, no schedule.
 
 ### A-filter re-derivation (discharging P2-A rev 3's recorded invariant)
 
@@ -583,10 +761,23 @@ keep-awake evidence from the 24 h observation instead.
 9. **downloads:** click a `Content-Disposition: attachment` link → no file appears, exactly one
    `nav.blocked{download}`, kiosk stays on page; the load-event sequence is captured and
    recorded against the A-filter question above.
-10. **dialog/chrome:** an `alert()`-loop page does not wedge the kiosk and paints nothing;
-    right-click produces no context menu; a `beforeunload` page navigates away **without
-    prompting**. All three arms asserted explicitly — this is the pin for the
-    return-value/`confirm_set_confirmed` assumption.
+10. **dialog/chrome/injected controls:** an `alert()`-loop page does not wedge the kiosk and
+    paints nothing; right-click produces no context menu; a `beforeunload` page navigates away
+    **without prompting**. All three arms asserted explicitly — this is the pin for the
+    return-value/`confirm_set_confirmed` assumption. Two arms added in rev 3, both on fixture
+    pages the harness already serves from the allowlisted local httpd:
+    - **(d) keyboard (B13).** A page with one `<input type="text">`: focus it → the keyboard's
+      container is in the DOM; click a key → the input's `value` gained that character and one
+      `input` event fired; blur → the container is gone. Fails if the block is not injected, if
+      the focus predicate is wrong, if a key steals focus (the value would not change), or if
+      the site-CSP-independence claim above is wrong. Cheap: one page, four assertions, no new
+      fixture machinery.
+    - **(e) print (B14).** A page that creates an `about:blank` iframe and calls
+      `iframe.contentWindow.print()` → **no print dialog paints** and the kiosk stays on the
+      page. Written this way deliberately: calling `window.print()` from the main document
+      cannot fail (the override is non-writable, non-configurable), so it would assert nothing
+      about `connect_print`. This arm fails if *neither* entry point covers the child frame,
+      which is the composition parent §7 requires.
 11. **permissions:** a `geolocation.getCurrentPosition` + `getUserMedia` probe page → denied
     under default-deny, **and allowed** when the fixture config flips `permissions.camera`.
     The positive arm is what proves our handler is the one deciding — an unhandled request
@@ -611,7 +802,12 @@ keep-awake evidence from the 24 h observation instead.
 - **Host tests, `kiosk-main`:** CSP derivation — the expressibility gate returns `None` for each
   refused shape, `data:`/`blob:` present, no path components survive, superset property stated
   against `resource_allowed`; permission classifier — the full mapping table including
-  `classify_user_media`'s four arms and the `Other`-deny arm; `REASON_*` label pins.
+  `classify_user_media`'s four arms and the `Other`-deny arm; `REASON_*` label pins. **B13:**
+  `build_injection`'s new arm — with `on_screen_keyboard = true` the emitted script contains the
+  keyboard block; with `false` it does **not**, which is the C8 pin (the Windows string is
+  unchanged), and the three existing tests (`inject.rs:67-95`) keep passing with the added
+  argument. Both arms run on the ubuntu job, which is why the flag is a parameter rather than a
+  `cfg!` (§B13).
 - **Smoke:** scenarios 8–12 above, plus A's 1–7 re-run **with the filter installed** — named
   here as the pin for the custom-scheme assumption rather than left as a generic regression
   sweep, with scenario 3 (bundled offline page) and scenario 7 (`safe.html` from the app
@@ -674,10 +870,27 @@ glob→regex conversion question — allowlist patterns are **URLPattern, not gl
 Unchanged from A: launcher/systemd (P2-C), idle/gesture (P2-D), video soak (P2-E), update+CI
 harness automation (P2-F), packaging/image/logind/hardware (P2-G).
 
+Rev 3 adds nothing to the deferral list. **B13 is in scope and built here**; what stays out is
+RT-16's `inject_css`/`inject_js` (deferred out of P2 by the owner — B13 does not depend on it,
+§B13) and the Windows half of PF-02 (parent §7's Windows cell already sanctions the same
+bundled keyboard there; P2-B ships the Linux wiring only and declares no Windows edge).
+**M4/OD-8 needs no deferral either**: it is not a live control for this deployment (§M4), adds
+no code, and carries no follow-up item, owner or schedule.
+
 Recorded ponytails: mid-label host wildcards in the filter compiler (accept once the
 implication test covers them); the one-line `^https?://(tauri|kioskasset|ipc)\.localhost/`
 ignore rule for the `http://` app-origin form; `zbus` if a second D-Bus consumer appears;
-clipboard-read on a future bindings/floor bump.
+clipboard-read on a future bindings/floor bump; lifting `keyboard.js` to a shared asset if
+Windows takes PF-02.
 
-Escalated, **not** deferred: M4 / OD-8 PDF default-block is unowned on both platforms and needs
-an owner assigned outside this spec.
+## Amendment register — rev 3
+
+Rev 2's register (B1–B12) is in the review record
+(`docs/superpowers/reviews/2026-08-07-p2b-p2g-adversarial-review/P2B-R3-writer.md`, §Final
+register) and is unchanged. Rev 3 adds two changes and restates one.
+
+| ID | Change | Final state | Depends on |
+|---|---|---|---|
+| **B13** | Bundled on-screen keyboard | **In P2-B, built here.** One `keyboard.js` asset + one block in `inject::build_injection` behind a third `on_screen_keyboard: bool` parameter; `main.rs` passes `cfg!(target_os = "linux")` at the existing single `initialization_script` call site. Focus-gated show/hide, no config knob, no IPC, no CSP dependence. Usability feature, not a security control. Gate: P2-G **H4b** + smoke 10(d) + the two host arms | P1's shipped injection engine only (`inject.rs`, `main.rs:1041-1048`). **Not** RT-16. Edge onto P2-G: H4b's recorded question changes (G's row is not rewritten here) |
+| **B14** | WebKitGTK `print` signal | `connect_print` → `true` (`web_view.rs:2461`, ungated), completing H1's native half beside the P1 JS override. One row in the hardening mapping; no floor change | B10's declared minimum (unchanged). Gate: smoke 10(e) |
+| **B8** | PDF parity (restated) | **Not a live control for this deployment.** No enforcement, no detection, no assertion, no follow-up item. `pdf_decision` stays `#[allow(dead_code)]` with its reason rewritten (§M4). Rev 2's "unowned and escalated" text is withdrawn | Owner ruling that the content origin is operator-controlled |
