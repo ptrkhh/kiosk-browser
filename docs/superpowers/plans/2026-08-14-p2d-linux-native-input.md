@@ -29,6 +29,18 @@
   ```
   `gtk 0.18.2` and `gdk 0.18.2` are already in `Cargo.lock` and already built for wry/tauri, and the dependency is **forced by Tauri's own public signature** — `gtk_window()` returns `gtk::ApplicationWindow`, a type we cannot name without the crate.
 
+## Change IDs referenced by sibling specs
+
+P2-B and P2-G cite D's changes by ID; this is where each lands, so an edge followed from either arrives at a task rather than at prose.
+
+| ID | What | Task |
+|---|---|---|
+| **D1** | leg 1 — pointer/touch observation on the webview widget (also the object PF-04's controller attaches to) | 4 |
+| **D3** | the one sentence D contributes to **P2-G's G10**: the technician chord is the in-session escape under the locked cage session; the image intentionally leaves no VT/getty route. **Leg 3 is withdrawn** | 7 Step 4 |
+| **D5 / D11** | `GDK_TOUCH_CANCEL` emission and the N-finger over-count, both recorded as ponytails and gated on real touch hardware at **P2-G H4a** | 4 |
+| **D10** | the shared `webkit2gtk` dependency declaration — needs nothing above P2-B's B10 floor; union of features, first writer wins, **no ordering edge** | 2 Step 3 |
+| **D13** | the PF-04 pinch intercept and its recorded `scale_delta()` deadband, gated at **P2-G H10** | 6 |
+
 ## File Structure
 
 | File | Responsibility |

@@ -49,7 +49,7 @@
 - Test: `crates/kiosk-main/src/nav_policy.rs` (`mod tests`)
 
 **Interfaces:**
-- Produces: `const APP_ORIGIN: &str`, `const ASSET_ORIGIN: &str` (both `main.rs`, unchanged types); `pub fn is_remote_origin(url: &str) -> bool` (unchanged signature)
+- Produces: `const APP_ORIGIN: &str` (`main.rs`, unchanged type); `pub fn is_remote_origin(url: &str) -> bool` (unchanged signature)
 - Consumes: nothing
 
 - [ ] **Step 1: Write the failing tests** in `nav_policy.rs`'s `mod tests`
@@ -148,15 +148,11 @@ const APP_ORIGIN: &str = if cfg!(windows) {
     "tauri://localhost"
 };
 
-/// The `kioskasset` custom-scheme origin (the offline mp4), same switch as `APP_ORIGIN`.
-const ASSET_ORIGIN: &str = if cfg!(windows) {
-    "http://kioskasset.localhost"
-} else {
-    "kioskasset://localhost"
-};
 ```
 
-Then replace every hard-coded `http://kioskasset.localhost` string in `main.rs` with `ASSET_ORIGIN` (build the URL as `format!("{ASSET_ORIGIN}/kiosk-offline.mp4")`), and update the comment at `main.rs:997` that spells the derivation out.
+**Do not add an `ASSET_ORIGIN` const in this task.** Checked against the tree: `main.rs` contains **no** hard-coded `http://kioskasset.localhost` string — only the comment at `:997` — because the asset URL is written in `offline.html` (Task 8) and the scheme is registered by name at `:998`. A const with no consumer is dead code and `cargo clippy -- -D warnings` fails on it. The const arrives in **P2-B Task 3**, where `derive_csp` is its first caller.
+
+What this task does change at `main.rs:997` is the comment: it currently spells the derivation as the `http://` form only, so extend it to name both spellings and point at `offline.html`'s `location.protocol` selection.
 
 - [ ] **Step 5: Run the full crate test suite**
 
@@ -967,7 +963,9 @@ serve_fixtures() {
 
 ```bash
 # The spool is the durable telemetry record — no fake GCL endpoint needed.
-spool_events() { cat /var/lib/kiosk/spool/main/*.jsonl 2>/dev/null; }
+# Recursive, not a flat glob: the spool is a directory of `NNNNN.jsonl` segments per
+# severity tier (`spool.rs:100-101`), so segments sit one level below the partition.
+spool_events() { find /var/lib/kiosk/spool -name '*.jsonl' -exec cat {} + 2>/dev/null; }
 assert_event_count() {  # name, expected count
   local got; got="$(spool_events | grep -c "\"event\":\"$1\"" || true)"
   [ "$got" = "$2" ] || { echo "FAIL: $1 expected $2, got $got" >&2; exit 1; }

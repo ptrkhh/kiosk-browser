@@ -29,7 +29,7 @@
 
 | File | Responsibility |
 |---|---|
-| `crates/kiosk-launcher/src/pipe.rs` | `instance_name()` gains a `cfg` seam *inside* the function; new `runtime_dir()`; `#[cfg(unix)] serve` replaces the stub |
+| `crates/kiosk-launcher/src/pipe.rs` | `instance_name` gains a `cfg` seam inside the function plus a `data_dir` argument and an `io::Result`; new `runtime_dir()`; `#[cfg(unix)] serve` replaces the stub |
 | `crates/kiosk-launcher/src/spawn.rs` | `ChildHandle` type; `#[cfg(unix)] spawn_main` + waiter thread; `#[cfg(unix)] kill_and_wait`; exit-status mapping |
 | `crates/kiosk-launcher/src/job.rs` | `#[cfg(unix)] Job::create` detects `INVOCATION_ID`; `#[cfg(unix)] acquire_single_instance` takes a file lock |
 | `crates/kiosk-launcher/src/sink.rs` | `child` field's type becomes `ChildHandle` (alias-only change on Windows) |
@@ -48,8 +48,12 @@
 - Test: `crates/kiosk-launcher/src/pipe.rs` (`mod tests` — currently `#[cfg(all(test, windows))]` in places; the new tests must run on Linux)
 
 **Interfaces:**
-- Produces: `pub fn runtime_dir(data_dir: &Path) -> PathBuf`, `pub fn instance_name() -> io::Result<String>` **or** keep the infallible signature and add `pub fn instance_path(data_dir: &Path) -> io::Result<PathBuf>` — pick whichever leaves `main.rs:172`'s call site untouched, which is the requirement.
+- Produces: `pub fn runtime_dir(data_dir: &Path) -> PathBuf` (pure, host-tested) and `pub fn instance_name(data_dir: &Path) -> io::Result<String>`
 - Consumes: `resolve_data_dir` (Task 8)
+
+> **The call site does change, and the spec's two requirements are why.** The spec prefers `main.rs:172`'s call site untouched, but it also requires `runtime_dir()` to fall back to *the data dir* and the derivation to return `io::Result` so a path ≥ 108 bytes is rejected before `bind()`. You cannot have both: the function needs the data dir as input and its error has to be handled somewhere. Checked at the tree — `main.rs:172` is `let pipe_name = pipe::instance_name();` with `data_dir` already in scope (it is cloned eight lines later at `:180`, and `pipe::serve` already takes `&data_dir`), so the cost is **one argument and one error arm**, not new plumbing.
+>
+> Handle the `Err` the way every other launcher degradation is handled (`job.rs:18-25`, never block boot): `eprintln!` + `crate::sink::breadcrumb(data_dir, "pipe", …)` and keep going with the un-bindable name, which then takes `pipe.rs:370-388`'s existing retry-and-breadcrumb path. **Do not** `unwrap()` and do not abort — a launcher that refuses to start is a black screen. `#[cfg(windows)]` keeps the infallible body and ignores the argument.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -74,7 +78,7 @@ mod unix_naming {
     #[test]
     fn a_path_at_or_over_sun_len_is_rejected_by_the_derivation() {
         let long = std::path::PathBuf::from("/tmp").join("x".repeat(120));
-        assert!(instance_path(&long).is_err());
+        assert!(instance_name(&long).is_err());
     }
 
     /// The host test asserts the BIND, not only the derivation.
@@ -82,7 +86,7 @@ mod unix_naming {
     fn the_derived_path_actually_binds() {
         let dir = std::env::temp_dir().join(format!("kiosk-bind-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = instance_path(&dir).expect("derives");
+        let path = instance_name(&dir).expect("derives");
         let _l = std::os::unix::net::UnixListener::bind(&path).expect("binds");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -92,7 +96,7 @@ mod unix_naming {
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p kiosk-launcher pipe`
-Expected: FAIL — `runtime_dir`/`instance_path` do not exist.
+Expected: FAIL — `runtime_dir`/`instance_name`'s new signature do not exist.
 
 - [ ] **Step 3: Implement**
 
@@ -186,7 +190,7 @@ git commit -m "feat(launcher): SO_PEERCRED peer verification feeding the existin
 - Modify: `crates/kiosk-launcher/src/pipe.rs:519-528` — **replace** the `#[cfg(not(windows))]` stub
 
 **Interfaces:**
-- Consumes: `runtime_dir`/`instance_path` (Task 1), `peer_pid` (Task 2), `accept_client`, `frame_to_event`, `await_child_pid`, `sink::breadcrumb`
+- Consumes: `runtime_dir`/`instance_name` (Task 1), `peer_pid` (Task 2), `accept_client`, `frame_to_event`, `await_child_pid`, `sink::breadcrumb`
 - Produces: the Linux `serve(pipe_name, data_dir, tx, cancel, child_pid)` with the identical signature
 
 **Structure mirrors `pipe.rs:366-491` one-for-one:**

@@ -31,6 +31,19 @@
 - **Escalation levels:** absent Layer 1 ⇒ `config.error("egress.filter_absent")`; absent Layer 2 ⇒ `config.error("egress.csp_absent")`; per-pattern refusals in either layer ⇒ `config.warn`. **Neither is boot-blocking.**
 - **Windows stays byte-unchanged.** No `main.rs` `generate_handler!` edit, no `capabilities/default.json` edit, no Windows clippy job added (P2-F owns CI).
 
+## Change IDs referenced by sibling specs
+
+Sibling specs cite B's changes by ID; this is where each lands, so an edge followed from C, D, E or G arrives at a task rather than at prose.
+
+| ID | What | Task |
+|---|---|---|
+| **B8** | PDF parity — **not a live control for this deployment**; no code, no gate, no follow-up item | 7 |
+| **B9** | keep-awake `systemd-inhibit` child (G11 relabels it inert defence-in-depth — labelling only, no code change) | 8 |
+| **B10** | the declared WebKitGTK feature floor and the shared `webkit2gtk` dependency line (P2-C's C17 and P2-D's D10 need nothing above it; **no ordering edge**, union of features, first writer wins) | Global Constraints + 4 |
+| **B12** | smoke scenario 12, keep-awake, with its labelled preconditions | 10 |
+| **B13** | bundled on-screen keyboard (gated by **P2-G H4b** + smoke 10(d)) | 6 |
+| **B14** | WebKitGTK `print` signal (gated by smoke 10(e)) | 5 |
+
 ## File Structure
 
 | File | Responsibility |
@@ -260,11 +273,14 @@ git commit -m "feat(core): Allowlist::origins plus the filter soundness implicat
 
 **Files:**
 - Modify: `crates/kiosk-main/src/nav_policy.rs` — add `derive_csp`
+- Modify: `crates/kiosk-main/src/main.rs` — add `const ASSET_ORIGIN` (P2-A deliberately left it out: it had no consumer there and would have failed `clippy -D warnings` as dead code; `derive_csp` is its first caller)
 - Modify: `crates/kiosk-core/src/config/schema.rs:89` — new doc comment on `clipboard_read`
 
 **Interfaces:**
-- Produces: `pub fn derive_csp(allow: &Allowlist, app_origin: &str, asset_origin: &str) -> Option<String>`
+- Produces: `pub fn derive_csp(allow: &Allowlist, app_origin: &str, asset_origin: &str) -> Option<String>`; `const ASSET_ORIGIN: &str = if cfg!(windows) { "http://kioskasset.localhost" } else { "kioskasset://localhost" };`
 - Consumes: `Allowlist::origins()` (Task 2)
+
+> Origins are **parameters**, not globals read inside `derive_csp`: the consts live in `main.rs` and `nav_policy.rs` cannot see them. The tests below therefore pass literals, and `main.rs` passes `APP_ORIGIN`/`ASSET_ORIGIN` at the one call site.
 
 **Why `Option`:** the "looser by construction" property is **withdrawn** — it was false in both halves. URLPattern component accessors return the component's `pattern_string`, and several live entries yield source expressions that are not valid CSP; an unparseable source expression is *ignored* by the CSP parser while the rest still applies, leaving the belt silently **tighter** than the authority. That is verbatim the bug D2b refused to ship (`nav_policy.rs:169-184`).
 
@@ -275,14 +291,14 @@ git commit -m "feat(core): Allowlist::origins plus the filter soundness implicat
 fn an_inexpressible_pattern_skips_the_whole_belt() {
     for p in ["https://api-*.example.com/*", "*://example.com/*", "https://:sub.example.com/*"] {
         let allow = Allowlist::new(&[p.to_string()], "https://home.test/app");
-        assert_eq!(derive_csp(&allow, APP_ORIGIN, ASSET_ORIGIN), None, "{p}");
+        assert_eq!(derive_csp(&allow, "tauri://localhost", "kioskasset://localhost"), None, "{p}");
     }
 }
 
 #[test]
 fn the_belt_carries_data_and_blob_sources() {
     let allow = Allowlist::new(&["https://cdn.example.com/*".into()], "https://home.test/app");
-    let csp = derive_csp(&allow, APP_ORIGIN, ASSET_ORIGIN).expect("expressible");
+    let csp = derive_csp(&allow, "tauri://localhost", "kioskasset://localhost").expect("expressible");
     assert!(csp.contains("data:"));
     assert!(csp.contains("blob:"));
 }
@@ -290,7 +306,7 @@ fn the_belt_carries_data_and_blob_sources() {
 #[test]
 fn no_path_component_survives_into_the_belt() {
     let allow = Allowlist::new(&["https://cdn.example.com/assets/*".into()], "https://home.test/app");
-    let csp = derive_csp(&allow, APP_ORIGIN, ASSET_ORIGIN).expect("expressible");
+    let csp = derive_csp(&allow, "tauri://localhost", "kioskasset://localhost").expect("expressible");
     assert!(!csp.contains("/assets"));
 }
 
@@ -300,7 +316,7 @@ fn no_path_component_survives_into_the_belt() {
 #[test]
 fn inline_and_eval_are_opened() {
     let allow = Allowlist::new(&["https://cdn.example.com/*".into()], "https://home.test/app");
-    let csp = derive_csp(&allow, APP_ORIGIN, ASSET_ORIGIN).expect("expressible");
+    let csp = derive_csp(&allow, "tauri://localhost", "kioskasset://localhost").expect("expressible");
     assert!(csp.contains("'unsafe-inline'"));
     assert!(csp.contains("'unsafe-eval'"));
 }
@@ -310,7 +326,7 @@ fn inline_and_eval_are_opened() {
 #[test]
 fn the_three_declared_restrictions_are_present() {
     let allow = Allowlist::new(&["https://cdn.example.com/*".into()], "https://home.test/app");
-    let csp = derive_csp(&allow, APP_ORIGIN, ASSET_ORIGIN).expect("expressible");
+    let csp = derive_csp(&allow, "tauri://localhost", "kioskasset://localhost").expect("expressible");
     assert!(csp.contains("object-src 'none'"));
     assert!(csp.contains("base-uri 'none'"));
     assert!(csp.contains("frame-ancestors 'none'"));
