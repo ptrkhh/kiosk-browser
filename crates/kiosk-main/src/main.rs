@@ -526,7 +526,10 @@ mod data_dir_tests {
     #[cfg(not(windows))]
     #[test]
     fn the_linux_data_dir_is_var_lib_kiosk() {
-        assert_eq!(resolve_data_dir(), std::path::PathBuf::from("/var/lib/kiosk"));
+        assert_eq!(
+            resolve_data_dir(),
+            std::path::PathBuf::from("/var/lib/kiosk")
+        );
     }
 }
 
