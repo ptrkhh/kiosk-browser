@@ -914,6 +914,8 @@ git commit -m "feat(linux): offline.html selects the mp4 origin from location.pr
 
 **Environment (verified present on this host):** weston 13.0.0, cage 0.1.5, Xwayland, xdotool, WebKitGTK 2.52.3, GTK 3.24.41.
 
+> **Hand-off, so it is not a surprise later:** this harness is human-run in-session and deliberately **not** wired into `ci.yml` — automating it is P2-F. When F lands, it re-homes these scenario **bodies** into `crates/kiosk-smoke` (F owns the bodies for A 1–7 · B 8–12 · C 13–15 · D 16–17). Keep compositor start/stop in one function and each scenario's assertions in one place, so that port is a move rather than a rewrite.
+
 - [ ] **Step 1: Write the compositor lifecycle**
 
 ```bash
