@@ -432,14 +432,23 @@ fn resolve_config_dir(override_dir: Option<&str>) -> PathBuf {
     }
 }
 
-/// The data dir (cache, spool, last-good) — `%ProgramData%\kiosk\` (spec §4). Never
-/// operator-overridden (unlike the install dir): this is not something a `kiosk.ini`
-/// deployment ever needs to relocate.
+/// The data dir (cache, spool, last-good) — `%ProgramData%\kiosk\` on Windows,
+/// `/var/lib/kiosk/` on Linux (spec §4). Never operator-overridden (unlike the install
+/// dir): this is not something a `kiosk.ini` deployment ever needs to relocate.
+///
+/// The launcher's `resolve_data_dir` must return the identical path — it drains the
+/// `spool/main` partition written here (P2-C C16).
+#[cfg(windows)]
 fn resolve_data_dir() -> PathBuf {
     std::env::var_os("ProgramData")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join("kiosk")
+}
+
+#[cfg(not(windows))]
+fn resolve_data_dir() -> PathBuf {
+    PathBuf::from("/var/lib/kiosk")
 }
 
 #[cfg(windows)]
@@ -478,9 +487,47 @@ fn machine_id() -> Option<String> {
     }
 }
 
+/// Pure, host-tested: the `/etc/machine-id` contents → a device id, or `None` when the
+/// file is empty/whitespace. Split out of `machine_id` so the trimming rule is testable
+/// without an `/etc` fixture.
+#[cfg(not(windows))]
+fn parse_machine_id(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// systemd's `/etc/machine-id` (spec §4). Absent or unreadable degrades exactly as the
+/// Windows missing-MachineGuid path does — `None`, no panic, boot continues.
 #[cfg(not(windows))]
 fn machine_id() -> Option<String> {
-    None
+    parse_machine_id(&std::fs::read_to_string("/etc/machine-id").ok()?)
+}
+
+#[cfg(all(test, not(windows)))]
+mod data_dir_tests {
+    use super::{parse_machine_id, resolve_data_dir};
+
+    #[test]
+    fn machine_id_is_trimmed() {
+        assert_eq!(
+            parse_machine_id("2c4a1b6e8f9d4c3b8a7e6f5d4c3b2a19\n"),
+            Some("2c4a1b6e8f9d4c3b8a7e6f5d4c3b2a19".to_string())
+        );
+    }
+
+    /// An empty or whitespace-only `/etc/machine-id` degrades exactly as the Windows
+    /// no-MachineGuid path does: `None`, no panic, boot continues with the fallback id.
+    #[test]
+    fn an_empty_machine_id_file_degrades_to_none() {
+        assert_eq!(parse_machine_id(""), None);
+        assert_eq!(parse_machine_id("   \n"), None);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn the_linux_data_dir_is_var_lib_kiosk() {
+        assert_eq!(resolve_data_dir(), std::path::PathBuf::from("/var/lib/kiosk"));
+    }
 }
 
 /// File-only breadcrumb, installed before telemetry exists (see call site in `main`).
