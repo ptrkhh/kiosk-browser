@@ -1107,15 +1107,20 @@ async fn main() {
             // (`wry-0.55.1/src/webkitgtk/mod.rs:547-576`) — NavigationAction only, every frame,
             // correct return value. Do NOT hand-write a `decide-policy` handler.
             //
-            // The `true` third argument is a deliberate Linux decision — enforce on ALL frames —
-            // not a transfer of the Windows justification. A blocked sub-frame therefore reports
-            // `nav.blocked{reason: "not_allowlisted"}` where Windows reports `"egress"`.
+            // `nav::ENFORCE_ALL_FRAMES` (always `true`) is a deliberate Linux decision —
+            // enforce on ALL frames — not a transfer of the Windows justification. A blocked
+            // sub-frame therefore reports `nav.blocked{reason: "not_allowlisted"}` where
+            // Windows reports `"egress"`.
             #[cfg(not(windows))]
             {
                 let guard_policy = nav_policy_setup.clone();
                 let guard_telem = telem_setup.clone();
                 builder = builder.on_navigation(move |url| {
-                    match nav::should_block(&guard_policy.load(), url.as_str(), true) {
+                    match nav::should_block(
+                        &guard_policy.load(),
+                        url.as_str(),
+                        nav::ENFORCE_ALL_FRAMES,
+                    ) {
                         Some(reason) => {
                             guard_telem.nav_blocked(reason.as_str(), url.as_str());
                             false

@@ -55,10 +55,20 @@ pub fn install(window: &tauri::WebviewWindow, telem: Telemetry, nav_policy: Shar
     windows_impl::install(window, telem, nav_policy);
 }
 
-/// No-op on Linux: scheme-allowlist enforcement rides the nav guard here — the
-/// `on_navigation` handler installed in `main.rs` already calls `NavPolicy::decision_for`,
-/// and `kiosk_core::nav::decide` already covers schemes, so there is nothing left for this
-/// module to enforce on that front. Downloads and PDF blocking are P2-B.
+/// PARTIAL no-op on Linux — not full coverage. Authority-bearing external schemes (a host
+/// is present, e.g. `steam://host/path`) do ride the nav guard installed in `main.rs`:
+/// `should_block` finds `is_remote_origin` true and falls through to
+/// `NavPolicy::decision_for`, which routes through `kiosk_core::nav::decide` to
+/// `scheme::scheme_decision`, and that already checks `scheme_allowlist`.
+///
+/// KNOWN GAP, unenforced anywhere on Linux: hostless / cannot-be-a-base schemes —
+/// `mailto:`, `tel:`, `sms:` and the like, exactly what this module's Windows
+/// `LaunchingExternalUriScheme` handler exists for. `crate::nav_policy::is_remote_origin`
+/// returns `false` whenever `Url::host_str()` is `None`, so `should_block` allows them
+/// (never reaching `decision_for`/`decide`/`scheme_decision`) before any scheme-allowlist
+/// check runs. Not implemented here — no plan currently owns Linux hostless-scheme
+/// enforcement; this is a known, visible gap, not something this no-op covers. Downloads
+/// and PDF blocking are also unenforced here; all three are P2-B.
 #[cfg(not(windows))]
 pub fn install(_window: &tauri::WebviewWindow, _telem: Telemetry, _nav_policy: SharedNavPolicy) {}
 

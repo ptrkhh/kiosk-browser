@@ -43,6 +43,16 @@ fn feeds_fsm(url: &str) -> bool {
     crate::nav_policy::is_remote_origin(url)
 }
 
+/// The `is_main_frame` argument Linux's builder line (`main.rs`) always passes to
+/// [`should_block`] — WebKitGTK's `decide-policy`/`NavigationAction` gives no main-frame/
+/// sub-frame distinction at the level wry exposes (`Fn(&Url) -> bool`, no frame info), so
+/// Linux makes a deliberate choice instead of inheriting Windows' distinction: enforce the
+/// guard on EVERY frame. Naming it here, once, means `main.rs`'s call site and this module's
+/// own regression test both read the same value rather than each hardcoding `true`
+/// independently — so a future edit that changes the decision necessarily changes both at
+/// once, and the test cannot silently stay green through a flip.
+pub(crate) const ENFORCE_ALL_FRAMES: bool = true;
+
 /// The pure classification behind the P1-D2b navigation guard (spec §3.6): should this
 /// navigation be cancelled? `None` (allow) when `is_main_frame` is `false` — sub-resource
 /// (iframe/subresource) navigations are Task 4's separate egress boundary, never this
@@ -53,6 +63,11 @@ fn feeds_fsm(url: &str) -> bool {
 /// remote-content allowlist and could self-block) — or when
 /// [`NavPolicy::decision_for`] allows it; `Some(reason)` otherwise. Never reimplements
 /// the matcher: every verdict is `decide`'s, reached only through `decision_for`.
+///
+/// That `is_main_frame == false` carve-out is a Windows-only escape in practice: Linux's
+/// caller (`main.rs`'s builder line) always passes [`ENFORCE_ALL_FRAMES`] (`true`), so on
+/// Linux every frame — sub-frames included — IS this guard's job, because `egress.rs` has
+/// no Linux body yet (P2-A scope) to catch them instead.
 pub(crate) fn should_block(
     policy: &NavPolicy,
     url: &str,
@@ -282,7 +297,7 @@ mod windows_impl {
 
 #[cfg(test)]
 mod tests {
-    use super::{feeds_fsm, should_block};
+    use super::{feeds_fsm, should_block, ENFORCE_ALL_FRAMES};
     use crate::nav_policy::NavPolicy;
     use kiosk_core::config::schema::Content;
     use kiosk_core::nav::BlockReason;
@@ -314,13 +329,16 @@ mod tests {
     }
 
     /// Linux enforces the guard on ALL frames — the deliberate divergence from Windows,
-    /// where sub-frames are waved past because `egress.rs` catches them. This test pins the
-    /// argument the Linux builder line passes, so a later edit cannot quietly flip it.
+    /// where sub-frames are waved past because `egress.rs` catches them. Asserts against
+    /// [`ENFORCE_ALL_FRAMES`] itself, the same constant `main.rs`'s builder line passes as
+    /// `should_block`'s third argument — not a locally-hardcoded `true` — so flipping that
+    /// constant flips this test's expected outcome too (`Some(NotAllowlisted)` → `None`)
+    /// instead of leaving it silently green.
     #[test]
     fn the_guard_blocks_an_off_allowlist_sub_frame_when_told_it_is_in_scope() {
         let p = policy(&["https://home.test/*"], "https://home.test/app");
         assert_eq!(
-            should_block(&p, "https://evil.test/frame", true),
+            should_block(&p, "https://evil.test/frame", ENFORCE_ALL_FRAMES),
             Some(BlockReason::NotAllowlisted)
         );
     }
