@@ -230,16 +230,32 @@ pub fn permission_allowed(kind: PermissionKind, perms: &Permissions) -> bool {
 /// App-origin (bundled pages / mp4) vs remote content. Single source of truth;
 /// `nav::feeds_fsm` delegates here so the FSM-feed filter and the nav guard agree by
 /// construction.
+///
+/// Matched on `(scheme, host)`, with **no `cfg`**: both platforms' spellings are
+/// recognised everywhere, because a host-only match classifies Linux's
+/// `tauri://localhost` as remote (bundled pages would self-block and the error page's
+/// own load would feed the FSM), and a scheme-only match would let `tauri://evil.test/`
+/// pass as app-origin. Never add bare `"localhost"` — the smoke harness's own
+/// `http://localhost:PORT` home must stay remote.
 pub fn is_remote_origin(url: &str) -> bool {
-    match tauri::Url::parse(url)
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_string))
-    {
-        Some(host) => {
-            host != "tauri.localhost" && host != "kioskasset.localhost" && host != "ipc.localhost"
-        }
-        None => false,
-    }
+    let Ok(u) = tauri::Url::parse(url) else {
+        // Parse failure → not remote, unchanged from P1. Failing closed here would
+        // newly block unparseable URLs on Windows, break `nav.rs`'s classification and
+        // invert `resource_allowed`'s inline/hostless rule.
+        return false;
+    };
+    let Some(host) = u.host_str() else {
+        return false;
+    };
+    let app_origin = match u.scheme() {
+        "tauri" | "kioskasset" | "ipc" => host == "localhost",
+        "http" | "https" => matches!(
+            host,
+            "tauri.localhost" | "kioskasset.localhost" | "ipc.localhost"
+        ),
+        _ => false,
+    };
+    !app_origin
 }
 
 #[cfg(test)]
@@ -321,6 +337,48 @@ mod tests {
         // exact host literal is app origin, subdomains and suffix-spoofed hosts are remote.
         assert!(is_remote_origin("http://evil.ipc.localhost/"));
         assert!(is_remote_origin("http://ipc.localhost.evil.com/"));
+    }
+
+    #[test]
+    fn linux_app_origins_are_not_remote() {
+        assert!(!is_remote_origin("tauri://localhost/splash.html"));
+        assert!(!is_remote_origin(
+            "kioskasset://localhost/kiosk-offline.mp4"
+        ));
+        assert!(!is_remote_origin("ipc://localhost/"));
+    }
+
+    #[test]
+    fn windows_app_origins_are_not_remote() {
+        assert!(!is_remote_origin("http://tauri.localhost/splash.html"));
+        assert!(!is_remote_origin(
+            "http://kioskasset.localhost/kiosk-offline.mp4"
+        ));
+        assert!(!is_remote_origin("http://ipc.localhost/"));
+    }
+
+    /// The host is required on the custom schemes too, or `tauri://evil.test/` would
+    /// classify as our own origin and skip the guard entirely.
+    #[test]
+    fn a_custom_scheme_on_a_foreign_host_is_remote() {
+        assert!(is_remote_origin("tauri://evil.test/"));
+        assert!(is_remote_origin("kioskasset://evil.test/x"));
+    }
+
+    /// The smoke harness serves its home from `http://localhost:PORT`. Bare `localhost`
+    /// must never join the app-origin host set or the harness's own home page would stop
+    /// feeding the FSM.
+    #[test]
+    fn bare_localhost_over_http_is_remote() {
+        assert!(is_remote_origin("http://localhost:8099/home.html"));
+    }
+
+    /// Unchanged from P1: parse failure is NOT a block. Failing closed here would newly
+    /// block unparseable URLs on Windows and invert `resource_allowed`'s hostless rule.
+    #[test]
+    fn unparseable_stays_not_remote() {
+        assert!(!is_remote_origin("not a url"));
+        assert!(!is_remote_origin("about:blank"));
     }
 
     // ---- resource_allowed (P1-D2b Task 4, SEC-10) -------------------------------------

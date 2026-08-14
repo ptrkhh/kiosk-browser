@@ -43,14 +43,16 @@ use tokio_util::sync::CancellationToken;
 
 const WINDOW_LABEL: &str = "kiosk";
 
-/// The Windows/`wry` app-origin workaround for the `tauri://` custom scheme: WebView2
-/// cannot navigate the top-level frame to a custom scheme, so Tauri serves bundled
-/// assets at this `http://` host instead on Windows (confirmed against tauri 2.11.5,
-/// `AppManager::tauri_protocol_url`: `cfg!(windows) => "http://tauri.localhost"` when
-/// `use_https_scheme` is unset, which this app never sets). Revisit if/when a
-/// Linux/macOS target ships (spec P2/P3), where the origin is the literal
-/// `tauri://localhost`.
-const APP_ORIGIN: &str = "http://tauri.localhost";
+/// The app origin for bundled pages. Windows/`wry` cannot navigate the top-level frame
+/// to a custom scheme, so Tauri serves bundled assets at an `http://` host there; on
+/// Linux/WebKitGTK the origin is the literal custom scheme. Same compile-time switch
+/// Tauri uses internally (`tauri-2.11.5/src/manager/mod.rs:340-345`,
+/// `AppManager::tauri_protocol_url`).
+const APP_ORIGIN: &str = if cfg!(windows) {
+    "http://tauri.localhost"
+} else {
+    "tauri://localhost"
+};
 
 /// Generous relative to the event rate (one per probe flip / config poll / navigation);
 /// sized so a burst never makes `try_send` the reason an `AppEvent` is dropped.
@@ -994,7 +996,10 @@ async fn main() {
         // latter's `scope` is static config and cannot cleanly cover a runtime install
         // dir. Windows origin form is `http://<scheme>.localhost/<path>` (tauri
         // 2.11.5 `Builder::register_uri_scheme_protocol` doc + `AppManager`'s own
-        // `tauri.localhost` derivation) → `http://kioskasset.localhost/kiosk-offline.mp4`.
+        // `tauri.localhost` derivation) → `http://kioskasset.localhost/kiosk-offline.mp4`;
+        // Linux/WebKitGTK serves the same scheme at its literal custom-scheme origin →
+        // `kioskasset://localhost/kiosk-offline.mp4`. `offline.html` picks the mp4 URL by
+        // `location.protocol` (page-local JS, no serve-time templating).
         .register_uri_scheme_protocol("kioskasset", move |_ctx, _req| {
             let mp4 = config_dir.join("kiosk-offline.mp4");
             match std::fs::read(&mp4) {
