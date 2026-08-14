@@ -363,6 +363,7 @@ mod tests {
     fn a_custom_scheme_on_a_foreign_host_is_remote() {
         assert!(is_remote_origin("tauri://evil.test/"));
         assert!(is_remote_origin("kioskasset://evil.test/x"));
+        assert!(is_remote_origin("ipc://evil.test/"));
     }
 
     /// The smoke harness serves its home from `http://localhost:PORT`. Bare `localhost`
@@ -371,6 +372,7 @@ mod tests {
     #[test]
     fn bare_localhost_over_http_is_remote() {
         assert!(is_remote_origin("http://localhost:8099/home.html"));
+        assert!(is_remote_origin("https://localhost:8099/home.html"));
     }
 
     /// Unchanged from P1: parse failure is NOT a block. Failing closed here would newly
