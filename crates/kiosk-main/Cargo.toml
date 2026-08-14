@@ -43,6 +43,19 @@ windows = { version = "0.61", features = [
   "Win32_System_SystemServices",
 ] }
 
+# Linux/WebKitGTK. Justified by exactly four signals plus one callback that have no wry
+# or Tauri route: load-changed, load-failed, load-failed-with-tls-errors,
+# web-process-terminated, and WebsiteDataManagerExtManual::clear's completion callback.
+# Version is the one already in our lock via wry; Cargo unifies semver-compatible
+# requirements to one crate, so `PlatformWebview::inner()`'s type and ours cannot
+# diverge. `v2_16` is what `clear` needs, but `web-process-terminated`'s
+# `WebProcessTerminationReason`/`connect_web_process_terminated` are gated on `v2_20`
+# in the vendored webkit2gtk 2.0.2 source (auto/enums.rs, auto/web_view.rs) — features
+# are cumulative, so requesting `v2_20` alone covers both needs. glib/gio arrive as
+# `webkit2gtk::glib` / `webkit2gtk::gio` re-exports — no new direct deps.
+[target.'cfg(target_os = "linux")'.dependencies]
+webkit2gtk = { version = "2.0.2", features = ["v2_20"] }
+
 [dev-dependencies]
 tempfile = "3"
 # Test-only: the RSA keypair for telemetry's Logger/TokenSource tests is

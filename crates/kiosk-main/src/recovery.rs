@@ -87,14 +87,28 @@ pub fn kind_label(raw_kind: i32) -> &'static str {
     }
 }
 
+/// A stable, greppable label for the `webview.crash` telemetry `kind` field, in the
+/// **WebKit** reason space. Deliberately prefixed `webkit_` and deliberately NOT routed
+/// through `kind_label`, whose `i32`s are WebView2 constants with different meanings.
+#[cfg(not(windows))]
+fn termination_label(reason: webkit2gtk::WebProcessTerminationReason) -> &'static str {
+    use webkit2gtk::WebProcessTerminationReason as R;
+    match reason {
+        R::Crashed => "webkit_crashed",
+        R::ExceededMemoryLimit => "webkit_exceeded_memory_limit",
+        R::TerminatedByApi => "webkit_terminated_by_api",
+        _ => "webkit_unrecognized",
+    }
+}
+
 #[cfg(windows)]
 pub fn install(window: &tauri::WebviewWindow, telem: Telemetry, nav_policy: SharedNavPolicy) {
     windows_impl::install(window, telem, nav_policy);
 }
 
 #[cfg(not(windows))]
-pub fn install(_window: &tauri::WebviewWindow, _telem: Telemetry, _nav_policy: SharedNavPolicy) {
-    eprintln!("recovery: only implemented on Windows; ProcessFailed will never be observed");
+pub fn install(window: &tauri::WebviewWindow, telem: Telemetry, nav_policy: SharedNavPolicy) {
+    linux_impl::install(window, telem, nav_policy);
 }
 
 #[cfg(windows)]
@@ -168,6 +182,41 @@ mod windows_impl {
     }
 }
 
+#[cfg(not(windows))]
+mod linux_impl {
+    use webkit2gtk::WebViewExt;
+
+    use crate::nav_policy::SharedNavPolicy;
+    use crate::telemetry::Telemetry;
+
+    /// All three WebKit termination reasons mean the web process is gone, so all three
+    /// take `NavigateHome`. There is no `Reload` branch: Windows reserves it for
+    /// `RENDER_PROCESS_UNRESPONSIVE`, which has no WebKitGTK analogue (hang detection on
+    /// Linux is the JS ping, P2-C C17).
+    pub fn install(window: &tauri::WebviewWindow, telem: Telemetry, nav_policy: SharedNavPolicy) {
+        let window_handle = window.clone();
+        let result = window.with_webview(move |platform_webview| {
+            let webview = platform_webview.inner();
+            webview.connect_web_process_terminated(move |_wv, reason| {
+                let label = super::termination_label(reason);
+                telem.webview_crash(label);
+                let home = nav_policy.load().home().to_string();
+                match tauri::Url::parse(&home) {
+                    Ok(url) => {
+                        if let Err(e) = window_handle.navigate(url) {
+                            eprintln!("recovery: navigate home failed after {label}: {e}");
+                        }
+                    }
+                    Err(e) => eprintln!("recovery: home URL unparseable ({home}): {e}"),
+                }
+            });
+        });
+        if let Err(e) = result {
+            eprintln!("recovery: with_webview failed, renderer crash will never be recovered: {e}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,5 +254,30 @@ mod tests {
     fn an_unrecognized_future_kind_defaults_to_navigate_home_not_a_panic() {
         assert_eq!(recovery_action(99), RecoveryAction::NavigateHome);
         assert_eq!(kind_label(99), "unrecognized");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn every_webkit_termination_reason_has_a_label() {
+        use webkit2gtk::WebProcessTerminationReason as R;
+        assert_eq!(termination_label(R::Crashed), "webkit_crashed");
+        assert_eq!(
+            termination_label(R::ExceededMemoryLimit),
+            "webkit_exceeded_memory_limit"
+        );
+        assert_eq!(
+            termination_label(R::TerminatedByApi),
+            "webkit_terminated_by_api"
+        );
+        assert_eq!(termination_label(R::__Unknown(99)), "webkit_unrecognized");
+    }
+
+    /// The two constant spaces must never be crossed: WebKit's `Crashed` is 0, which
+    /// `kind_label` would render as WebView2's `browser_process_exited`.
+    #[cfg(not(windows))]
+    #[test]
+    fn webkit_labels_never_collide_with_the_webview2_space() {
+        use webkit2gtk::WebProcessTerminationReason as R;
+        assert_ne!(termination_label(R::Crashed), kind_label(0));
     }
 }
