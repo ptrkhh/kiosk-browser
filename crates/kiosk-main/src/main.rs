@@ -1102,6 +1102,41 @@ async fn main() {
                 display.cursor_autohide_seconds,
                 allow_text_selection,
             ));
+
+            // Linux nav guard (P2-A): wry already installs the `decide-policy` handler this drives
+            // (`wry-0.55.1/src/webkitgtk/mod.rs:547-576`) — NavigationAction only, every frame,
+            // correct return value. Do NOT hand-write a `decide-policy` handler.
+            //
+            // The `true` third argument is a deliberate Linux decision — enforce on ALL frames —
+            // not a transfer of the Windows justification. A blocked sub-frame therefore reports
+            // `nav.blocked{reason: "not_allowlisted"}` where Windows reports `"egress"`.
+            #[cfg(not(windows))]
+            {
+                let guard_policy = nav_policy_setup.clone();
+                let guard_telem = telem_setup.clone();
+                builder = builder.on_navigation(move |url| {
+                    match nav::should_block(&guard_policy.load(), url.as_str(), true) {
+                        Some(reason) => {
+                            guard_telem.nav_blocked(reason.as_str(), url.as_str());
+                            false
+                        }
+                        None => true,
+                    }
+                });
+                // §7: "new windows navigate in place". Hand the URL back to the main webview and
+                // THEN deny: `navigate` is a dispatcher-proxied non-blocking send, safe from the
+                // event-loop thread, and the resulting load re-enters `on_navigation` above and
+                // faces the same guard — exactly Windows' `SetHandled(true)` + `Navigate`. Deny
+                // explicitly rather than relying on wry not connecting `connect_create`.
+                let popup_handle = app.handle().clone();
+                builder = builder.on_new_window(move |url, _features| {
+                    if let Some(w) = popup_handle.get_webview_window(WINDOW_LABEL) {
+                        let _ = w.navigate(url);
+                    }
+                    tauri::webview::NewWindowResponse::Deny
+                });
+            }
+
             let window = builder.build()?;
 
             // display.monitor (spec §5.2): an out-of-range index must never

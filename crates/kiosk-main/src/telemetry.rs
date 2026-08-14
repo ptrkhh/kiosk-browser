@@ -116,12 +116,13 @@ impl Telemetry {
         self.emit(LogEvent::NavError, f);
     }
 
-    /// A main-frame navigation was cancelled by the native guard (spec §3.6/§6:
-    /// `nav.blocked`, WARNING, rate-capped by the same Logger bucket as every other
-    /// event — no second limiter here). `reason` is `BlockReason::as_str()` (a stable,
-    /// greppable label); `url` is the navigation that got cancelled, redacted via
-    /// `UrlDetail::Host` — never logged raw. `url_sha256` lets an operator correlate
-    /// repeated blocks of the same URL without ever seeing the URL itself.
+    /// A navigation was cancelled by the native guard (main-frame on Windows; any frame on
+    /// Linux — see `nav.rs`). Spec §3.6/§6: `nav.blocked`, WARNING, rate-capped by the same
+    /// Logger bucket as every other event — no second limiter here. `reason` is
+    /// `BlockReason::as_str()` (a stable, greppable label); `url` is the navigation that got
+    /// cancelled, redacted via `UrlDetail::Host` — never logged raw. `url_sha256` lets an
+    /// operator correlate repeated blocks of the same URL without ever seeing the URL
+    /// itself.
     pub fn nav_blocked(&self, reason: &str, url: &str) {
         let (redacted, hash) = redact_url(url, UrlDetail::Host);
         let mut f = Map::new();

@@ -55,12 +55,12 @@ pub fn install(window: &tauri::WebviewWindow, telem: Telemetry, nav_policy: Shar
     windows_impl::install(window, telem, nav_policy);
 }
 
+/// No-op on Linux: scheme-allowlist enforcement rides the nav guard here — the
+/// `on_navigation` handler installed in `main.rs` already calls `NavPolicy::decision_for`,
+/// and `kiosk_core::nav::decide` already covers schemes, so there is nothing left for this
+/// module to enforce on that front. Downloads and PDF blocking are P2-B.
 #[cfg(not(windows))]
-pub fn install(_window: &tauri::WebviewWindow, _telem: Telemetry, _nav_policy: SharedNavPolicy) {
-    eprintln!(
-        "scheme_guard: only implemented on Windows; external schemes/downloads will never be blocked"
-    );
-}
+pub fn install(_window: &tauri::WebviewWindow, _telem: Telemetry, _nav_policy: SharedNavPolicy) {}
 
 #[cfg(windows)]
 mod windows_impl {

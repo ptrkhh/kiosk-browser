@@ -53,7 +53,11 @@ fn feeds_fsm(url: &str) -> bool {
 /// remote-content allowlist and could self-block) — or when
 /// [`NavPolicy::decision_for`] allows it; `Some(reason)` otherwise. Never reimplements
 /// the matcher: every verdict is `decide`'s, reached only through `decision_for`.
-fn should_block(policy: &NavPolicy, url: &str, is_main_frame: bool) -> Option<BlockReason> {
+pub(crate) fn should_block(
+    policy: &NavPolicy,
+    url: &str,
+    is_main_frame: bool,
+) -> Option<BlockReason> {
     if !is_main_frame || !crate::nav_policy::is_remote_origin(url) {
         return None;
     }
@@ -307,6 +311,18 @@ mod tests {
     fn sub_frame_off_allowlist_is_not_this_guards_concern() {
         let p = policy(&["https://home.test/*"], "https://home.test/app");
         assert_eq!(should_block(&p, "https://evil.test/x", false), None);
+    }
+
+    /// Linux enforces the guard on ALL frames — the deliberate divergence from Windows,
+    /// where sub-frames are waved past because `egress.rs` catches them. This test pins the
+    /// argument the Linux builder line passes, so a later edit cannot quietly flip it.
+    #[test]
+    fn the_guard_blocks_an_off_allowlist_sub_frame_when_told_it_is_in_scope() {
+        let p = policy(&["https://home.test/*"], "https://home.test/app");
+        assert_eq!(
+            should_block(&p, "https://evil.test/frame", true),
+            Some(BlockReason::NotAllowlisted)
+        );
     }
 
     #[test]
