@@ -106,13 +106,13 @@ pub fn install(
 
 #[cfg(not(windows))]
 pub fn install(
-    _window: &tauri::WebviewWindow,
-    _tx: mpsc::Sender<AppEvent>,
-    _telem: Telemetry,
-    _nav_policy: SharedNavPolicy,
-    _ready: std::sync::Arc<tokio::sync::Notify>,
+    window: &tauri::WebviewWindow,
+    tx: mpsc::Sender<AppEvent>,
+    telem: Telemetry,
+    nav_policy: SharedNavPolicy,
+    ready: std::sync::Arc<tokio::sync::Notify>,
 ) {
-    eprintln!("nav: only implemented on Windows; NavigationCommitted/Failed will never fire");
+    linux_impl::install(window, tx, telem, nav_policy, ready);
 }
 
 #[cfg(windows)]
@@ -288,6 +288,134 @@ mod windows_impl {
             if let Err(e) = webview2.add_NavigationCompleted(&completed_handler, &mut completed_token) {
                 eprintln!("nav: add_NavigationCompleted failed: {e}");
             }
+        });
+        if let Err(e) = result {
+            eprintln!("nav: with_webview failed, navigation outcome will never be observed: {e}");
+        }
+    }
+}
+
+/// Load-lifecycle detection (spec "`nav.rs` — load lifecycle"): outcome-only, mirrors
+/// `windows_impl`'s `NavigationStarting`/`NavigationCompleted` mapping onto the same
+/// `AppEvent`/`Telemetry`/ready-pulse surface. Distinct from the nav GUARD (Task 5's
+/// `on_navigation` builder line in `main.rs`) — this module calls [`super::feeds_fsm`],
+/// never [`super::should_block`]; the guard already ran before WebKit ever started this
+/// load.
+///
+/// **Assumption, not derivable from the pinned bindings:** `load-changed`/`load-failed`/
+/// `load-failed-with-tls-errors` are `WebKitWebView`-level signals that track the **main
+/// frame's** load only, so a sub-frame's (iframe's) load never fires them —
+/// `webkit2gtk-2.0.2`'s bindings (`web_view.rs:2286,2315,2352`) give signatures only, no
+/// doc text confirming frame scope. The failure latch and the policy-cancellation filter
+/// below both depend on this holding. Pinned observationally by smoke scenario 5 (an
+/// off-allowlist iframe must produce no `NavigationFailed`, no `nav.error` and no
+/// error-page transition), not asserted here.
+#[cfg(not(windows))]
+mod linux_impl {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use kiosk_core::app::state::Event as AppEvent;
+    use tokio::sync::mpsc;
+    use webkit2gtk::{LoadEvent, PolicyError, WebViewExt};
+
+    use crate::nav_policy::SharedNavPolicy;
+    use crate::telemetry::Telemetry;
+
+    /// A `load-failed` raised by our own guard's cancellation. Dropped statelessly: the
+    /// guard already emitted the single `nav.blocked`, matching Windows'
+    /// one-event-per-blocked-navigation.
+    ///
+    /// **Invariant:** this filter assumes exactly one `navigation_handler` is installed
+    /// and that no RESPONSE or download decision is subscribed. P2-B adds both, and they
+    /// raise the same error code from a different cause — P2-B must re-derive this.
+    fn is_policy_cancellation(err: &webkit2gtk::glib::Error) -> bool {
+        matches!(
+            err.kind::<PolicyError>(),
+            Some(PolicyError::FrameLoadInterruptedByPolicyChange)
+        )
+    }
+
+    pub fn install(
+        window: &tauri::WebviewWindow,
+        tx: mpsc::Sender<AppEvent>,
+        telem: Telemetry,
+        _nav_policy: SharedNavPolicy,
+        ready: std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        let result = window.with_webview(move |platform_webview| {
+            let webview = platform_webview.inner();
+
+            // One latch, GTK-main-thread-only, so `Rc<Cell<..>>` is sufficient.
+            let failed = Rc::new(Cell::new(false));
+            let ready_latch = Rc::new(Cell::new(false));
+
+            let failed_changed = failed.clone();
+            let tx_changed = tx.clone();
+            webview.connect_load_changed(move |wv, event| {
+                match event {
+                    // The only per-load boundary WebKit gives us. Clearing here rather
+                    // than on the suppressed FINISHED is load-bearing: a load-failed with
+                    // no following FINISHED must not arm the latch across navigations,
+                    // which would swallow the next successful load's commit and park the
+                    // kiosk on the offline video with a healthy network.
+                    LoadEvent::Started => failed_changed.set(false),
+                    LoadEvent::Finished => {
+                        if failed_changed.get() {
+                            return;
+                        }
+                        // READY pulses on the first successful load of ANY origin,
+                        // including the bundled offline page: the watchdog asks "is the
+                        // app alive and rendering", not "is the site reachable". Must run
+                        // BEFORE the feeds_fsm filter.
+                        if !ready_latch.replace(true) {
+                            ready.notify_one();
+                        }
+                        // `uri()` is read at signal time and is post-redirect (the Windows
+                        // navId→uri map is pre-redirect); both classify identically for
+                        // `is_remote_origin`, since a redirect cannot cross into our own
+                        // registered schemes. `None` classifies as not-remote — never
+                        // unwrap in a signal handler.
+                        let Some(uri) = wv.uri() else { return };
+                        if !super::feeds_fsm(uri.as_str()) {
+                            return;
+                        }
+                        let _ = tx_changed.try_send(AppEvent::NavigationCommitted);
+                    }
+                    _ => {}
+                }
+            });
+
+            let failed_load = failed.clone();
+            let tx_load = tx.clone();
+            let telem_load = telem.clone();
+            webview.connect_load_failed(move |_wv, _event, failing_uri, err| {
+                if is_policy_cancellation(err) {
+                    // No AppEvent, no telemetry, no latch change.
+                    return true;
+                }
+                failed_load.set(true);
+                // Both the FSM event and the telemetry sit inside the remote-origin
+                // filter, mirroring Windows where `nav_error` sits after the `feeds_fsm`
+                // early return. App-origin load failures stay silent.
+                if super::feeds_fsm(failing_uri) {
+                    telem_load.nav_error(&err.to_string());
+                    let _ = tx_load.try_send(AppEvent::NavigationFailed);
+                }
+                true
+            });
+
+            let failed_tls = failed;
+            let tx_tls = tx;
+            let telem_tls = telem;
+            webview.connect_load_failed_with_tls_errors(move |_wv, failing_uri, _cert, _errors| {
+                failed_tls.set(true);
+                if super::feeds_fsm(failing_uri) {
+                    telem_tls.nav_error("tls_error");
+                    let _ = tx_tls.try_send(AppEvent::NavigationFailed);
+                }
+                true
+            });
         });
         if let Err(e) = result {
             eprintln!("nav: with_webview failed, navigation outcome will never be observed: {e}");
