@@ -1,0 +1,22 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>SMOKE IFRAME HOST</title>
+    <style>
+      html, body { margin: 0; padding: 0; font-family: sans-serif; }
+      iframe { display: block; width: 100%; height: 340px; border: 4px solid #000; }
+      h2 { margin: 4px; font-size: 18px; }
+    </style>
+  </head>
+  <body>
+    <!-- Scenario 5 (blocking): one in-allowlist iframe, one off-allowlist iframe. The
+         off-allowlist target is never served or resolved -- the nav guard must cancel
+         the sub-frame navigation before WebKit ever attempts DNS, exactly like the
+         off-allowlist main-frame case. -->
+    <h2>in-allowlist iframe:</h2>
+    <iframe id="allowed-frame" src="http://localhost:8099/iframe-allowed.html"></iframe>
+    <h2>off-allowlist iframe (must be blocked):</h2>
+    <iframe id="blocked-frame" src="http://evil.test/iframe-blocked"></iframe>
+  </body>
+</html>
