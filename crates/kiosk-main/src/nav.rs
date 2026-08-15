@@ -305,7 +305,7 @@ mod windows_impl {
 /// **Assumption, not derivable from the pinned bindings:** `load-changed`/`load-failed`/
 /// `load-failed-with-tls-errors` are `WebKitWebView`-level signals that track the **main
 /// frame's** load only, so a sub-frame's (iframe's) load never fires them —
-/// `webkit2gtk-2.0.2`'s bindings (`web_view.rs:2286,2315,2352`) give signatures only, no
+/// `webkit2gtk-2.0.2`'s bindings (`web_view.rs:2287,2316,2355`) give signatures only, no
 /// doc text confirming frame scope. The failure latch and the policy-cancellation filter
 /// below both depend on this holding. Pinned observationally by smoke scenario 5 (an
 /// off-allowlist iframe must produce no `NavigationFailed`, no `nav.error` and no
