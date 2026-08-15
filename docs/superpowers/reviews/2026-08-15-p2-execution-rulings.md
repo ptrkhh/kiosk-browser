@@ -187,3 +187,47 @@ persist into the harder plans.
   `WindowsStore(RefCell<…>)`. If WebKit emits `create` while tauri already holds
   that borrow, the callback panics on a double-borrow instead of returning `Deny`.
   Unprovable from a diff; scenario 5 is what settles it.
+
+### R11 — Trusted input injection is impossible in this container; it blocks part of A's gate and threatens D's
+
+*P2-A Task 9.* The smoke harness runs and scenarios 1–5 pass under weston
+headless, but carry-forward #1 — driving a **real `window.open()`** to settle the
+GTK `create` double-borrow risk — could not be executed. I verified the
+environment claim rather than accepting it:
+
+```
+/dev/input      — does not exist
+/dev/uinput     — does not exist
+wtype/ydotool/wlrctl — not installed
+weston 13.0.0   — advertises no zwp_virtual_keyboard protocol
+Xwayland/XTest  — segfaults on any input injection (implementer's finding)
+```
+
+WebKit gates `window.open()` behind a **trusted** user gesture, and a script
+`.click()` is not trusted. So there is no path to a real popup here.
+
+**Ruling:** this is an environment limitation, not a code defect, and not grounds
+to weaken the scenario. Scenario 5's popup sub-checks are recorded **BLOCKED with
+evidence** rather than passed or skipped. A's merge gate is therefore met
+**with one named exception**, and the exception is explicit:
+
+> The `navigate()`-from-`create` double-borrow panic risk (tauri-runtime-wry
+> `lib.rs:239-248` dispatches inline and borrows `WindowsStore(RefCell<..>)`)
+> remains **UNSETTLED**. It must be proven on hardware or on a runner with real
+> input devices before this is considered covered.
+
+**Cost if wrong:** a popup attempt on a real device panics the callback instead of
+denying the popup. Bounded — it needs a page that calls `window.open()` from a
+genuine gesture, which an operator-controlled kiosk content set may never do.
+
+**Two downstream consequences, flagged now rather than discovered later:**
+
+1. **P2-D is at risk.** Its entire subject is native input — gestures (`gesture.rs`)
+   and shortcuts (`shortcuts.rs`) — and its merge gate is smoke 16–17. Those
+   scenarios need synthetic input by definition. If D is executed in a container
+   like this one, its gate is unreachable for the same reason. Decide D's
+   verification strategy *before* dispatching its tasks, not after.
+2. **P2-F must be told.** Its `smoke-linux` job cannot cover gesture-dependent
+   scenarios on a runner without input devices. F7's matrix and F14's flake policy
+   need to account for scenarios that are structurally unrunnable in CI, rather
+   than treating them as flaky.
