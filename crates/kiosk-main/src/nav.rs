@@ -421,6 +421,33 @@ mod linux_impl {
             eprintln!("nav: with_webview failed, navigation outcome will never be observed: {e}");
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn policy_cancellation_error_is_recognized() {
+            let err = webkit2gtk::glib::Error::new(
+                PolicyError::FrameLoadInterruptedByPolicyChange,
+                "frame load interrupted by policy change",
+            );
+            assert!(is_policy_cancellation(&err));
+        }
+
+        /// The exact confusable regression Rule 3 exists to prevent: a same-shaped
+        /// "cancelled" error from a DIFFERENT domain (a real network-layer cancellation,
+        /// not our own guard's policy decision) must NOT be recognized. If the domain
+        /// scoping in `is_policy_cancellation` is ever widened or dropped — e.g. "fixed"
+        /// to also catch `NetworkError::Cancelled` — this goes red while the positive
+        /// case above stays green, catching exactly that mistake.
+        #[test]
+        fn a_same_shaped_error_from_a_different_domain_is_not_recognized() {
+            let err =
+                webkit2gtk::glib::Error::new(webkit2gtk::NetworkError::Cancelled, "cancelled");
+            assert!(!is_policy_cancellation(&err));
+        }
+    }
 }
 
 #[cfg(test)]
