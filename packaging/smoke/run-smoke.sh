@@ -36,6 +36,16 @@ export WAYLAND_DISPLAY="wayland-smoke"
 export WEBKIT_DISABLE_COMPOSITING_MODE=1   # smoke environment ONLY -- never in shipped code or units
 chmod 700 "$RUNTIME_DIR"
 
+# start_kiosk unconditionally `rm -rf`s DATA_DIR before every scenario. Refuse to
+# run at all unless the operator has explicitly confirmed that is safe -- a
+# provisioned kiosk device's real /var/lib/kiosk must never be silently wiped by
+# a human running this harness on the wrong host (review round 2, Minor 11).
+if [ -z "${KIOSK_SMOKE_I_MEAN_IT:-}" ]; then
+  echo "refusing to run: this harness repeatedly wipes $DATA_DIR." >&2
+  echo "set KIOSK_SMOKE_I_MEAN_IT=1 once you've confirmed that path is disposable on this host." >&2
+  exit 1
+fi
+
 PASS_COUNT=0
 FAIL_COUNT=0
 RESULTS=()   # "N|name|PASS" or "N|name|FAIL" per scenario, printed as the summary table
@@ -47,8 +57,14 @@ log() { echo "[smoke] $*" >&2; }
 # ---------------------------------------------------------------------------
 start_compositor() {
   mkdir -p /tmp/.X11-unix   # weston's xwayland module needs this dir to bind X0; harmless if already present
+  # Default shell (desktop-shell), NOT kiosk-shell.so: kiosk-shell.so forces every
+  # top-level surface to the output's full extent regardless of whether kiosk-main
+  # asked to be fullscreen, which makes scenario 1's geometry check a property of
+  # the compositor, not of kiosk-main (review round 2, Critical 1 -- see
+  # task-9-report.md). desktop-shell's ~32px panel offset is tolerated (logged,
+  # not asserted) in scenario_1 instead. Nothing else in this file reads geometry.
   weston --backend=headless-backend.so --socket="$WAYLAND_DISPLAY" --idle-time=0 \
-    --xwayland --shell=kiosk-shell.so --width="$WAYLAND_OUT_W" --height="$WAYLAND_OUT_H" \
+    --xwayland --width="$WAYLAND_OUT_W" --height="$WAYLAND_OUT_H" \
     >"$RUNTIME_DIR/weston.log" 2>&1 &
   WESTON_PID=$!
   for _ in $(seq 1 50); do
@@ -112,6 +128,20 @@ start_fixtures() {
 stop_fixtures() {
   kill "${HTTPD_PID:-}" 2>/dev/null || true
   wait "${HTTPD_PID:-}" 2>/dev/null || true
+}
+
+# Runs $1 (a function) with the fixture httpd stopped, guaranteed restarted before
+# returning. The ONE place outside start_fixtures/stop_fixtures themselves that
+# touches the shared httpd resource, so a scenario that needs a real network-loss
+# window (only scenario 3, today) calls this instead of reaching into
+# stop_fixtures/start_fixtures directly -- one call for a P2-F port to translate,
+# not a stop/start pair that could be duplicated or forgotten in a future scenario
+# (review round 2, Important 7 -- see task-9-report.md).
+with_fixtures_stopped() {
+  local fn="$1"
+  stop_fixtures
+  "$fn"
+  start_fixtures
 }
 
 # Which signed config variant is live at /config.json (spec §5.2, genuinely
@@ -178,6 +208,19 @@ stop_kiosk() {
     pgrep -f WebKitWebProcess >/dev/null 2>&1 || pgrep -f WebKitNetworkProcess >/dev/null 2>&1 || break
     sleep 0.2
   done
+  # Escalate + log rather than silently giving up after 5s (review round 2, Minor
+  # 9): a slower host, or a WebKit child wedged past SIGTERM, must not silently
+  # reintroduce the exact "next scenario starts before this one's WebKit is
+  # actually gone" flake this whole function exists to close.
+  if pgrep -f WebKitWebProcess >/dev/null 2>&1 || pgrep -f WebKitNetworkProcess >/dev/null 2>&1; then
+    log "  WARNING: WebKit child(ren) still alive 5s after SIGTERM; escalating to SIGKILL"
+    pkill -9 -f WebKitWebProcess 2>/dev/null || true
+    pkill -9 -f WebKitNetworkProcess 2>/dev/null || true
+    for _ in $(seq 1 15); do
+      pgrep -f WebKitWebProcess >/dev/null 2>&1 || pgrep -f WebKitNetworkProcess >/dev/null 2>&1 || break
+      sleep 0.2
+    done
+  fi
 }
 
 kiosk_alive() { kill -0 "${KIOSK_PID:-0}" 2>/dev/null; }
@@ -243,13 +286,23 @@ check() {
   fi
 }
 
+SCENARIO_BLOCKED=0
+# note_blocked DESC -- records a sub-check that was genuinely driven but could not
+# be exercised in this environment (see the file header). Distinct from `check`:
+# never flips SCENARIO_OK, but IS counted and surfaced in the summary table's
+# verdict (review round 2, Important 4) so "PASS" can never silently mean
+# "PASS, but two required sub-checks were never exercised" -- that used to be
+# true only of the per-check log lines, not of the one line a human/P2-F actually
+# reads at the end.
 note_blocked() {
   log "  BLOCKED: $1"
+  SCENARIO_BLOCKED=$((SCENARIO_BLOCKED + 1))
 }
 
 run_scenario() {
   local n="$1" name="$2" fn="$3"
   SCENARIO_OK=1
+  SCENARIO_BLOCKED=0
   log "=== Scenario $n: $name ==="
   "$fn"
   local verdict
@@ -259,6 +312,9 @@ run_scenario() {
   else
     verdict=FAIL
     FAIL_COUNT=$((FAIL_COUNT + 1))
+  fi
+  if [ "$SCENARIO_BLOCKED" -gt 0 ]; then
+    verdict="$verdict ($SCENARIO_BLOCKED BLOCKED)"
   fi
   RESULTS+=("$n|$name|$verdict")
   log "=== Scenario $n verdict: $verdict ==="
@@ -285,8 +341,11 @@ scenario_1() {
   else
     geo="$(DISPLAY=":$X11_DISPLAY" xdotool getwindowgeometry --shell "$win" 2>/dev/null)"
     log "  window geometry: $(echo "$geo" | tr '\n' ' ')"
+    # Y is deliberately NOT asserted: desktop-shell reserves a panel strip (~32px)
+    # that no fullscreen request can reclaim -- gating on it would make this check
+    # a property of the compositor, not of kiosk-main. Logged for visibility only.
+    log "  window Y (desktop-shell panel offset, informational, not gated): $(echo "$geo" | sed -n 's/^Y=//p')"
     check "window X" "$(echo "$geo" | sed -n 's/^X=//p')" 0
-    check "window Y" "$(echo "$geo" | sed -n 's/^Y=//p')" 0
     check "window WIDTH == headless output width" "$(echo "$geo" | sed -n 's/^WIDTH=//p')" "$WAYLAND_OUT_W"
     check "window HEIGHT == headless output height" "$(echo "$geo" | sed -n 's/^HEIGHT=//p')" "$WAYLAND_OUT_H"
   fi
@@ -305,6 +364,15 @@ scenario_2() {
   wait_until 15 httpd_get_at_least /home.html 1
 
   check "kiosk-main alive after boot" "$(kiosk_alive && echo yes || echo no)" yes
+
+  # Snapshot, not a hardcoded "1" (same order-independence reasoning as scenario
+  # 4's Important-3 fix): the fixture httpd's access log accumulates across the
+  # WHOLE run (start_fixtures runs once in main(), before scenario 1), so by the
+  # time scenario 2 boots, this is already the run's SECOND /home.html GET, not
+  # its first. Caught empirically: a hardcoded "1" here passed in isolation and
+  # failed in the real 5-scenario sequence.
+  local gets_after_initial_load
+  gets_after_initial_load="$(httpd_get_count /home.html)"
 
   # home.html's step 1 (off-list .click()) fires at T+2s after ITS OWN load, not
   # process start -- wait_until polls for the effect rather than assuming a fixed
@@ -337,13 +405,25 @@ scenario_2() {
     note_blocked "target=_blank off-allowlist: nav.blocked count stayed at $blocked_after (expected 2) -- same WebKit gesture gate as above; the guard was never reached to judge this one. NOT counted as scenario failure."
   fi
 
+  # Same assertion scenario 5 carries after its own settle window (review round 2,
+  # Important 6): none of the three attempts above -- blocked, blocked-attempted
+  # target=_blank x2 -- may have reloaded or replaced the top-level document.
+  # Compared against the snapshot above, not a hardcoded "1" -- see its comment.
+  check "top-level unchanged (no reload/replace from any of the three attempts)" \
+    "$(httpd_get_count /home.html)" "$gets_after_initial_load"
+
   stop_kiosk
 }
 
 # ---------------------------------------------------------------------------
 # Scenario 3: offline fallback. Stop the fixture httpd, drive a reload (the page
 # itself calls location.reload() -- a genuine top-level navigation attempt, not
-# a simulation), assert the failure is observed and the app survives.
+# a simulation), assert the link drop is independently observed by the FSM's
+# connectivity prober (not just a generic load failure), and assert the FULL
+# recovery loop: reconnect is observed and the remembered home is re-navigated
+# for real (review round 2, Critical 2 -- the original version of this scenario
+# asserted nothing that a black-screen-on-network-loss device couldn't also
+# satisfy; see task-9-report.md for the full "what was vacuous and why" writeup).
 # ---------------------------------------------------------------------------
 scenario_3() {
   stage_config config-reload.json
@@ -354,11 +434,40 @@ scenario_3() {
   check "initial GET of home.html?probe=reload succeeded" \
     "$([ "$(httpd_get_count '/home.html?probe=reload')" -ge 1 ] && echo yes || echo no)" yes
 
-  stop_fixtures
-  log "  fixture httpd stopped; waiting for the page's self-reload to hit a closed port"
-  wait_until 12 event_at_least nav.error 1   # reload fires at T+2s after load; localhost connection-refused is fast
+  # kiosk-core's Prober (net/prober.rs) starts ASSUMING Offline, and its cold-start
+  # rule only flips on a CHANGE from that assumption -- if the httpd went down
+  # before the prober's very first probe, that first failure would read as
+  # "already offline" and net.offline would never fire AT ALL, no matter how long
+  # the link stayed down (confirmed by reading Prober::record's damping table).
+  # Must happen BEFORE stopping fixtures, or the assertion below is unfireable by
+  # construction.
+  #
+  # This -- and the whole offline/recovery window below -- runs on the SCHEMA
+  # DEFAULT probe intervals (probe_offline_s=10, probe_online_s=30), not a fast
+  # test-only override: main.rs reads `network` from `booted.manager.current()`
+  # BEFORE `booted.manager` moves into `fetch::run` (main.rs, right after
+  # `boot::load`), so it is fixed at whatever local/bootstrap state resolved at
+  # boot -- a signed config's `network` section can never take effect within the
+  # lifetime of the process that fetches it (confirmed the hard way: setting it
+  # in config-reload.json changed nothing observable, and separately, values
+  # below config/validate.rs's 5s floor were silently rejected as "invalid
+  # config: 2 field error(s)", which is a second, independent reason not to lean
+  # on this path). So this scenario genuinely costs on the order of a minute and
+  # a half of wall clock -- real damped-probe timing, not a harness inefficiency.
+  wait_until 20 event_at_least net.online 1
+  check "prober confirmed online before the link drop" \
+    "$([ "$(event_count net.online)" -ge 1 ] && echo yes || echo no)" yes
+
+  with_fixtures_stopped scenario_3_offline_window
 
   check "nav.error observed (the reload's connection failure)" "$([ "$(event_count nav.error)" -ge 1 ] && echo yes || echo no)" yes
+  # Independent of nav.error: net.offline comes from the connectivity prober's own
+  # damped HTTP GETs (probe.rs), a completely separate code path from the WebKit
+  # load-failed signal nav.error is built on. Asserting BOTH is what makes this
+  # scenario about the FSM's offline handling specifically, not just "some load,
+  # somewhere, failed" -- the gap the review flagged.
+  check "net.offline observed (the prober independently heard the link drop)" \
+    "$([ "$(event_count net.offline)" -ge 1 ] && echo yes || echo no)" yes
   check "kiosk-main still alive (fell to the offline page, did not crash)" "$(kiosk_alive && echo yes || echo no)" yes
 
   log "  offline.html's app-origin load and its kioskasset://localhost mp4-URL computation are" \
@@ -371,8 +480,38 @@ scenario_3() {
   # memory-surface output's geometry the way it does a real one. Not worth
   # carrying a call that is guaranteed to abort on this backend.
 
+  # Recovery (with_fixtures_stopped already restarted the httpd before returning):
+  # rule 4 (kiosk-core state.rs, `Offline + LinkChanged(Online)`) must re-navigate
+  # the remembered home once the prober confirms reconnect -- proving the machine
+  # genuinely was in AppState::Offline and can leave it, not just that it survived.
+  # Compared against RELOAD_GETS_BEFORE_RECOVERY (a snapshot `scenario_3_offline_window`
+  # took just before fixtures came back up) rather than a fixed "== 2": the page's
+  # own ?probe=reload timer can legitimately produce more than one successful GET
+  # before the link actually drops, depending on exactly how boot latency lines up
+  # against the probe interval, so only "strictly more than whatever it already
+  # was" is a timing-independent signal. Two consecutive successful probes at the
+  # (default) 10s offline-interval before this flips -- see the note above on why
+  # that default, not a fast override, is what's actually running.
+  wait_until 40 event_at_least net.online 2
+  wait_until 10 httpd_get_at_least '/home.html?probe=reload' "$((RELOAD_GETS_BEFORE_RECOVERY + 1))"
+  check "net.online observed again after recovery (reconnect)" \
+    "$([ "$(event_count net.online)" -ge 2 ] && echo yes || echo no)" yes
+  check "a fresh GET of home.html?probe=reload after recovery (rule 4 re-navigate)" \
+    "$([ "$(httpd_get_count '/home.html?probe=reload')" -gt "$RELOAD_GETS_BEFORE_RECOVERY" ] && echo yes || echo no)" yes
+  check "kiosk-main still alive after recovery" "$(kiosk_alive && echo yes || echo no)" yes
+
   stop_kiosk
-  start_fixtures   # restart for scenario 4/5
+}
+
+# Runs while the fixture httpd is down (called only via with_fixtures_stopped).
+# Snapshots RELOAD_GETS_BEFORE_RECOVERY (a global scenario_3 reads after
+# with_fixtures_stopped returns) so the post-recovery check is a delta, not a
+# fixed count -- see scenario_3's comment on the recovery checks.
+scenario_3_offline_window() {
+  log "  fixture httpd stopped; waiting for the page's self-reload to hit a closed port"
+  wait_until 12 event_at_least nav.error 1    # reload fires at T+2s after load; localhost connection-refused is fast
+  wait_until 90 event_at_least net.offline 1  # 2 consecutive failed probes at the (default) 30s online-interval
+  RELOAD_GETS_BEFORE_RECOVERY="$(httpd_get_count '/home.html?probe=reload')"
 }
 
 # ---------------------------------------------------------------------------
@@ -386,17 +525,32 @@ scenario_4() {
   check "kiosk-main alive after boot" "$(kiosk_alive && echo yes || echo no)" yes
   check "initial GET /home.html before the crash" "$([ "$(httpd_get_count /home.html)" -ge 1 ] && echo yes || echo no)" yes
 
+  # Snapshot BEFORE the kill rather than asserting a fixed "== 2" (review round 2,
+  # Important 3): scenarios 1 and 2 each already GET /home.html once, so a
+  # re-homed run that reorders or drops scenario 3 (which is what currently
+  # truncates the shared httpd access log, via start_fixtures) would satisfy a
+  # fixed ">= 2" before the crash below ever happens. Comparing against this
+  # scenario's OWN pre-kill count is order-independent -- it only ever proves
+  # something NEW happened after the crash.
+  local gets_before_crash
+  gets_before_crash="$(httpd_get_count /home.html)"
+
   pkill -f WebKitWebProcess
   log "  sent SIGTERM to WebKitWebProcess"
   wait_until 10 event_at_least webview.crash 1
 
   check "kiosk-main (the supervising process) survived the renderer crash" "$(kiosk_alive && echo yes || echo no)" yes
   check "exactly one webview.crash" "$(event_count webview.crash)" 1
-  log "  webview.crash kind: $(spool_events | grep -F '"event":"webview.crash"' | sed -n 's/.*"kind":"\([^"]*\)".*/\1/p')"
+  # Was only ever logged, not asserted (review round 2, Important 5) -- the
+  # termination_label mapping (recovery.rs) is spec-pinned to NOT reuse the
+  # WebView2 constant space, and nothing in this harness checked that until now.
+  local crash_kind
+  crash_kind="$(spool_events | grep -F '"event":"webview.crash"' | sed -n 's/.*"kind":"\([^"]*\)".*/\1/p')"
+  check "webview.crash kind is webkit_crashed" "$crash_kind" webkit_crashed
 
-  wait_until 10 httpd_get_at_least /home.html 2
+  wait_until 10 httpd_get_at_least /home.html "$((gets_before_crash + 1))"
   check "a fresh GET /home.html after the crash (recovery navigate-home)" \
-    "$([ "$(httpd_get_count /home.html)" -ge 2 ] && echo yes || echo no)" yes
+    "$([ "$(httpd_get_count /home.html)" -gt "$gets_before_crash" ] && echo yes || echo no)" yes
 
   stop_kiosk
 }
@@ -453,4 +607,11 @@ main() {
   [ "$FAIL_COUNT" = 0 ]
 }
 
-main
+# Guarded so this file can be `source`d (e.g. to drive a single scenario_N
+# function in isolation, as the review-round-2 mutation tests did) without
+# immediately running the full 5-scenario suite. `bash packaging/smoke/run-smoke.sh`
+# (the documented, only supported way to run this file directly) is unaffected --
+# BASH_SOURCE[0] and $0 are the same path in that case, exactly as before.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main
+fi
