@@ -54,6 +54,9 @@ pub fn caps() -> &'static [(Event, u32, u32)] {
         (Event::NavBlocked, 10, 20),
         (Event::NavError, 10, 20),
         (Event::WebviewCrash, 6, 6),
+        // A broken media asset can be retriggered by recovery, reload, or safe-mode
+        // cycling. Keep the signal visible without allowing it to flood the spool.
+        (Event::MediaError, 6, 6),
         // focus.lost is OS/window-manager-driven (alt-tab, an always-on-top window,
         // a UAC prompt): a real focus-fight would otherwise emit unbounded WARNING
         // entries and unbounded disk-spool writes. Capped at its WARNING siblings'
@@ -221,5 +224,14 @@ mod tests {
             .find(|(e, _, _)| *e == Event::WebviewCrash)
             .unwrap();
         assert_eq!(crash.1, 6);
+    }
+
+    #[test]
+    fn media_error_is_capped_at_six_per_minute() {
+        let mut r = limiter();
+        let admitted = (0..10)
+            .filter(|_| matches!(r.admit(Event::MediaError), Admit::Allow))
+            .count();
+        assert_eq!(admitted, 6);
     }
 }

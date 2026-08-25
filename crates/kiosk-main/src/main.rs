@@ -15,6 +15,7 @@ mod heartbeat;
 mod idle;
 mod inject;
 mod maintenance;
+mod media;
 mod nav;
 mod nav_policy;
 mod pinpad;
@@ -52,6 +53,12 @@ const APP_ORIGIN: &str = if cfg!(windows) {
     "http://tauri.localhost"
 } else {
     "tauri://localhost"
+};
+
+const ASSET_ORIGIN: &str = if cfg!(windows) {
+    "http://kioskasset.localhost"
+} else {
+    "kioskasset://localhost"
 };
 
 /// Generous relative to the event rate (one per probe flip / config poll / navigation);
@@ -221,7 +228,11 @@ mod hold_safe_after_credential_violation_tests {
         let urls = navigated.lock().unwrap();
         // FIX 3 (SEC-09 final review): navigates TWICE, last-write-wins against a
         // driver dispatch that raced the latch — see this function's doc comment.
-        assert_eq!(urls.len(), 2, "must navigate exactly twice (last-write-wins)");
+        assert_eq!(
+            urls.len(),
+            2,
+            "must navigate exactly twice (last-write-wins)"
+        );
         for url in urls.iter() {
             assert!(url.contains("safe.html"));
             assert!(url.contains("device=lobby-01"));
@@ -765,11 +776,14 @@ async fn main() {
     // config (a later config fetch changing either field takes effect only on the
     // next process restart).
     let nightly_reload = booted.manager.current().maintenance.nightly_reload.clone();
+    let restart_app = booted.manager.current().maintenance.restart_app.clone();
     let maintenance_timezone = booted.manager.current().maintenance.timezone.clone();
     // P1-D2e Task 2: same "read once, next-restart to change" convention as the
     // fields above — the health-sample timer is spawned once, below, and never
     // re-reads config.
     let health_sample_s = booted.manager.current().logging.health_sample_s;
+    let max_webview_mem_mb = booted.manager.current().maintenance.max_webview_mem_mb;
+    let logging_level = booted.manager.current().logging.level.clone();
     // P1-D2c Task 4: same "read once, next-restart to change" convention as the
     // three fields above — remote `input.exit_gesture` wins over bootstrap
     // `[exit_gesture]` (cfg-12), resolved once here via `gesture::effective_gesture`
@@ -802,6 +816,8 @@ async fn main() {
     };
     let nav_policy: SharedNavPolicy = Arc::new(ArcSwap::from_pointee(policy));
     let nav_policy_fetch = nav_policy.clone();
+    let (policy_updates_tx, policy_updates_rx) = std::sync::mpsc::channel::<Arc<NavPolicy>>();
+    let policy_updates_fetch = policy_updates_tx.clone();
 
     // TEL-01: ONE clock, cloned into both the logger stack and the prober. Two
     // independent clocks would give each its own, disagreeing view of the
@@ -886,6 +902,7 @@ async fn main() {
     let dropped_expired_log = dropped_expired.clone();
     let (handle_tx, handle_rx) = std::sync::mpsc::channel::<Option<telemetry::Telemetry>>();
     let panic_hook_data_dir = data_dir.clone();
+    let telemetry_data_dir = data_dir.clone();
     let spawned = std::thread::Builder::new()
         .name("telemetry".into())
         .spawn(move || {
@@ -905,7 +922,7 @@ async fn main() {
                 clock,
                 app_version,
                 revision,
-                &data_dir,
+                &telemetry_data_dir,
             ) {
                 Ok((telem, logger, log_rx)) => {
                     let _ = handle_tx.send(Some(telem));
@@ -928,6 +945,7 @@ async fn main() {
         .ok()
         .flatten()
         .unwrap_or_else(telemetry::Telemetry::disabled);
+    telem.set_level(&logging_level);
 
     install_panic_hook(telem.clone(), panic_hook_data_dir);
     telem.app_start();
@@ -952,6 +970,7 @@ async fn main() {
             refetch.clone(),
             fetch_probe_cancel.clone(),
             nav_policy_fetch,
+            policy_updates_fetch,
             credential_path_for_reload,
             credential_violation_tx,
         ));
@@ -972,6 +991,9 @@ async fn main() {
     // function of `%ProgramData%`, cheap to call again here — the `data_dir` bound
     // at the top of `main` was already moved into the telemetry thread's closure
     // above (same pattern as `pinpad_state` below).
+    // sysinfo's process refresh can otherwise retain one /proc/stat handle per
+    // tracked process. Disable that cache before the health task's first refresh.
+    sysinfo::set_open_files_limit(0);
     tokio::spawn(health::run(
         System::new(),
         Disks::new_with_refreshed_list(),
@@ -981,6 +1003,7 @@ async fn main() {
         Arc::new(move || dropped_expired.load(std::sync::atomic::Ordering::Relaxed)),
         telem.clone(),
         cancel.clone(),
+        max_webview_mem_mb,
     ));
 
     // P1-E2 Task 5: heartbeat client. `ready` is pulsed by `nav::install` on the
@@ -988,14 +1011,17 @@ async fn main() {
     // and pings the launcher. No `KIOSK_HEARTBEAT_PIPE` → nobody is supervising
     // us (developer / direct launch) → no heartbeat, kiosk runs unchanged.
     let ready = Arc::new(Notify::new());
-    match heartbeat::pipe_name_from_env() {
-        Some(pipe_name) => {
-            tokio::spawn(heartbeat::run(pipe_name, ready.clone(), cancel.clone()));
-        }
-        None => eprintln!(
+    let heartbeat_pipe = heartbeat::pipe_name_from_env();
+    #[cfg(windows)]
+    if let Some(pipe_name) = heartbeat_pipe.clone() {
+        tokio::spawn(heartbeat::run(pipe_name, ready.clone(), cancel.clone()));
+    }
+    #[cfg(target_os = "linux")]
+    if heartbeat_pipe.is_none() {
+        eprintln!(
             "kiosk-main: {} unset; running standalone with no launcher heartbeat",
             heartbeat::PIPE_ENV
-        ),
+        );
     }
 
     // Keep-awake (spec §7, display.keep_awake): asserted once at startup, for the
@@ -1017,6 +1043,43 @@ async fn main() {
         }
     }
 
+    // Linux defense-in-depth: the packaged image masks the sleep targets and
+    // keeps logind idle actions disabled, so this inhibitor is not the primary
+    // keep-awake control. It remains useful if an operator unmasks a target.
+    #[cfg(target_os = "linux")]
+    if display.keep_awake {
+        match std::process::Command::new("systemd-inhibit")
+            .args([
+                "--what=idle:sleep",
+                "--who=kiosk-browser",
+                "--why=kiosk display",
+                "--mode=block",
+                "cat",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(mut child) => {
+                // Keeping this pipe open is the inhibitor. Taking and dropping it
+                // immediately would make `cat` see EOF and release the lock.
+                let inhibit_pipe = child.stdin.take();
+                let telem_inhibit = telem.clone();
+                std::thread::spawn(move || {
+                    let _inhibit_pipe = inhibit_pipe;
+                    let status = child.wait();
+                    telem_inhibit.config_warn(
+                        "display.keep_awake",
+                        &format!("inhibitor exited: {status:?}"),
+                    );
+                });
+            }
+            Err(e) => telem.config_warn(
+                "display.keep_awake",
+                &format!("systemd-inhibit spawn failed: {e}"),
+            ),
+        }
+    }
+
     let windowed = args.windowed;
     let tx_setup = tx.clone();
     let refetch_setup = refetch.clone();
@@ -1026,6 +1089,8 @@ async fn main() {
     let nav_policy_setup = nav_policy.clone();
     let exit_gesture_setup = exit_gesture.clone();
     let ready_setup = ready.clone();
+    let policy_updates_rx_setup = policy_updates_rx;
+    let data_dir_setup = data_dir.clone();
 
     // P1-D2c Task 5: the `verify_pin` command's state. `resolve_data_dir()` is a
     // pure function of `%ProgramData%`, cheap to call again here — the `data_dir`
@@ -1039,7 +1104,11 @@ async fn main() {
 
     tauri::Builder::default()
         .manage(pinpad_state)
-        .invoke_handler(tauri::generate_handler![pinpad::verify_pin])
+        .manage(telem.clone())
+        .invoke_handler(tauri::generate_handler![
+            pinpad::verify_pin,
+            media::media_error
+        ])
         // Serve the runtime, user-replaceable `kiosk-offline.mp4` (spec §3.4: sits next
         // to the binaries, NOT build-embedded) to the bundled offline.html at a fixed
         // origin. A custom scheme rather than the built-in asset protocol because the
@@ -1088,10 +1157,7 @@ async fn main() {
             builder = if windowed {
                 builder.inner_size(1280.0, 800.0).decorations(true)
             } else {
-                builder
-                    .decorations(false)
-                    .always_on_top(true)
-                    .focused(true)
+                builder.decorations(false).always_on_top(true).focused(true)
             };
             // P1-D2b Task 6: the ONE `initialization_script` call for this webview
             // (a second call elsewhere would clobber this one — see
@@ -1101,6 +1167,7 @@ async fn main() {
             builder = builder.initialization_script(inject::build_injection(
                 display.cursor_autohide_seconds,
                 allow_text_selection,
+                cfg!(target_os = "linux"),
             ));
 
             // Linux nav guard (P2-A): wry already installs the `decide-policy` handler this drives
@@ -1116,11 +1183,13 @@ async fn main() {
                 let guard_policy = nav_policy_setup.clone();
                 let guard_telem = telem_setup.clone();
                 builder = builder.on_navigation(move |url| {
-                    match nav::should_block(
-                        &guard_policy.load(),
+                    let policy = guard_policy.load();
+                    let decision = scheme_guard::navigation_block_reason(
                         url.as_str(),
-                        nav::ENFORCE_ALL_FRAMES,
-                    ) {
+                        policy.scheme_allowlist(),
+                    )
+                    .or_else(|| nav::should_block(&policy, url.as_str(), nav::ENFORCE_ALL_FRAMES));
+                    match decision {
                         Some(reason) => {
                             guard_telem.nav_blocked(reason.as_str(), url.as_str());
                             false
@@ -1140,9 +1209,28 @@ async fn main() {
                     }
                     tauri::webview::NewWindowResponse::Deny
                 });
+
+                let dl_telem = telem_setup.clone();
+                builder = builder.on_download(move |_webview, event| match event {
+                    tauri::webview::DownloadEvent::Requested { url, .. } => {
+                        dl_telem.nav_blocked(scheme_guard::REASON_DOWNLOAD, url.as_str());
+                        false
+                    }
+                    _ => true,
+                });
             }
 
             let window = builder.build()?;
+
+            #[cfg(target_os = "linux")]
+            if let Some(pipe_name) = heartbeat_pipe {
+                tokio::spawn(heartbeat::run(
+                    pipe_name,
+                    ready_setup.clone(),
+                    cancel_setup.clone(),
+                    window.clone(),
+                ));
+            }
 
             // display.monitor (spec §5.2): an out-of-range index must never
             // leave the kiosk without a window or panic at startup — a
@@ -1190,7 +1278,15 @@ async fn main() {
                 ready_setup.clone(),
             );
             scheme_guard::install(&window, telem_setup.clone(), nav_policy_setup.clone());
-            egress::install(&window, telem_setup.clone(), nav_policy_setup.clone());
+            egress::install(
+                &window,
+                telem_setup.clone(),
+                nav_policy_setup.clone(),
+                policy_updates_rx_setup,
+                data_dir_setup,
+                APP_ORIGIN,
+                ASSET_ORIGIN,
+            );
             hardening::apply(
                 &window,
                 nav_policy_setup.clone(),
@@ -1282,7 +1378,7 @@ async fn main() {
                 let maint_telem = telem_setup.clone();
                 tokio::spawn(maintenance::run(
                     nightly_reload,
-                    maintenance_timezone,
+                    maintenance_timezone.clone(),
                     move || {
                         let _ = tx_reload.try_send(AppEvent::IdleExpired);
                     },
@@ -1290,6 +1386,20 @@ async fn main() {
                         maint_telem.config_warn(
                             "maintenance.nightly_reload",
                             "unparseable HH:MM or unknown timezone; nightly reload disabled",
+                        )
+                    },
+                    cancel_setup.clone(),
+                ));
+
+                let restart_telem = telem_setup.clone();
+                tokio::spawn(maintenance::run(
+                    restart_app,
+                    maintenance_timezone,
+                    || std::process::exit(0),
+                    move || {
+                        restart_telem.config_warn(
+                            "maintenance.restart_app",
+                            "unparseable HH:MM or unknown timezone; scheduled restart disabled",
                         )
                     },
                     cancel_setup.clone(),

@@ -1,7 +1,8 @@
 use serde_json::{Map, Value};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
-use sysinfo::{Disks, System};
+use sysinfo::{Disks, Pid, Process, ProcessesToUpdate, System};
 
 pub struct HealthSample {
     pub cpu_percent: f32,
@@ -9,6 +10,7 @@ pub struct HealthSample {
     pub mem_total_mb: u64,
     pub disk_free_mb: u64,
     pub uptime_secs: u64,
+    pub webview_rss_mb: u64,
 }
 
 const MB: u64 = 1_048_576;
@@ -25,6 +27,7 @@ pub fn sample(
 ) -> HealthSample {
     sys.refresh_cpu_usage();
     sys.refresh_memory();
+    sys.refresh_processes(ProcessesToUpdate::All, true);
     disks.refresh();
     // Free space on the disk whose mount point is the longest prefix of data_dir.
     let disk_free = disks
@@ -40,6 +43,59 @@ pub fn sample(
         mem_total_mb: sys.total_memory() / MB,
         disk_free_mb: disk_free / MB,
         uptime_secs: started.elapsed().as_secs(),
+        webview_rss_mb: sysinfo::get_current_pid()
+            .ok()
+            .map(|pid| webview_subtree_rss_mb(sys.processes(), pid))
+            .unwrap_or(0),
+    }
+}
+
+/// Sum the resident/working-set memory of descendants of the kiosk process.
+///
+/// The parent-pointer walk is engine-agnostic: WebKitGTK and WebView2 can add
+/// as many renderer, GPU, or network helpers as they need. A candidate is
+/// accepted only when every parent is present and each child is at least as
+/// new as its claimed parent, which prevents recycled PIDs from grafting an
+/// unrelated process tree onto the kiosk.
+pub fn webview_subtree_rss_mb(procs: &HashMap<Pid, Process>, self_pid: Pid) -> u64 {
+    let Some(self_process) = procs.get(&self_pid) else {
+        return 0;
+    };
+    let self_start = self_process.start_time();
+
+    procs
+        .iter()
+        .filter(|(pid, _)| **pid != self_pid)
+        .filter(|(_, process)| is_descendant(process, self_pid, self_start, procs))
+        .map(|(_, process)| process.memory() / MB)
+        .sum()
+}
+
+fn is_descendant(
+    process: &Process,
+    self_pid: Pid,
+    self_start: u64,
+    procs: &HashMap<Pid, Process>,
+) -> bool {
+    let mut child = process;
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(child as *const Process) {
+            return false;
+        }
+        let Some(parent_pid) = child.parent() else {
+            return false;
+        };
+        let Some(parent) = procs.get(&parent_pid) else {
+            return false;
+        };
+        if child.start_time() < parent.start_time() {
+            return false;
+        }
+        if parent_pid == self_pid {
+            return child.start_time() >= self_start;
+        }
+        child = parent;
     }
 }
 
@@ -51,6 +107,7 @@ pub fn to_fields(s: &HealthSample, dropped_expired: u64) -> Map<String, Value> {
     m.insert("mem_total_mb".into(), Value::from(s.mem_total_mb));
     m.insert("disk_free_mb".into(), Value::from(s.disk_free_mb));
     m.insert("uptime_secs".into(), Value::from(s.uptime_secs));
+    m.insert("webview_rss_mb".into(), Value::from(s.webview_rss_mb));
     m.insert("spool_dropped_expired".into(), Value::from(dropped_expired));
     m
 }
@@ -101,6 +158,7 @@ mod tests {
             mem_total_mb: 200,
             disk_free_mb: 50,
             uptime_secs: 10,
+            webview_rss_mb: 0,
         };
         let f = to_fields(&s, 7);
         for k in [
@@ -109,10 +167,19 @@ mod tests {
             "mem_total_mb",
             "disk_free_mb",
             "uptime_secs",
+            "webview_rss_mb",
             "spool_dropped_expired",
         ] {
             assert!(f.contains_key(k), "missing {k}");
         }
         assert_eq!(f["spool_dropped_expired"], serde_json::json!(7));
+    }
+
+    #[test]
+    fn subtree_helper_handles_the_real_process_table_without_panicking() {
+        let mut sys = System::new();
+        sys.refresh_processes(ProcessesToUpdate::All, true);
+        let pid = sysinfo::get_current_pid().expect("test process must have a pid");
+        let _rss = webview_subtree_rss_mb(sys.processes(), pid);
     }
 }

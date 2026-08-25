@@ -1,0 +1,18 @@
+[Unit]
+Description=kiosk browser
+StartLimitIntervalSec=0
+After=systemd-user-sessions.service
+
+[Service]
+Type=simple
+ExecStart=cage -- /usr/lib/kiosk/kiosk-launcher --config /etc/kiosk
+Restart=always
+RestartSec=30
+RestartPreventExitStatus=86
+SuccessExitStatus=86
+RuntimeDirectory=kiosk
+RuntimeDirectoryMode=0700
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

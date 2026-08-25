@@ -1,0 +1,26 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = configure ] && [ -z "${2:-}" ]; then
+    install -d -m 0750 -o root -g root /etc/kiosk /var/lib/kiosk
+fi
+
+if [ -e /etc/kiosk/kiosk-credential.json ]; then
+    chmod 0600 /etc/kiosk/kiosk-credential.json
+fi
+
+if [ "$1" = configure ]; then
+    deb-systemd-helper --quiet was-enabled kiosk.service &&
+        deb-systemd-helper enable kiosk.service ||
+        deb-systemd-helper update-state kiosk.service
+
+    if [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
+        if [ -n "${2:-}" ]; then
+            deb-systemd-invoke restart kiosk.service || true
+        else
+            deb-systemd-invoke start kiosk.service || true
+        fi
+    fi
+fi
+
+exit 0

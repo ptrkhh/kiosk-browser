@@ -146,12 +146,147 @@ async fn sleep_or_cancel(cancel: &CancellationToken, d: Duration) -> bool {
     }
 }
 
-/// Non-Windows stub: the watchdog channel is a Windows named pipe (the kiosk
-/// target is Windows x64; other hosts are dev-only). Mirrors the stubs in
-/// `kiosk-launcher`'s `pipe.rs` / `spawn.rs`.
-#[cfg(not(windows))]
-pub async fn run(_pipe_name: String, _ready: Arc<Notify>, _cancel: CancellationToken) {
-    eprintln!("kiosk-main heartbeat is Windows-only; not sending heartbeats on this platform");
+/// Linux heartbeat client. The Unix socket carries the same line-framed IPC as
+/// the Windows named pipe. In addition, every ping is gated on a GTK/WebKit
+/// round trip so a live Tokio runtime cannot mask a wedged UI thread or
+/// renderer from the launcher's hang detector.
+#[cfg(unix)]
+pub async fn run(
+    pipe_name: String,
+    ready: Arc<Notify>,
+    cancel: CancellationToken,
+    window: tauri::WebviewWindow,
+) {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::UnixStream;
+
+    use kiosk_core::ipc::{encode, Frame, PING_INTERVAL_S};
+
+    let mut ready_reached = false;
+    let mut logged_failure = false;
+    let mut logged_ui_failure = false;
+
+    loop {
+        if cancel.is_cancelled() {
+            return;
+        }
+        // Linux reconnect gaps are ENOENT before the launcher's first bind and
+        // ECONNREFUSED while the socket file exists between listener instances.
+        // Any open error is transient from the client's point of view.
+        let mut client = match UnixStream::connect(&pipe_name).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                if !logged_failure {
+                    logged_failure = true;
+                    eprintln!(
+                        "kiosk-main: heartbeat socket {pipe_name} unavailable ({error}); retrying"
+                    );
+                }
+                if !sleep_or_cancel(&cancel, RECONNECT_BACKOFF).await {
+                    return;
+                }
+                continue;
+            }
+        };
+        logged_failure = false;
+
+        if !ready_reached {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = ready.notified() => ready_reached = true,
+            }
+        }
+
+        let ready_frame = encode(&Frame::Ready);
+        let write_result = tokio::select! {
+            _ = cancel.cancelled() => return,
+            result = client.write_all(ready_frame.as_bytes()) => result,
+        };
+        if write_result.is_err() {
+            if !sleep_or_cancel(&cancel, RECONNECT_BACKOFF).await {
+                return;
+            }
+            continue;
+        }
+
+        let mut tick = tokio::time::interval(Duration::from_secs(PING_INTERVAL_S));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await;
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tick.tick() => {
+                    // arch-04 / RT-02 / OD-1: a Tokio task alone proves only that
+                    // Tokio is alive. Round-trip through GTK and WebKit before
+                    // claiming the whole kiosk is alive. The three-second cap is
+                    // below the launcher FSM's 15-second three-miss window.
+                    if !webview_round_trip(&window).await {
+                        if !logged_ui_failure {
+                            logged_ui_failure = true;
+                            eprintln!(
+                                "kiosk-main: webview heartbeat probe withheld a ping; UI round trip timed out or failed"
+                            );
+                        }
+                        continue;
+                    }
+                    let ping_frame = encode(&Frame::Ping);
+                    let write_result = tokio::select! {
+                        _ = cancel.cancelled() => return,
+                        result = client.write_all(ping_frame.as_bytes()) => result,
+                    };
+                    if write_result.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        if !sleep_or_cancel(&cancel, RECONNECT_BACKOFF).await {
+            return;
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn sleep_or_cancel(cancel: &CancellationToken, d: Duration) -> bool {
+    tokio::select! {
+        _ = cancel.cancelled() => false,
+        _ = tokio::time::sleep(d) => true,
+    }
+}
+
+/// Schedules a no-op on the GTK main thread and resolves only after WebKit has
+/// completed JavaScript execution. A scheduling error, callback error, dropped
+/// callback, or three-second timeout is a failed probe.
+#[cfg(unix)]
+async fn webview_round_trip(window: &tauri::WebviewWindow) -> bool {
+    use tokio::sync::oneshot;
+
+    let (done_tx, done_rx) = oneshot::channel::<Result<(), String>>();
+    let window_for_main = window.clone();
+    if window
+        .run_on_main_thread(move || {
+            let _ = window_for_main.with_webview(move |platform_webview| {
+                use webkit2gtk::WebViewExt;
+
+                #[allow(deprecated)]
+                platform_webview.inner().run_javascript(
+                    "0",
+                    None::<&webkit2gtk::gio::Cancellable>,
+                    move |result| {
+                        let _ = done_tx.send(result.map(|_| ()).map_err(|error| error.to_string()));
+                    },
+                );
+            });
+        })
+        .is_err()
+    {
+        return false;
+    }
+
+    matches!(
+        tokio::time::timeout(Duration::from_secs(3), done_rx).await,
+        Ok(Ok(Ok(())))
+    )
 }
 
 #[cfg(all(test, windows))]

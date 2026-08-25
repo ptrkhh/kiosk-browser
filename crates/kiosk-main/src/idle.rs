@@ -41,6 +41,7 @@ pub fn should_fire(idle_secs: u64, threshold: u64, already_fired: bool) -> bool 
 /// `GetTickCount64` inflates the result by k*2^32 ms permanently after the first
 /// wraparound (~50 days uptime), wedging idle_secs at billions so the latch never
 /// re-arms and idle reset silently dies for the rest of uptime.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn idle_secs_from_ticks(now_tick_ms32: u32, last_input_tick_ms32: u32) -> u64 {
     (now_tick_ms32.wrapping_sub(last_input_tick_ms32) / 1000) as u64
 }
@@ -56,11 +57,56 @@ pub async fn run(
 
 #[cfg(not(windows))]
 pub async fn run(
-    _threshold: u64,
-    _tx: tokio::sync::mpsc::Sender<AppEvent>,
-    _cancel: tokio_util::sync::CancellationToken,
+    threshold: u64,
+    tx: tokio::sync::mpsc::Sender<AppEvent>,
+    cancel: tokio_util::sync::CancellationToken,
 ) {
-    eprintln!("idle: only implemented on Windows; idle reset will never fire");
+    let mut already_fired = false;
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+        }
+        let secs = idle_secs();
+        if should_fire(secs, threshold, already_fired) {
+            let _ = tx.try_send(AppEvent::IdleExpired);
+            already_fired = true;
+        } else if secs < threshold {
+            already_fired = false;
+        }
+    }
+}
+
+/// Linux input observation clock. The GTK main thread stores it and the Tokio
+/// worker reads it; no ordering is carried by this timestamp.
+#[cfg(not(windows))]
+static LAST_INPUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(not(windows))]
+pub fn note_activity() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    // Keep the zero value reserved for "no observation source".
+    LAST_INPUT_MS.store(now.max(1), std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(windows))]
+fn idle_secs() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let last = LAST_INPUT_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if last == 0 {
+        return 0;
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(last);
+    now.saturating_sub(last) / 1000
 }
 
 #[cfg(windows)]
@@ -113,6 +159,35 @@ mod windows_impl {
 #[cfg(test)]
 mod tests {
     use super::{idle_secs_from_ticks, should_fire};
+
+    #[cfg(not(windows))]
+    mod linux_clock {
+        use super::super::*;
+
+        fn reset_clock_for_test() {
+            LAST_INPUT_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        #[test]
+        fn no_observation_source_reads_as_not_idle() {
+            reset_clock_for_test();
+            assert_eq!(idle_secs(), 0);
+        }
+
+        #[test]
+        fn a_stamp_at_epoch_zero_still_beats_the_sentinel() {
+            reset_clock_for_test();
+            note_activity();
+            assert_ne!(LAST_INPUT_MS.load(std::sync::atomic::Ordering::Relaxed), 0);
+        }
+
+        #[test]
+        fn a_fresh_stamp_reads_as_zero_idle_seconds() {
+            reset_clock_for_test();
+            note_activity();
+            assert_eq!(idle_secs(), 0);
+        }
+    }
 
     #[test]
     fn fires_once_when_idle_exceeds_threshold() {

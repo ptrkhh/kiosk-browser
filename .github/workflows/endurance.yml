@@ -1,0 +1,152 @@
+name: endurance
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  smoke-key:
+    runs-on: ubuntu-22.04
+    outputs:
+      public_key: ${{ steps.keygen.outputs.public_key }}
+      seed: ${{ steps.keygen.outputs.seed }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - id: keygen
+        shell: bash
+        run: |
+          output="$(cargo run -q -p kiosk-core --example kioskctl -- keygen)"
+          public_key="$(printf '%s\n' "$output" | sed -n 's/^KIOSK_CONFIG_PUBKEY_B64=//p')"
+          seed="$(printf '%s\n' "$output" | sed -n 's/^KIOSK_SIGNING_KEY_B64=//p')"
+          test -n "$public_key" -a -n "$seed"
+          echo "::add-mask::$seed"
+          echo "public_key=$public_key" >> "$GITHUB_OUTPUT"
+          echo "seed=$seed" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: smoke-key
+    uses: ./.github/workflows/build.yml
+    with:
+      pubkey_b64: ${{ needs.smoke-key.outputs.public_key }}
+
+  scenarios-ad:
+    needs: [smoke-key, build]
+    runs-on: ubuntu-22.04
+    container: debian:12
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Debian 12 runtime floor
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            ca-certificates jq cage weston xwayland xdotool systemd \
+            libwebkit2gtk-4.1-0 gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+            gstreamer1.0-libav
+      - uses: actions/download-artifact@v4
+        with:
+          name: kiosk-linux-x86_64-${{ github.sha }}
+          path: artifacts/linux
+      - name: Prepare release artifacts and kiosk runtime directories
+        run: |
+          find artifacts/linux -type f -name 'kiosk-main' -exec chmod +x {} +
+          find artifacts/linux -type f -name 'kiosk-launcher' -exec chmod +x {} +
+          find artifacts/linux -type f -name 'fixture-httpd' -exec chmod +x {} +
+          find artifacts/linux -type f -name 'clear_probe' -exec chmod +x {} +
+          find artifacts/linux -type f -name 'kioskctl' -exec chmod +x {} +
+          find artifacts/linux/target/release/deps -maxdepth 1 -type f -name 'smoke_linux-*' -exec chmod +x {} +
+          install -d -m 0750 /run/kiosk /var/lib/kiosk
+      - name: Container probe
+        run: |
+          cage -v
+          test -x artifacts/linux/target/release/kiosk-main
+          test -x artifacts/linux/target/release/kiosk-launcher
+          test -x artifacts/linux/target/release/fixture-httpd
+          test -x artifacts/linux/target/release/examples/clear_probe
+          bash packaging/linux/container-assertions.sh --probe-only
+      - name: Run A–D matrix by scenario ID
+        env:
+          KIOSK_BIN: ${{ github.workspace }}/artifacts/linux/target/release/kiosk-main
+          KIOSK_LAUNCHER: ${{ github.workspace }}/artifacts/linux/target/release/kiosk-launcher
+          KIOSK_HTTPD_BIN: ${{ github.workspace }}/artifacts/linux/target/release/fixture-httpd
+          KIOSK_CLEAR_PROBE: ${{ github.workspace }}/artifacts/linux/target/release/examples/clear_probe
+          KIOSKCTL_BIN: ${{ github.workspace }}/artifacts/linux/target/release/examples/kioskctl
+          KIOSK_SMOKE_DRIVER: ${{ github.workspace }}/packaging/smoke/run-smoke.sh
+          KIOSK_CONFIG_PUBKEY_B64: ${{ needs.smoke-key.outputs.public_key }}
+          KIOSK_SIGNING_KEY_B64: ${{ needs.smoke-key.outputs.seed }}
+          KIOSK_SMOKE_I_MEAN_IT: "1"
+        run: |
+          smoke_test="$(find artifacts/linux/target/release/deps -maxdepth 1 -type f \
+            -name 'smoke_linux-*' -perm -111 | head -n 1)"
+          test -n "$smoke_test"
+          test -x "$KIOSK_BIN" -a -x "$KIOSKCTL_BIN"
+          "$GITHUB_WORKSPACE/$smoke_test" --ignored --test-threads=1
+
+  offline-video:
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: kiosk-linux-x86_64-${{ github.sha }}
+          path: artifacts/linux
+      - name: Install soak runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y weston cage xwayland \
+            libwebkit2gtk-4.1-0 gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+            gstreamer1.0-libav
+      - name: Run scenario 18
+        env:
+          KIOSK_BIN: ${{ github.workspace }}/artifacts/linux/target/release/kiosk-main
+          KIOSK_LAUNCHER: ${{ github.workspace }}/artifacts/linux/target/release/kiosk-launcher
+          KIOSK_CONFIG_DIR: ${{ github.workspace }}/packaging/soak
+          KIOSK_DATA_DIR: /tmp/kiosk-soak-data
+          KIOSK_SOAK_RUNNER: ${{ vars.KIOSK_SOAK_RUNNER }}
+          KIOSK_SOAK_DURATION_S: "270"
+        run: bash packaging/soak/scenario-18.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: offline-video-${{ github.sha }}
+          path: |
+            /tmp/kiosk-soak-data
+            /tmp/**/weston.log
+          if-no-files-found: warn
+
+  windows-w2:
+    needs: build
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        scenario: [18-W2]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: kiosk-windows-${{ github.sha }}
+          path: artifacts/windows
+      - name: Run ${{ matrix.scenario }} body
+        shell: pwsh
+        env:
+          KIOSK_WINDOWS_SOAK_RUNNER: ${{ vars.KIOSK_WINDOWS_SOAK_RUNNER }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:KIOSK_WINDOWS_SOAK_RUNNER)) {
+            throw "KIOSK_WINDOWS_SOAK_RUNNER is required; refusing a false green W2 run"
+          }
+          & $env:KIOSK_WINDOWS_SOAK_RUNNER -Scenario "${{ matrix.scenario }}" -ArtifactDir "$env:GITHUB_WORKSPACE\w2-artifacts"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-w2-${{ github.sha }}
+          path: w2-artifacts
+          if-no-files-found: warn

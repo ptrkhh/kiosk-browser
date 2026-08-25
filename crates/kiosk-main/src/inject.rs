@@ -26,7 +26,11 @@
 ///   `user-select: none` rule (and its `input`/`textarea` carve-out, which would be
 ///   meaningless without the blanket rule) is omitted. Drag/drop and print blocking
 ///   apply either way — those are not "text selection" controls.
-pub fn build_injection(cursor_autohide_seconds: u64, select_text: bool) -> String {
+pub fn build_injection(
+    cursor_autohide_seconds: u64,
+    select_text: bool,
+    on_screen_keyboard: bool,
+) -> String {
     let mut script = String::from("(function(){\n");
 
     if !select_text {
@@ -56,6 +60,12 @@ pub fn build_injection(cursor_autohide_seconds: u64, select_text: bool) -> Strin
         ));
     }
 
+    if on_screen_keyboard {
+        script.push_str("try{");
+        script.push_str(include_str!("keyboard.js"));
+        script.push_str("}catch(e){}\n");
+    }
+
     script.push_str("})();\n");
     script
 }
@@ -66,7 +76,7 @@ mod tests {
 
     #[test]
     fn default_call_locks_selection_blocks_drag_and_print() {
-        let s = build_injection(5, false);
+        let s = build_injection(5, false, false);
         assert!(s.contains("user-select:none"));
         assert!(s.contains("input,textarea{user-select:text"));
         assert!(s.contains("'dragstart'"));
@@ -80,17 +90,38 @@ mod tests {
 
     #[test]
     fn zero_seconds_omits_the_autohide_timer() {
-        let s = build_injection(0, false);
+        let s = build_injection(0, false, false);
         assert!(!s.contains("setTimeout"));
         assert!(!s.contains("mousemove"));
     }
 
     #[test]
     fn select_text_true_omits_the_user_select_none_rule() {
-        let s = build_injection(5, true);
+        let s = build_injection(5, true, false);
         assert!(!s.contains("user-select:none"));
         // Drag/drop + print still apply regardless of text-selection choice.
         assert!(s.contains("'dragstart'"));
         assert!(s.contains("Object.defineProperty(window,\"print\""));
+    }
+
+    #[test]
+    fn the_keyboard_block_is_present_only_when_enabled() {
+        let with = build_injection(5, false, true);
+        let without = build_injection(5, false, false);
+        assert!(with.contains("focusin"));
+        assert!(!without.contains("focusin"));
+    }
+
+    #[test]
+    fn the_disabled_arm_is_byte_identical_to_the_two_argument_era() {
+        let s = build_injection(5, false, false);
+        assert!(s.ends_with("})();\n"));
+        assert!(!s.contains("kiosk-osk"));
+    }
+
+    #[test]
+    fn the_keyboard_sets_its_own_user_select_none_either_way() {
+        let s = build_injection(5, true, true);
+        assert!(s.contains("user-select"));
     }
 }

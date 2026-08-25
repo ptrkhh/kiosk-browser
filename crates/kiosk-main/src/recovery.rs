@@ -14,7 +14,7 @@
 //! navigating the (WebView2-recreated-under-the-hood) webview back to `home`.
 //!
 //! **Recreate-vs-reload-fallback, and why this took the fallback (concern, see
-//! task-7-report.md):** the brief's preferred shape is "recreate/reload the
+//! the implementation note):** the brief's preferred shape is "recreate/reload the
 //! webview" on a crash. A full teardown-and-rebuild of the Tauri-owned
 //! `WebviewWindow`/`ICoreWebView2Controller` from inside this COM callback isn't
 //! attempted here — Tauri's `WebviewWindow` is managed by the app's own event loop
@@ -34,6 +34,7 @@ use crate::telemetry::Telemetry;
 
 /// What [`recovery_action`] decided to do about a `ProcessFailed` event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub enum RecoveryAction {
     /// The renderer process is still alive but wedged: reload the current page on
     /// the existing `ICoreWebView2`.
@@ -47,19 +48,30 @@ pub enum RecoveryAction {
 // bindings.rs:702-722), pinned here (not imported from `windows`) so
 // [`recovery_action`]/[`kind_label`] stay pure and host-testable on every target —
 // same convention as `hardening::classify_permission_kind`.
+#[cfg_attr(not(windows), allow(dead_code))]
 const KIND_BROWSER_PROCESS_EXITED: i32 = 0;
+#[cfg_attr(not(windows), allow(dead_code))]
 const KIND_RENDER_PROCESS_EXITED: i32 = 1;
+#[cfg_attr(not(windows), allow(dead_code))]
 const KIND_RENDER_PROCESS_UNRESPONSIVE: i32 = 2;
+#[cfg_attr(not(windows), allow(dead_code))]
 const KIND_FRAME_RENDER_PROCESS_EXITED: i32 = 3;
+#[cfg_attr(not(windows), allow(dead_code))]
 const KIND_UTILITY_PROCESS_EXITED: i32 = 4;
+#[cfg_attr(not(windows), allow(dead_code))]
 const KIND_SANDBOX_HELPER_PROCESS_EXITED: i32 = 5;
+#[cfg_attr(not(windows), allow(dead_code))]
 const KIND_GPU_PROCESS_EXITED: i32 = 6;
+#[cfg_attr(not(windows), allow(dead_code))]
 const KIND_PPAPI_PLUGIN_PROCESS_EXITED: i32 = 7;
+#[cfg_attr(not(windows), allow(dead_code))]
 const KIND_PPAPI_BROKER_PROCESS_EXITED: i32 = 8;
+#[cfg_attr(not(windows), allow(dead_code))]
 const KIND_UNKNOWN_PROCESS_EXITED: i32 = 9;
 
 /// Pure, host-tested: the only kind that gets `Reload` instead of `NavigateHome`
 /// is the hang (`RENDER_PROCESS_UNRESPONSIVE`) — see module doc.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn recovery_action(raw_kind: i32) -> RecoveryAction {
     if raw_kind == KIND_RENDER_PROCESS_UNRESPONSIVE {
         RecoveryAction::Reload
@@ -71,6 +83,7 @@ pub fn recovery_action(raw_kind: i32) -> RecoveryAction {
 /// A stable, greppable label for the `webview.crash` telemetry event's `kind`
 /// field (spec §6 taxonomy) — never the WebView2 enum's Rust type name, which
 /// isn't guaranteed stable across `webview2-com-sys` versions.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn kind_label(raw_kind: i32) -> &'static str {
     match raw_kind {
         KIND_BROWSER_PROCESS_EXITED => "browser_process_exited",

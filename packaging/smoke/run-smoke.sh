@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# P2-A smoke harness (merge gate). Scenarios 1-5 (this file's scope; 6-7 are a later
-# P2-A task). All blocking. Human-run in-session; deliberately NOT wired into
-# ci.yml — automating it is P2-F, which re-homes these scenario bodies into
-# crates/kiosk-smoke (F owns A 1-7 · B 8-12 · C 13-15 · D 16-17). Compositor
+# Linux smoke harness. The scenario body is selected by KIOSK_SCENARIO when
+# called from crates/kiosk-smoke; without it, all scenarios run.
+# Compositor
 # start/stop lives in exactly one function each (start_compositor/stop_compositor)
 # and every scenario's assertions live in its own scenario_N function, so that port
 # is a move, not a rewrite.
@@ -21,7 +20,7 @@
 set -uo pipefail
 
 SMOKE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-KIOSK_MAIN="${KIOSK_MAIN:-$SMOKE_DIR/../../target/debug/kiosk-main}"
+KIOSK_MAIN="${KIOSK_BIN:-${KIOSK_MAIN:-$SMOKE_DIR/../../target/debug/kiosk-main}}"
 FIXTURE_PORT=8099
 WAYLAND_OUT_W=1280
 WAYLAND_OUT_H=720
@@ -61,7 +60,7 @@ start_compositor() {
   # top-level surface to the output's full extent regardless of whether kiosk-main
   # asked to be fullscreen, which makes scenario 1's geometry check a property of
   # the compositor, not of kiosk-main (review round 2, Critical 1 -- see
-  # task-9-report.md). desktop-shell's ~32px panel offset is tolerated (logged,
+  # README.md). desktop-shell's ~32px panel offset is tolerated (logged,
   # not asserted) in scenario_1 instead. Nothing else in this file reads geometry.
   weston --backend=headless-backend.so --socket="$WAYLAND_DISPLAY" --idle-time=0 \
     --xwayland --width="$WAYLAND_OUT_W" --height="$WAYLAND_OUT_H" \
@@ -93,11 +92,116 @@ start_compositor() {
 }
 
 stop_compositor() {
+  kill "${LAUNCHER_PID:-}" 2>/dev/null || true
+  kill "${CAGE_PID:-}" 2>/dev/null || true
+  wait "${LAUNCHER_PID:-}" 2>/dev/null || true
+  wait "${CAGE_PID:-}" 2>/dev/null || true
   kill "${WESTON_PID:-}" 2>/dev/null || true
   wait "${WESTON_PID:-}" 2>/dev/null || true
   rm -rf "$RUNTIME_DIR" "$SERVE_DIR" "$CONFIG_DIR"
 }
 trap stop_compositor EXIT
+
+stop_weston_only() {
+  kill "${WESTON_PID:-}" 2>/dev/null || true
+  wait "${WESTON_PID:-}" 2>/dev/null || true
+  WESTON_PID=""
+}
+
+prepare_launcher() {
+  [ -n "${KIOSK_LAUNCHER:-}" ] && [ -x "$KIOSK_LAUNCHER" ] || {
+    log "KIOSK_LAUNCHER is required for cage scenarios"
+    return 1
+  }
+  LAUNCH_DIR="$RUNTIME_DIR/launcher"
+  rm -rf "$LAUNCH_DIR"
+  mkdir -p "$LAUNCH_DIR"
+  cp "$KIOSK_LAUNCHER" "$LAUNCH_DIR/kiosk-launcher"
+  cp "$KIOSK_MAIN" "$LAUNCH_DIR/kiosk-main"
+  chmod 755 "$LAUNCH_DIR/kiosk-launcher" "$LAUNCH_DIR/kiosk-main"
+}
+
+start_cage_app() {
+  local executable="$1"; shift
+  stop_weston_only
+  CAGE_RUNTIME_DIR="$RUNTIME_DIR/cage"
+  mkdir -p "$CAGE_RUNTIME_DIR"
+  chmod 700 "$CAGE_RUNTIME_DIR"
+  WAYLAND_DISPLAY="wayland-cage"
+  export XDG_RUNTIME_DIR="$CAGE_RUNTIME_DIR" WAYLAND_DISPLAY
+  local cage_log="$RUNTIME_DIR/cage.log"
+  if [ "${KIOSK_CAGE_GDK_BACKEND:-}" = x11 ]; then
+    env -u DISPLAY GDK_BACKEND=x11 WLR_BACKENDS=headless \
+      cage -- "$executable" "$@" >"$cage_log" 2>&1 &
+  else
+    env -u DISPLAY -u GDK_BACKEND WLR_BACKENDS=headless \
+      cage -- "$executable" "$@" >"$cage_log" 2>&1 &
+  fi
+  CAGE_PID=$!
+  for _ in $(seq 1 100); do
+    [ -S "$CAGE_RUNTIME_DIR/$WAYLAND_DISPLAY" ] && break
+    kill -0 "$CAGE_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  if [ ! -S "$CAGE_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
+    log "cage did not create its Wayland socket"
+    cat "$cage_log" >&2
+    return 1
+  fi
+  X11_DISPLAY=""
+  for _ in $(seq 1 100); do
+    X11_DISPLAY="$(sed -n 's/.*xserver listening on display :\([0-9]*\).*/\1/p' "$cage_log" | tail -1)"
+    [ -n "$X11_DISPLAY" ] && [ -S "/tmp/.X11-unix/X${X11_DISPLAY}" ] && break
+    sleep 0.1
+  done
+  if [ "${KIOSK_CAGE_GDK_BACKEND:-}" = x11 ] && [ -z "$X11_DISPLAY" ]; then
+    log "cage did not create its Xwayland display"
+    cat "$cage_log" >&2
+    return 1
+  fi
+}
+
+start_cage_launcher() {
+  prepare_launcher || return 1
+  prepare_kiosk_files "${1:-kiosk.ini}" || return 1
+  start_cage_app "$LAUNCH_DIR/kiosk-launcher" --config "$CONFIG_DIR" || return 1
+  LAUNCHER_PID=""
+  for _ in $(seq 1 100); do
+    LAUNCHER_PID="$(pgrep -f "^$LAUNCH_DIR/kiosk-launcher --config" | head -1 || true)"
+    [ -n "$LAUNCHER_PID" ] && break
+    sleep 0.1
+  done
+  [ -n "$LAUNCHER_PID" ]
+}
+
+supervised_main_pid() {
+  pgrep -f "^$LAUNCH_DIR/kiosk-main --config" | head -1 || true
+}
+
+supervised_main_present() {
+  [ -n "$(supervised_main_pid)" ]
+}
+
+supervised_main_changed() {
+  local old="$1" current
+  current="$(supervised_main_pid)"
+  [ -n "$current" ] && [ "$current" != "$old" ]
+}
+
+stop_cage_app() {
+  if [ -n "${LAUNCHER_PID:-}" ]; then
+    kill "$LAUNCHER_PID" 2>/dev/null || true
+    wait "$LAUNCHER_PID" 2>/dev/null || true
+  fi
+  if [ -n "${KIOSK_PID:-}" ]; then
+    kill "$KIOSK_PID" 2>/dev/null || true
+    wait "$KIOSK_PID" 2>/dev/null || true
+  fi
+  kill "${CAGE_PID:-}" 2>/dev/null || true
+  wait "${CAGE_PID:-}" 2>/dev/null || true
+  CAGE_PID=""
+  LAUNCHER_PID=""
+}
 
 # ---------------------------------------------------------------------------
 # Fixture httpd -- serves a REFRESHABLE COPY of fixtures/ (never the checked-in
@@ -107,14 +211,25 @@ trap stop_compositor EXIT
 start_fixtures() {
   rm -rf "$SERVE_DIR"; mkdir -p "$SERVE_DIR"
   cp "$SMOKE_DIR"/fixtures/*.html "$SERVE_DIR/"
-  # `-u`: unbuffered stdout/stderr. Without it, http.server's access log (written
-  # via stderr) is FULLY buffered once redirected to a file (only a TTY gets
-  # Python's line-buffering default) -- every httpd_get_count check below would
-  # read a truncated/empty log until the buffer happened to fill or the process
-  # exited. Found the hard way: every httpd-log assertion in the first real run
-  # false-failed with this omitted, despite the underlying page loads genuinely
-  # succeeding (confirmed independently via the spool). See task-9-report.md.
-  ( cd "$SERVE_DIR" && exec python3 -u -m http.server "$FIXTURE_PORT" ) >"$RUNTIME_DIR/httpd.log" 2>&1 &
+  cp "$SMOKE_DIR"/fixtures/*.js "$SERVE_DIR/" 2>/dev/null || true
+  cp "$SMOKE_DIR"/fixtures/*.bin "$SERVE_DIR/" 2>/dev/null || true
+  if [ -n "${KIOSK_HTTPD_BIN:-}" ]; then
+    test -x "$KIOSK_HTTPD_BIN" || {
+      log "fixture server is not executable: $KIOSK_HTTPD_BIN"
+      return 1
+    }
+    KIOSK_FIXTURE_ROOT="$SERVE_DIR" KIOSK_FIXTURE_PORT="$FIXTURE_PORT" \
+      "$KIOSK_HTTPD_BIN" >"$RUNTIME_DIR/httpd.log" 2>&1 &
+  else
+    # Local fallback for the pre-P2-F human runner. CI and endurance always set
+    # KIOSK_HTTPD_BIN, so the Debian floor does not carry Python just for tests.
+    command -v python3 >/dev/null 2>&1 || {
+      log "KIOSK_HTTPD_BIN is required when python3 is unavailable"
+      return 1
+    }
+    ( cd "$SERVE_DIR" && exec python3 -u -m http.server "$FIXTURE_PORT" ) \
+      >"$RUNTIME_DIR/httpd.log" 2>&1 &
+  fi
   HTTPD_PID=$!
   for _ in $(seq 1 50); do
     { exec 3<>"/dev/tcp/127.0.0.1/$FIXTURE_PORT"; } 2>/dev/null && { exec 3<&-; exec 3>&-; return 0; }
@@ -136,7 +251,7 @@ stop_fixtures() {
 # window (only scenario 3, today) calls this instead of reaching into
 # stop_fixtures/start_fixtures directly -- one call for a P2-F port to translate,
 # not a stop/start pair that could be duplicated or forgotten in a future scenario
-# (review round 2, Important 7 -- see task-9-report.md).
+# (review round 2, Important 7 -- see README.md).
 with_fixtures_stopped() {
   local fn="$1"
   stop_fixtures
@@ -147,7 +262,58 @@ with_fixtures_stopped() {
 # Which signed config variant is live at /config.json (spec §5.2, genuinely
 # signed via kioskctl -- see README.md "Fixtures"). $1: config.json | config-reload.json | config-iframe.json
 stage_config() {
-  cp "$SMOKE_DIR/fixtures/$1" "$SERVE_DIR/config.json"
+  local source="$SMOKE_DIR/fixtures/$1"
+  if [ -n "${KIOSK_SIGNING_KEY_B64:-}" ] && [ -n "${KIOSKCTL_BIN:-}" ]; then
+    command -v jq >/dev/null 2>&1 || {
+      log "jq is required when signing smoke fixtures dynamically"
+      return 1
+    }
+    jq 'del(.sig)' "$source" >"$SERVE_DIR/config.unsigned.json" || {
+      SCENARIO_OK=0
+      return 0
+    }
+    KIOSK_SIGNING_KEY_B64="$KIOSK_SIGNING_KEY_B64" \
+      "$KIOSKCTL_BIN" sign "$SERVE_DIR/config.unsigned.json" >"$SERVE_DIR/config.json" || {
+      SCENARIO_OK=0
+      return 0
+    }
+    rm -f "$SERVE_DIR/config.unsigned.json"
+  else
+    cp "$source" "$SERVE_DIR/config.json"
+  fi
+}
+
+# Stage a signed config for a page-specific scenario. These variants are made
+# at run time with the ephemeral smoke key; no hand-edited signature can make a
+# scenario appear green after its URL or capability assertions change.
+stage_probe_config() {
+  local page="$1"; shift
+  local filter='.content.url = $url'
+  local pin=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      camera) filter="$filter | .content.permissions.camera = true" ;;
+      idle) filter="$filter | .content.idle_reset_seconds = 3 | .content.clear_data_on_reset = true" ;;
+      gesture)
+        pin="${2:?gesture requires a PHC pin hash}"
+        filter="$filter | .input.exit_gesture = {taps: 3, region: \"top-left\", pin_hash: \$pin}"
+        shift
+        ;;
+      *) log "unknown probe config option: $1"; return 1 ;;
+    esac
+    shift
+  done
+  if [ -z "${KIOSK_SIGNING_KEY_B64:-}" ] || [ -z "${KIOSKCTL_BIN:-}" ]; then
+    log "signed probe configs require KIOSK_SIGNING_KEY_B64 and KIOSKCTL_BIN"
+    return 1
+  fi
+  command -v jq >/dev/null 2>&1 || { log "jq is required for probe configs"; return 1; }
+  local url="http://localhost:${FIXTURE_PORT}/${page}"
+  jq --arg url "$url" --arg pin "$pin" "$filter | del(.sig)" \
+    "$SMOKE_DIR/fixtures/config.json" >"$SERVE_DIR/config.unsigned.json" || return 1
+  KIOSK_SIGNING_KEY_B64="$KIOSK_SIGNING_KEY_B64" \
+    "$KIOSKCTL_BIN" sign "$SERVE_DIR/config.unsigned.json" >"$SERVE_DIR/config.json" || return 1
+  rm -f "$SERVE_DIR/config.unsigned.json"
 }
 
 # ---------------------------------------------------------------------------
@@ -165,14 +331,41 @@ stage_config() {
 # race that first navigation and lose, so a scenario whose content.url differs
 # from the bootstrap url never actually reaches its intended page).
 # ---------------------------------------------------------------------------
+prepare_kiosk_files() {
+  local ini="${1:-kiosk.ini}"
+  rm -rf "$DATA_DIR" || return 1
+  mkdir -p "$DATA_DIR" || {
+    log "cannot prepare disposable data directory: $DATA_DIR"
+    return 1
+  }
+  rm -rf "$CONFIG_DIR" || return 1
+  mkdir -p "$CONFIG_DIR" || return 1
+  cp "$SMOKE_DIR/fixtures/$ini" "$CONFIG_DIR/kiosk.ini" || return 1
+  cp "$SMOKE_DIR/fixtures/kiosk-credential.json" "$CONFIG_DIR/kiosk-credential.json" || return 1
+  chmod 600 "$CONFIG_DIR/kiosk-credential.json" || return 1  # SEC-09: the boot gate fails closed on anything wider
+  cp "$SMOKE_DIR/fixtures/kiosk-offline.mp4" "$CONFIG_DIR/kiosk-offline.mp4" || return 1
+  if [ -n "${KIOSK_BOOTSTRAP_URL:-}" ]; then
+    sed -i "s|^url = .*|url = $KIOSK_BOOTSTRAP_URL|" "$CONFIG_DIR/kiosk.ini" || return 1
+  fi
+  if grep -q '^pin_hash = PIN_HASH$' "$CONFIG_DIR/kiosk.ini"; then
+    [ -n "${KIOSK_PIN_HASH:-}" ] || {
+      log "gesture fixture requires KIOSK_PIN_HASH"
+      return 1
+    }
+    sed -i "s|^pin_hash = PIN_HASH$|pin_hash = $KIOSK_PIN_HASH|" "$CONFIG_DIR/kiosk.ini" || return 1
+  fi
+  if [ "${KIOSK_EGRESS_FILTER_FILE:-0}" = 1 ]; then
+    : >"$DATA_DIR/content-filters" || return 1
+  fi
+}
+
 start_kiosk() {
   local backend="$1" ini="${2:-kiosk.ini}"
-  rm -rf "$DATA_DIR"; mkdir -p "$DATA_DIR"
-  rm -rf "$CONFIG_DIR"; mkdir -p "$CONFIG_DIR"
-  cp "$SMOKE_DIR/fixtures/$ini" "$CONFIG_DIR/kiosk.ini"
-  cp "$SMOKE_DIR/fixtures/kiosk-credential.json" "$CONFIG_DIR/kiosk-credential.json"
-  chmod 600 "$CONFIG_DIR/kiosk-credential.json"   # SEC-09: the boot gate fails closed on anything wider
-  cp "$SMOKE_DIR/fixtures/kiosk-offline.mp4" "$CONFIG_DIR/kiosk-offline.mp4"
+  prepare_kiosk_files "$ini" || {
+    log "cannot start kiosk: fixture files were not prepared"
+    SCENARIO_OK=0
+    return 1
+  }
 
   if [ "$backend" = x11 ]; then
     DISPLAY=":$X11_DISPLAY" GDK_BACKEND=x11 "$KIOSK_MAIN" --config "$CONFIG_DIR" \
@@ -199,7 +392,7 @@ stop_kiosk() {
   pkill -f WebKitNetworkProcess 2>/dev/null || true
   # Wait for them to actually be reaped, not just signaled: a one-run-in-four
   # flake (scenario 5 timing out on every httpd/spool wait despite passing
-  # cleanly in isolation every time -- see task-9-report.md's Concerns) was
+  # cleanly in isolation every time -- see README.md's input note) was
   # traced to this gap -- pkill returns as soon as the signal is DELIVERED, not
   # once the process has actually exited and released its IPC sockets/shared
   # memory, and the very next scenario starts a fresh WebKit within
@@ -247,11 +440,17 @@ httpd_log() { cat "$RUNTIME_DIR/httpd.log" 2>/dev/null; }
 
 # Count httpd access-log lines for a GET of exactly $1 (e.g. "/home.html" or
 # "/home.html?probe=reload"). Fixed-string match -- see event_count's doc.
-httpd_get_count() { httpd_log | grep -cF "\"GET $1 HTTP/1."; }
+httpd_get_count() { httpd_log | grep -cF "GET $1 HTTP/1."; }
+
+httpd_probe_count() { httpd_log | grep -cF "GET /probe?$1 HTTP/1."; }
+httpd_probe_prefix_count() { httpd_log | grep -cF "GET /probe?$1"; }
+httpd_path_count() { httpd_log | grep -cF "GET $1 HTTP/1."; }
 
 httpd_get_at_least() { [ "$(httpd_get_count "$1")" -ge "$2" ]; }
 event_at_least() { [ "$(event_count "$1")" -ge "$2" ]; }
 event_with_reason_at_least() { [ "$(event_count_with_reason "$1" "$2")" -ge "$3" ]; }
+config_error_count() { spool_events | grep -F '"event":"config.error"' | grep -cF "\"error\":\"$1\""; }
+config_warn_field_count() { spool_events | grep -F '"event":"config.warn"' | grep -cF "\"field\":\"$1\""; }
 
 # wait_until TIMEOUT_S CHECK_CMD... -- polls a predicate every 0.2s until it
 # succeeds or TIMEOUT_S elapses; always returns 0 (never aborts the scenario --
@@ -355,7 +554,7 @@ scenario_1() {
 
 # ---------------------------------------------------------------------------
 # Scenario 2: off-list navigation blocked; target=_blank (in-allowlist navigates
-# in place, off-allowlist blocked). See README.md/task-9-report.md for why the
+# in place, off-allowlist blocked). See README.md for why the
 # target=_blank sub-checks are driven but cannot be genuinely exercised here.
 # ---------------------------------------------------------------------------
 scenario_2() {
@@ -392,7 +591,7 @@ scenario_2() {
   if [ "$blank_allow_gets" -ge 1 ]; then
     log "  PASS: target=_blank in-allowlist navigated in place (GET /allowed-target.html observed)"
   else
-    note_blocked "target=_blank in-allowlist: no GET /allowed-target.html observed (got $blank_allow_gets) -- WebKit's own popup gate (javascript-can-open-windows-automatically, untouched on Linux -- hardening.rs is a no-op here) requires a trusted user gesture a script .click() cannot supply; this container has no input devices (see task-9-report.md Concerns). NOT counted as scenario failure."
+    note_blocked "target=_blank in-allowlist: no GET /allowed-target.html observed (got $blank_allow_gets) -- WebKit's own popup gate (javascript-can-open-windows-automatically, untouched on Linux -- hardening.rs is a no-op here) requires a trusted user gesture a script .click() cannot supply; this container has no input devices (see README.md input note). NOT counted as scenario failure."
   fi
 
   # step 3: target=_blank off-allowlist .click() fires at T+6s.
@@ -423,7 +622,7 @@ scenario_2() {
 # recovery loop: reconnect is observed and the remembered home is re-navigated
 # for real (review round 2, Critical 2 -- the original version of this scenario
 # asserted nothing that a black-screen-on-network-loss device couldn't also
-# satisfy; see task-9-report.md for the full "what was vacuous and why" writeup).
+# satisfy; see README.md for the input limitation).
 # ---------------------------------------------------------------------------
 scenario_3() {
   stage_config config-reload.json
@@ -472,7 +671,7 @@ scenario_3() {
 
   log "  offline.html's app-origin load and its kioskasset://localhost mp4-URL computation are" \
       "deterministic page-local JS (verified by reading offline.html; not runtime-introspectable" \
-      "from this shell harness -- no remote-debugging channel is wired). See task-9-report.md."
+      "from this shell harness -- no remote-debugging channel is wired). See README.md."
   # Best-effort screenshot (design spec's gate section: non-blocking) was tried
   # and dropped: weston-screenshooter hits `screenshot_create_shm_buffer:
   # Assertion 'width > 0' failed` against the headless backend every time
@@ -583,15 +782,450 @@ scenario_5() {
 }
 
 # ---------------------------------------------------------------------------
+# Scenario 6: profile clear completion. This path has no user-facing producer
+# until the idle FSM is exercised, so the dedicated probe drives clear::clear
+# and refuses to pass without the real ProfileCleared callback.
+# ---------------------------------------------------------------------------
+scenario_6() {
+  local probe="${KIOSK_CLEAR_PROBE:-}"
+  if [ -n "$probe" ]; then
+    "$probe"
+  else
+    cargo run -q -p kiosk-main --example clear_probe
+  fi
+  check "clear probe exited successfully" "$?" 0
+}
+
+# ---------------------------------------------------------------------------
+# Scenario 7: malformed bootstrap -> safe renderer. Credential failures are
+# intentionally out of scope: only the parser-error path enters safe_boot.
+# ---------------------------------------------------------------------------
+scenario_7() {
+  local config_gets_before
+  config_gets_before="$(httpd_get_count /config.json)"
+  start_kiosk wayland kiosk-malformed.ini
+  wait_until 10 event_at_least app.start 1
+  check "kiosk-main alive in safe mode" "$(kiosk_alive && echo yes || echo no)" yes
+  check "safe boot did not start a remote fixture request" \
+    "$(httpd_get_count /config.json)" "$config_gets_before"
+  stop_kiosk
+}
+
+# ---------------------------------------------------------------------------
+# Scenario 8: Linux egress filter, CSP belt, and the filter-degrade path.
+# ---------------------------------------------------------------------------
+scenario_8() {
+  if ! stage_probe_config hardening.html; then
+    check "signed hardening probe was staged" no yes
+    return
+  fi
+  KIOSK_BOOTSTRAP_URL="http://localhost:${FIXTURE_PORT}/hardening.html" start_kiosk wayland
+  wait_until 20 httpd_probe_count ready=1 1
+  wait_until 20 event_with_reason_at_least nav.blocked egress 4
+  local blocked="$(event_count_with_reason nav.blocked egress)"
+  check "four off-list resource classes are blocked" "$([ "$blocked" -ge 4 ] && echo yes || echo no)" yes
+  check "the data: image still renders" \
+    "$([ "$(httpd_probe_count data-image=rendered)" -ge 1 ] && echo yes || echo no)" yes
+  check "service-worker fixture was installed" \
+    "$([ "$(httpd_get_count /sw.js)" -ge 1 ] && echo yes || echo no)" yes
+  check "kiosk-main survives healthy egress enforcement" "$(kiosk_alive && echo yes || echo no)" yes
+  stop_kiosk
+
+  # A regular file is deterministic even for root: create_dir_all cannot turn it
+  # into the content-filter store, so this exercises the real degraded branch.
+  KIOSK_EGRESS_FILTER_FILE=1 \
+    KIOSK_BOOTSTRAP_URL="http://localhost:${FIXTURE_PORT}/hardening.html" \
+    start_kiosk wayland
+  wait_until 20 config_error_count egress.filter_absent 1
+  wait_until 20 httpd_probe_prefix_count csp= 1
+  check "missing native filter is a config.error" \
+    "$(config_error_count egress.filter_absent)" 1
+  check "CSP still reports the blocked off-list fetch" \
+    "$([ "$(httpd_probe_prefix_count csp=)" -ge 1 ] && echo yes || echo no)" yes
+  check "kiosk-main survives filter degradation" "$(kiosk_alive && echo yes || echo no)" yes
+  stop_kiosk
+}
+
+# ---------------------------------------------------------------------------
+# Scenario 9: attachment downloads are cancelled before a file is created.
+# ---------------------------------------------------------------------------
+scenario_9() {
+  if ! stage_probe_config download.html; then
+    check "signed download probe was staged" no yes
+    return
+  fi
+  KIOSK_BOOTSTRAP_URL="http://localhost:${FIXTURE_PORT}/download.html" start_kiosk wayland
+  wait_until 15 httpd_probe_count download=attempted 1
+  wait_until 15 event_with_reason_at_least nav.blocked download 1
+  check "exactly one download block is spooled" "$(event_count_with_reason nav.blocked download)" 1
+  check "attachment response was reached before cancellation" \
+    "$([ "$(httpd_get_count /attachment.bin)" -ge 1 ] && echo yes || echo no)" yes
+  check "no attachment was written below the kiosk data directory" \
+    "$([ "$(find "$DATA_DIR" -name attachment.bin -print -quit)" = "" ] && echo yes || echo no)" yes
+  check "kiosk-main remains on the page" "$(kiosk_alive && echo yes || echo no)" yes
+  stop_kiosk
+}
+
+# ---------------------------------------------------------------------------
+# Scenario 10: dialog/chrome suppression, the bundled keyboard, print, and
+# beforeunload. The right-click is deliberately real XTest input on the X11
+# floor path; if the runner cannot deliver it, this blocking scenario fails.
+# ---------------------------------------------------------------------------
+scenario_10() {
+  if ! stage_probe_config controls.html; then
+    check "signed controls probe was staged" no yes
+    return
+  fi
+  KIOSK_BOOTSTRAP_URL="http://localhost:${FIXTURE_PORT}/controls.html" start_kiosk x11
+  wait_until 15 httpd_probe_prefix_count keyboard= 1
+  wait_until 15 httpd_probe_count keyboard-panel=gone 1
+  wait_until 15 httpd_probe_count print=called 1
+  wait_until 15 httpd_probe_count beforeunload=passed 1
+
+  local win
+  win="$(DISPLAY=":$X11_DISPLAY" xdotool search --onlyvisible --name 'SMOKE CONTROLS' 2>/dev/null | head -1)"
+  if [ -z "$win" ]; then
+    check "X11 window is available for the context-menu arm" no yes
+  elif DISPLAY=":$X11_DISPLAY" xdotool mousemove --window "$win" 120 100 click 3 >/dev/null 2>&1; then
+    check "a real right-click reaches the page without a native menu" \
+      "$([ "$(httpd_probe_count contextmenu=event)" -ge 1 ] && echo yes || echo no)" yes
+  else
+    check "XTest right-click delivery" no yes
+  fi
+  check "keyboard key changed the focused input" \
+    "$([ "$(httpd_probe_prefix_count keyboard=)" -ge 1 ] && echo yes || echo no)" yes
+  check "keyboard panel disappeared on blur" "$(httpd_probe_count keyboard-panel=gone)" 1
+  check "iframe print call returned without wedging the kiosk" \
+    "$(kiosk_alive && echo yes || echo no)" yes
+  check "beforeunload navigation completed without a prompt" "$(httpd_probe_count beforeunload=passed)" 1
+  stop_kiosk
+}
+
+# ---------------------------------------------------------------------------
+# Scenario 11: permission requests are default-denied, and camera becomes
+# allowed only when the signed capability is present. A machine without a
+# camera should report NotFoundError in the positive arm, not NotAllowedError.
+# ---------------------------------------------------------------------------
+scenario_11() {
+  if ! stage_probe_config permissions.html; then
+    check "signed default permission probe was staged" no yes
+    return
+  fi
+  KIOSK_BOOTSTRAP_URL="http://localhost:${FIXTURE_PORT}/permissions.html" start_kiosk wayland
+  wait_until 15 httpd_probe_prefix_count permission= 2
+  local denied_camera
+  denied_camera="$(httpd_log | sed -n 's/.*GET \/probe?permission=\(camera-[^ ]*\) HTTP.*/\1/p' | tail -1)"
+  check "camera is denied by default" \
+    "$([[ "$denied_camera" == camera-NotAllowedError || "$denied_camera" == camera-denied ]] && echo yes || echo no)" yes
+  check "geolocation is denied by default" \
+    "$([[ "$(httpd_probe_prefix_count permission=geolocation-)" -ge 1 ]] && echo yes || echo no)" yes
+  stop_kiosk
+
+  if ! stage_probe_config permissions.html camera; then
+    check "signed camera-enabled permission probe was staged" no yes
+    return
+  fi
+  KIOSK_BOOTSTRAP_URL="http://localhost:${FIXTURE_PORT}/permissions.html" start_kiosk wayland
+  wait_until 15 httpd_probe_prefix_count permission=camera- 1
+  local allowed_camera
+  allowed_camera="$(httpd_log | sed -n 's/.*GET \/probe?permission=\(camera-[^ ]*\) HTTP.*/\1/p' | tail -1)"
+  check "camera capability changes the permission decision" \
+    "$([[ "$allowed_camera" != camera-NotAllowedError && "$allowed_camera" != camera-denied ]] && echo yes || echo no)" yes
+  check "kiosk-main remains alive after permission probes" "$(kiosk_alive && echo yes || echo no)" yes
+  stop_kiosk
+}
+
+# ---------------------------------------------------------------------------
+# Scenario 12: bus-less keep-awake degradation is observable and non-fatal.
+# ---------------------------------------------------------------------------
+scenario_12() {
+  if ! command -v systemd-inhibit >/dev/null 2>&1; then
+    check "systemd-inhibit precondition" no yes
+    return
+  fi
+  stage_config config.json
+  start_kiosk wayland
+  wait_until 15 event_at_least app.start 1
+  wait_until 15 config_warn_field_count display.keep_awake 1
+  check "keep-awake child failure is a config.warn" \
+    "$(config_warn_field_count display.keep_awake)" 1
+  check "keep-awake degradation does not kill the kiosk" "$(kiosk_alive && echo yes || echo no)" yes
+  stop_kiosk
+}
+
+# ---------------------------------------------------------------------------
+# Scenario 16: idle expiry clears the profile and re-navigates home once. The
+# fixture emits `set` after persisting the cookie; a second `absent` response is
+# therefore evidence that the clear completed rather than merely reloading.
+# ---------------------------------------------------------------------------
+scenario_16() {
+  if ! stage_probe_config idle.html idle; then
+    check "signed idle probe was staged" no yes
+    return
+  fi
+  KIOSK_BOOTSTRAP_URL="http://localhost:${FIXTURE_PORT}/idle.html" start_kiosk wayland
+  wait_until 15 httpd_probe_count idle=set 1
+  wait_until 20 httpd_probe_count idle=absent 2
+  check "idle fixture persisted its session cookie" \
+    "$([ "$(httpd_probe_count idle=set)" -ge 1 ] && echo yes || echo no)" yes
+  check "profile clear removed the cookie on the second home load" \
+    "$([ "$(httpd_probe_count idle=absent)" -ge 2 ] && echo yes || echo no)" yes
+  local absent_count="$(httpd_probe_count idle=absent)"
+  sleep 5
+  check "idle reset fired only once while the page stayed untouched" \
+    "$(httpd_probe_count idle=absent)" "$absent_count"
+  check "kiosk-main remains alive after profile clear" "$(kiosk_alive && echo yes || echo no)" yes
+  stop_kiosk
+}
+
+window_present() {
+  [ -n "${X11_DISPLAY:-}" ] && DISPLAY=":$X11_DISPLAY" \
+    xdotool search --onlyvisible --name "$1" >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------------------
+# Scenario 17: Linux X11 floor driver for native GTK activity, gesture/chord,
+# and the always-Proceed input backstop. This is the declared C7 divergence;
+# the native Wayland touch path remains P2-G H4a hardware evidence.
+# ---------------------------------------------------------------------------
+scenario_17() {
+  command -v xdotool >/dev/null 2>&1 || {
+    check "xdotool floor driver is installed" no yes
+    return
+  }
+  local pin
+  pin="$($KIOSKCTL_BIN hash-pin 1234 2>/dev/null)"
+  if [ -z "$pin" ] || ! stage_probe_config input-echo.html idle; then
+    check "signed gesture/input probe was staged" no yes
+    return
+  fi
+  KIOSK_PIN_HASH="$pin" KIOSK_BOOTSTRAP_URL="http://localhost:${FIXTURE_PORT}/input-echo.html" \
+    start_kiosk x11 kiosk-gesture.ini
+  wait_until 15 httpd_get_at_least /input-echo.html 1
+  local win
+  win="$(DISPLAY=":$X11_DISPLAY" xdotool search --onlyvisible --name 'Tauri App\|SMOKE' 2>/dev/null | head -1)"
+  if [ -z "$win" ]; then
+    check "X11 input window is discoverable" no yes
+    stop_kiosk
+    return
+  fi
+
+  # Activity before the short idle threshold; the page must not be cleared while
+  # this motion/click sequence is in progress.
+  DISPLAY=":$X11_DISPLAY" xdotool mousemove --window "$win" 300 300 >/dev/null 2>&1 || true
+  DISPLAY=":$X11_DISPLAY" xdotool mousemove --window "$win" 5 5 click --repeat 3 --delay 120 1 >/dev/null 2>&1
+  wait_until 8 window_present 'kiosk — technician exit'
+  check "three corner taps open the pin pad" "$(window_present 'kiosk — technician exit' && echo yes || echo no)" yes
+  stop_kiosk
+
+  KIOSK_PIN_HASH="$pin" KIOSK_BOOTSTRAP_URL="http://localhost:${FIXTURE_PORT}/input-echo.html" \
+    start_kiosk x11 kiosk-gesture.ini
+  wait_until 15 httpd_get_at_least /input-echo.html 1
+  DISPLAY=":$X11_DISPLAY" xdotool keydown ctrl keydown alt keydown shift key k keyup shift keyup alt keyup ctrl
+  wait_until 8 window_present 'kiosk — technician exit'
+  check "technician chord opens the pin pad" "$(window_present 'kiosk — technician exit' && echo yes || echo no)" yes
+  stop_kiosk
+
+  KIOSK_PIN_HASH="$pin" KIOSK_BOOTSTRAP_URL="http://localhost:${FIXTURE_PORT}/input-echo.html" \
+    start_kiosk x11 kiosk-gesture.ini
+  wait_until 15 httpd_get_at_least /input-echo.html 1
+  win="$(DISPLAY=":$X11_DISPLAY" xdotool search --onlyvisible --name 'Tauri App\|SMOKE' 2>/dev/null | head -1)"
+  local gets_before="$(httpd_get_count /input-echo.html)"
+  DISPLAY=":$X11_DISPLAY" xdotool mousemove --window "$win" 100 80 click 1
+  DISPLAY=":$X11_DISPLAY" xdotool key --window "$win" x
+  wait_until 10 httpd_probe_prefix_count input= 2
+  sleep 4
+  check "ordinary click and key events still reach the page" \
+    "$([ "$(httpd_probe_prefix_count input=)" -ge 2 ] && echo yes || echo no)" yes
+  check "activity reset prevents an early idle clear" \
+    "$(httpd_get_count /input-echo.html)" "$gets_before"
+  check "kiosk-main remains alive after input handling" "$(kiosk_alive && echo yes || echo no)" yes
+  stop_kiosk
+}
+
+# ---------------------------------------------------------------------------
+# Scenarios 13–15: the cage/launcher contract. These start the real launcher,
+# which in turn resolves the copied kiosk-main next to itself, so a green result
+# cannot come from a standalone kiosk-main process.
+# ---------------------------------------------------------------------------
+scenario_13() {
+  if ! command -v cage >/dev/null 2>&1 || ! prepare_launcher; then
+    check "cage and release launcher are available" no yes
+    return
+  fi
+  local cage_version
+  cage_version="$(cage -v 2>&1 | head -1)"
+  check "cage version is observable" "$([ -n "$cage_version" ] && echo yes || echo no)" yes
+
+  local probe_runtime="$RUNTIME_DIR/cage-probe"
+  mkdir -p "$probe_runtime"
+  env XDG_RUNTIME_DIR="$probe_runtime" WAYLAND_DISPLAY=wayland-probe \
+    WLR_BACKENDS=headless cage -- sh -c 'exit 86' >/dev/null 2>&1
+  local probe_status=$?
+  check "cage propagates a child exit status of 86" "$probe_status" 86
+
+  stage_config config.json
+  if ! start_cage_launcher kiosk.ini; then
+    check "cage launcher chain started" no yes
+    stop_cage_app
+    return
+  fi
+  wait_until 30 httpd_get_at_least /home.html 1
+  local old_main="$(supervised_main_pid)"
+  check "launcher has a supervised kiosk-main child" "$([ -n "$old_main" ] && echo yes || echo no)" yes
+  check "home rendered under cage launcher" \
+    "$([ "$(httpd_get_count /home.html)" -ge 1 ] && echo yes || echo no)" yes
+  check "launcher process remains alive after healthy boot" \
+    "$(kill -0 "${LAUNCHER_PID:-0}" 2>/dev/null && echo yes || echo no)" yes
+
+  local home_before="$(httpd_get_count /home.html)"
+  if [ -n "$old_main" ]; then kill -9 "$old_main" 2>/dev/null || true; fi
+  wait_until 45 supervised_main_changed "$old_main"
+  local new_main="$(supervised_main_pid)"
+  check "launcher restarts kiosk-main after a hard child exit" \
+    "$([ -n "$new_main" ] && [ "$new_main" != "$old_main" ] && echo yes || echo no)" yes
+  wait_until 30 httpd_get_at_least /home.html "$((home_before + 1))"
+  check "restarted child renders home again" \
+    "$([ "$(httpd_get_count /home.html)" -gt "$home_before" ] && echo yes || echo no)" yes
+  stop_cage_app
+}
+
+scenario_14() {
+  command -v cage >/dev/null 2>&1 || {
+    check "cage is installed for the technician-exit arm" no yes
+    return
+  }
+  local pin
+  pin="$($KIOSKCTL_BIN hash-pin 1234 2>/dev/null)"
+  if [ -z "$pin" ] || ! stage_probe_config input-echo.html; then
+    check "signed technician-exit probe was staged" no yes
+    return
+  fi
+  KIOSK_CAGE_GDK_BACKEND=x11 KIOSK_PIN_HASH="$pin" \
+    start_cage_launcher kiosk-gesture.ini || {
+      check "cage X11 launcher chain started" no yes
+      stop_cage_app
+      return
+    }
+  wait_until 30 httpd_get_at_least /input-echo.html 1
+  local win
+  win="$(DISPLAY=":$X11_DISPLAY" xdotool search --onlyvisible --name 'Tauri App\|SMOKE' 2>/dev/null | head -1)"
+  if [ -z "$win" ]; then
+    check "cage Xwayland exposes the kiosk window" no yes
+    stop_cage_app
+    return
+  fi
+  DISPLAY=":$X11_DISPLAY" xdotool keydown ctrl keydown alt keydown shift key k keyup shift keyup alt keyup ctrl
+  wait_until 10 window_present 'kiosk — technician exit'
+  local pad
+  pad="$(DISPLAY=":$X11_DISPLAY" xdotool search --onlyvisible --name 'kiosk — technician exit' 2>/dev/null | head -1)"
+  if [ -z "$pad" ]; then
+    check "technician chord opened the pin pad" no yes
+    stop_cage_app
+    return
+  fi
+  # pinpad.html is a fixed 3x4 grid centred in the 1280x720 floor output.
+  # Relative coordinates keep this independent of the X11 window id.
+  local x1=568 x2=640 x3=712 y1=281 y2=336 y3=391 y4=446
+  DISPLAY=":$X11_DISPLAY" xdotool mousemove --window "$pad" "$x1" "$y1" click 1
+  DISPLAY=":$X11_DISPLAY" xdotool mousemove --window "$pad" "$x2" "$y1" click 1
+  DISPLAY=":$X11_DISPLAY" xdotool mousemove --window "$pad" "$x3" "$y1" click 1
+  DISPLAY=":$X11_DISPLAY" xdotool mousemove --window "$pad" "$x1" "$y2" click 1
+  DISPLAY=":$X11_DISPLAY" xdotool mousemove --window "$pad" "$x3" "$y4" click 1
+  wait_until 15 cage_exited
+  local launcher_status=0
+  if [ -n "${CAGE_PID:-}" ]; then
+    wait "$CAGE_PID" 2>/dev/null || launcher_status=$?
+  fi
+  check "launcher exits with technician status 86" "$launcher_status" 86
+  stop_cage_app
+}
+
+cage_exited() {
+  [ -n "${CAGE_PID:-}" ] || return 1
+  if ! kill -0 "$CAGE_PID" 2>/dev/null; then
+    return 0
+  fi
+  [ "$(ps -o stat= -p "$CAGE_PID" 2>/dev/null | tr -d ' ' | cut -c1)" = Z ]
+}
+
+scenario_15() {
+  command -v cage >/dev/null 2>&1 || {
+    check "cage is installed for the heartbeat hang arm" no yes
+    return
+  }
+  stage_config config.json
+  if ! start_cage_launcher kiosk.ini; then
+    check "cage launcher chain started" no yes
+    stop_cage_app
+    return
+  fi
+  wait_until 30 httpd_get_at_least /home.html 1
+  local old_main="$(supervised_main_pid)"
+  check "launcher has a supervised child before SIGSTOP" "$([ -n "$old_main" ] && echo yes || echo no)" yes
+  if [ -n "$old_main" ]; then kill -STOP "$old_main" 2>/dev/null || true; fi
+  wait_until 45 supervised_main_changed "$old_main"
+  local new_main="$(supervised_main_pid)"
+  check "heartbeat miss causes a restart" \
+    "$([ -n "$new_main" ] && [ "$new_main" != "$old_main" ] && echo yes || echo no)" yes
+  if [ -n "$old_main" ]; then kill -CONT "$old_main" 2>/dev/null || true; fi
+  check "the SIGSTOP corpse is no longer alive" \
+    "$([ -z "$old_main" ] || ! kill -0 "$old_main" 2>/dev/null && echo yes || echo no)" yes
+  check "watchdog hang telemetry is durable" \
+    "$([ "$(event_count watchdog.hang)" -ge 1 ] && echo yes || echo no)" yes
+  check "launcher remains alive after hang recovery" \
+    "$(kill -0 "${LAUNCHER_PID:-0}" 2>/dev/null && echo yes || echo no)" yes
+  stop_cage_app
+}
+
+# ---------------------------------------------------------------------------
 main() {
   start_compositor
-  start_fixtures
+  start_fixtures || exit 1
 
-  run_scenario 1 "boot -> splash -> remote home commits" scenario_1
-  run_scenario 2 "off-list nav blocked + target=_blank" scenario_2
-  run_scenario 3 "offline fallback" scenario_3
-  run_scenario 4 "renderer crash recovery" scenario_4
-  run_scenario 5 "iframe blocking (main-frame pin)" scenario_5
+  case "${KIOSK_SCENARIO:-all}" in
+    1) run_scenario 1 "boot -> splash -> remote home commits" scenario_1 ;;
+    2) run_scenario 2 "off-list nav blocked + target=_blank" scenario_2 ;;
+    3) run_scenario 3 "offline fallback" scenario_3 ;;
+    4) run_scenario 4 "renderer crash recovery" scenario_4 ;;
+    5) run_scenario 5 "iframe blocking (main-frame pin)" scenario_5 ;;
+    6) run_scenario 6 "profile clear completion" scenario_6 ;;
+    7) run_scenario 7 "malformed bootstrap safe boot" scenario_7 ;;
+    8) run_scenario 8 "Linux egress filter and degraded CSP belt" scenario_8 ;;
+    9) run_scenario 9 "attachment download cancellation" scenario_9 ;;
+    10) run_scenario 10 "dialogs, chrome, keyboard, and print" scenario_10 ;;
+    11) run_scenario 11 "permission default-deny and camera grant" scenario_11 ;;
+    12) run_scenario 12 "keep-awake degradation" scenario_12 ;;
+    13) run_scenario 13 "cage launcher chain and restart" scenario_13 ;;
+    14) run_scenario 14 "technician exit through cage" scenario_14 ;;
+    15) run_scenario 15 "heartbeat hang and orphan reap" scenario_15 ;;
+    16) run_scenario 16 "idle clear and latch" scenario_16 ;;
+    17) run_scenario 17 "gesture, chord, and input activity" scenario_17 ;;
+    all)
+      run_scenario 1 "boot -> splash -> remote home commits" scenario_1
+      run_scenario 2 "off-list nav blocked + target=_blank" scenario_2
+      run_scenario 3 "offline fallback" scenario_3
+      run_scenario 4 "renderer crash recovery" scenario_4
+      run_scenario 5 "iframe blocking (main-frame pin)" scenario_5
+      run_scenario 6 "profile clear completion" scenario_6
+      run_scenario 7 "malformed bootstrap safe boot" scenario_7
+      run_scenario 8 "Linux egress filter and degraded CSP belt" scenario_8
+      run_scenario 9 "attachment download cancellation" scenario_9
+      run_scenario 10 "dialogs, chrome, keyboard, and print" scenario_10
+      run_scenario 11 "permission default-deny and camera grant" scenario_11
+      run_scenario 12 "keep-awake degradation" scenario_12
+      run_scenario 13 "cage launcher chain and restart" scenario_13
+      run_scenario 14 "technician exit through cage" scenario_14
+      run_scenario 15 "heartbeat hang and orphan reap" scenario_15
+      run_scenario 16 "idle clear and latch" scenario_16
+      run_scenario 17 "gesture, chord, and input activity" scenario_17
+      ;;
+    *)
+      log "unknown smoke scenario: ${KIOSK_SCENARIO}"
+      stop_fixtures
+      return 2
+      ;;
+  esac
 
   stop_fixtures
 

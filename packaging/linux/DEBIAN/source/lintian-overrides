@@ -1,0 +1,3 @@
+# The package is assembled from a deliberately minimal payload tree; no
+# error-severity override is expected. Keep this file so the release assertion
+# has a stable source path to inspect.

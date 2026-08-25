@@ -6,8 +6,42 @@ use crate::clock::now;
 use kiosk_core::watchdog::Event;
 use std::io;
 use std::path::Path;
+#[cfg(windows)]
 use std::process::Child;
 use std::sync::mpsc::Sender;
+
+#[cfg(unix)]
+pub(crate) fn exit_code_of(status: std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    match (status.code(), status.signal()) {
+        (Some(code), _) => code,
+        (None, Some(signo)) => 128 + signo,
+        (None, None) => -2,
+    }
+}
+
+#[cfg(windows)]
+pub type ChildHandle = Child;
+
+#[cfg(unix)]
+pub struct ChildHandle {
+    pub(crate) pidfd: Option<std::os::fd::OwnedFd>,
+    pub(crate) exited: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) pid: u32,
+}
+
+impl ChildHandle {
+    pub(crate) fn id(&self) -> u32 {
+        #[cfg(windows)]
+        {
+            Child::id(self)
+        }
+        #[cfg(unix)]
+        {
+            self.pid
+        }
+    }
+}
 
 /// Raw kernel32 declarations for the two calls std doesn't expose: waiting
 /// on a HANDLE and reading its exit code. `kernel32.lib` is already linked
@@ -60,10 +94,58 @@ pub(crate) fn kill_and_wait(child: &mut Child) {
 }
 
 /// Non-Windows stub (dev hosts only; the kiosk target is Windows x64).
-#[cfg(not(windows))]
-pub(crate) fn kill_and_wait(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
+#[cfg(unix)]
+pub(crate) fn kill_and_wait(child: &mut ChildHandle) {
+    use std::os::fd::AsRawFd;
+    use std::os::raw::{c_int, c_long, c_void};
+    use std::ptr;
+    use std::time::{Duration, Instant};
+
+    const SIGKILL: c_int = 9;
+    const SYS_PIDFD_SEND_SIGNAL: c_long = 424;
+
+    extern "C" {
+        fn syscall(number: c_long, ...) -> c_long;
+        fn kill(pid: c_int, signal: c_int) -> c_int;
+    }
+
+    if !child.exited.load(std::sync::atomic::Ordering::Acquire) {
+        let used_pidfd = if let Some(pidfd) = child.pidfd.as_ref() {
+            // Safety: syscall arguments match pidfd_send_signal(2); the
+            // pidfd is an owned live descriptor and the siginfo pointer is
+            // explicitly NULL for a plain SIGKILL.
+            let _ = unsafe {
+                syscall(
+                    SYS_PIDFD_SEND_SIGNAL,
+                    pidfd.as_raw_fd(),
+                    SIGKILL,
+                    ptr::null::<c_void>(),
+                    0u32,
+                )
+            };
+            true
+        } else {
+            false
+        };
+        if !used_pidfd {
+            // Degraded path when pidfd_open was unavailable or the syscall is
+            // rejected by the sandbox. The exited gate avoids killing a
+            // recycled PID after the sole waiter has reaped the child.
+            if !child.exited.load(std::sync::atomic::Ordering::Acquire) {
+                // Safety: `child.pid` is the PID returned by Command::spawn;
+                // this is the documented fallback and is guarded by the
+                // post-spawn exited flag check above.
+                unsafe {
+                    let _ = kill(child.pid as c_int, SIGKILL);
+                }
+            }
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(5_000);
+    while !child.exited.load(std::sync::atomic::Ordering::Acquire) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// Kills `child` so no orphaned process is left holding the IPC pipe (its
@@ -195,18 +277,64 @@ pub fn spawn_main(
 /// duplicating a Windows process handle (see the `cfg(windows)` impl
 /// above), so on other host platforms (dev-only; the kiosk target is
 /// Windows x64) this simply reports "unsupported" rather than spawning.
-#[cfg(not(windows))]
+#[cfg(unix)]
+fn pidfd_open(pid: u32) -> io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    use std::os::raw::{c_long, c_uint};
+
+    const SYS_PIDFD_OPEN: c_long = 434;
+    extern "C" {
+        fn syscall(number: c_long, ...) -> c_long;
+    }
+    // Safety: syscall(434) is pidfd_open(pid, flags), with flags zero.
+    let fd = unsafe { syscall(SYS_PIDFD_OPEN, pid as c_uint, 0u32) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Safety: the kernel returned a fresh owned file descriptor.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) })
+}
+
+#[cfg(unix)]
 pub fn spawn_main(
-    _exe: &Path,
-    _config_dir: &Path,
-    _safe: bool,
-    _pipe_name: &str,
-    _tx: Sender<Event>,
-) -> io::Result<Child> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "kiosk-launcher spawn_main is Windows-only",
-    ))
+    exe: &Path,
+    config_dir: &Path,
+    safe: bool,
+    pipe_name: &str,
+    tx: Sender<Event>,
+) -> io::Result<ChildHandle> {
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg("--config")
+        .arg(config_dir)
+        .env("KIOSK_HEARTBEAT_PIPE", pipe_name);
+    if safe {
+        command.arg("--safe");
+    }
+    let child = command.spawn()?;
+    let pid = child.id();
+    let pidfd = match pidfd_open(pid) {
+        Ok(fd) => Some(fd),
+        Err(error) => {
+            eprintln!(
+                "kiosk-launcher: pidfd_open({pid}) unavailable ({error}); using guarded kill fallback"
+            );
+            None
+        }
+    };
+    let exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let exited_waiter = exited.clone();
+    let waiter_tx = tx.clone();
+    let _ = tx.send(Event::Spawned { at: now() });
+    std::thread::Builder::new()
+        .name("kiosk-launcher-child-waiter".into())
+        .spawn(move || {
+            let mut child = child;
+            let code = child.wait().map(exit_code_of).unwrap_or(-2);
+            exited_waiter.store(true, std::sync::atomic::Ordering::Release);
+            let _ = waiter_tx.send(Event::ChildExited { code, at: now() });
+        })?;
+    Ok(ChildHandle { pidfd, exited, pid })
 }
 
 #[cfg(all(test, windows))]
@@ -269,5 +397,82 @@ mod tests {
             rx.recv_timeout(std::time::Duration::from_millis(200)),
             Err(mpsc::RecvTimeoutError::Timeout) | Err(mpsc::RecvTimeoutError::Disconnected)
         ));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    #[test]
+    fn exit_mapping_preserves_signal_identity_and_never_uses_minus_one() {
+        assert_eq!(exit_code_of(std::process::ExitStatus::from_raw(0)), 0);
+        assert_eq!(exit_code_of(std::process::ExitStatus::from_raw(9)), 137);
+        for signo in 1..=64 {
+            let code = exit_code_of(std::process::ExitStatus::from_raw(signo));
+            assert_ne!(code, 86);
+            assert_ne!(code, -1);
+        }
+    }
+
+    fn supervised_sleep(use_pidfd: bool) -> (ChildHandle, mpsc::Receiver<Event>) {
+        let mut child = Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("sleep must spawn");
+        let pid = child.id();
+        let pidfd = if use_pidfd {
+            Some(pidfd_open(pid).expect("pidfd_open must be available for the pidfd arm"))
+        } else {
+            None
+        };
+        let exited = Arc::new(AtomicBool::new(false));
+        let exited_waiter = exited.clone();
+        let (tx, rx) = mpsc::channel();
+        let waiter_tx = tx.clone();
+        std::thread::spawn(move || {
+            let code = child.wait().map(exit_code_of).unwrap_or(-2);
+            exited_waiter.store(true, Ordering::Release);
+            let _ = waiter_tx.send(Event::ChildExited { code, at: now() });
+        });
+        let _ = tx.send(Event::Spawned { at: now() });
+        (ChildHandle { pidfd, exited, pid }, rx)
+    }
+
+    fn run_kill_gate(use_pidfd: bool) {
+        for _ in 0..200 {
+            let (mut child, rx) = supervised_sleep(use_pidfd);
+            kill_and_wait(&mut child);
+            let mut exits = 0;
+            let mut spawned = 0;
+            loop {
+                match rx.recv_timeout(Duration::from_secs(2)) {
+                    Ok(Event::Spawned { .. }) => spawned += 1,
+                    Ok(Event::ChildExited { .. }) => exits += 1,
+                    Ok(_) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        panic!("child waiter did not report within the bounded gate")
+                    }
+                }
+            }
+            assert_eq!(spawned, 1);
+            assert_eq!(exits, 1, "exactly one exit event per killed child");
+        }
+    }
+
+    #[test]
+    fn exactly_one_exit_event_with_pidfd() {
+        run_kill_gate(true);
+    }
+
+    #[test]
+    fn exactly_one_exit_event_with_guarded_pid_fallback() {
+        run_kill_gate(false);
     }
 }

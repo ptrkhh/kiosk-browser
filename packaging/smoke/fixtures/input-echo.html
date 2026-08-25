@@ -1,0 +1,17 @@
+<!doctype html>
+<html>
+  <body>
+    <button id="click-target" type="button">click</button>
+    <input id="input-target" type="text" />
+    <p id="result">input probe</p>
+    <script>
+      function probe(value) { fetch('/probe?input=' + value).catch(function () {}); }
+      document.getElementById('click-target').addEventListener('click', function () {
+        probe('click');
+      });
+      document.getElementById('input-target').addEventListener('keydown', function () {
+        probe('key');
+      });
+    </script>
+  </body>
+</html>

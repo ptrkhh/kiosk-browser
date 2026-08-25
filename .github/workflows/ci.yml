@@ -27,37 +27,123 @@ jobs:
       - name: Linux compile check (kiosk-main)
         run: cargo check -p kiosk-main
 
-  build-windows:
-    runs-on: windows-latest
+  smoke-key:
+    runs-on: ubuntu-22.04
+    outputs:
+      public_key: ${{ steps.keygen.outputs.public_key }}
+      seed: ${{ steps.keygen.outputs.seed }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release -p kiosk-main -p kiosk-launcher
-      - uses: actions/upload-artifact@v4
-        with:
-          name: kiosk-windows-${{ github.sha }}
-          path: |
-            target/release/kiosk-main.exe
-            target/release/kiosk-launcher.exe
-          if-no-files-found: error
+      - id: keygen
+        shell: bash
+        run: |
+          output="$(cargo run -q -p kiosk-core --example kioskctl -- keygen)"
+          seed="$(printf '%s\n' "$output" | sed -n 's/^KIOSK_SIGNING_KEY_B64=//p')"
+          public_key="$(printf '%s\n' "$output" | sed -n 's/^KIOSK_CONFIG_PUBKEY_B64=//p')"
+          test -n "$seed" -a -n "$public_key"
+          echo "::add-mask::$seed"
+          echo "seed=$seed" >> "$GITHUB_OUTPUT"
+          echo "public_key=$public_key" >> "$GITHUB_OUTPUT"
 
-  build-linux:
+  build:
+    needs: smoke-key
+    uses: ./.github/workflows/build.yml
+    with:
+      pubkey_b64: ${{ needs.smoke-key.outputs.public_key }}
+
+  smoke-linux:
+    needs: [smoke-key, build]
     runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      issues: write
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - name: Install webkit2gtk and system deps
+      - name: Install smoke runtime
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
-            libayatana-appindicator3-dev librsvg2-dev libssl-dev
+          sudo apt-get install -y jq weston cage xwayland xdotool \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad gstreamer1.0-libav
+          sudo install -d -m 0750 -o "$(id -un)" -g "$(id -gn)" /var/lib/kiosk
+          sudo install -d -m 0750 -o "$(id -un)" -g "$(id -gn)" /run/kiosk
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release -p kiosk-main -p kiosk-launcher
-      - uses: actions/upload-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: kiosk-linux-x86_64-${{ github.sha }}
+          path: artifacts/linux
+      - name: Make release artifacts executable
+        run: |
+          find artifacts/linux -type f -name 'kiosk-main' -exec chmod +x {} +
+          find artifacts/linux -type f -name 'kiosk-launcher' -exec chmod +x {} +
+          find artifacts/linux -type f -name 'fixture-httpd' -exec chmod +x {} +
+          find artifacts/linux -type f -name 'clear_probe' -exec chmod +x {} +
+          find artifacts/linux -type f -name 'kioskctl' -exec chmod +x {} +
+          find artifacts/linux/target/release/deps -maxdepth 1 -type f -name 'smoke_linux-*' -exec chmod +x {} +
+      - name: Locate the release smoke test binary
+        id: smoke-binary
+        shell: bash
+        run: |
+          smoke_test="$(find artifacts/linux/target/release/deps -maxdepth 1 -type f \
+            -name 'smoke_linux-*' -perm -111 | head -n 1)"
+          test -n "$smoke_test"
+          echo "path=$GITHUB_WORKSPACE/$smoke_test" >> "$GITHUB_OUTPUT"
+      - name: Run fast smoke subset with one retry
+        id: smoke
+        continue-on-error: true
+        env:
+          KIOSK_BIN: ${{ github.workspace }}/artifacts/linux/target/release/kiosk-main
+          KIOSK_LAUNCHER: ${{ github.workspace }}/artifacts/linux/target/release/kiosk-launcher
+          KIOSK_HTTPD_BIN: ${{ github.workspace }}/artifacts/linux/target/release/fixture-httpd
+          KIOSK_CLEAR_PROBE: ${{ github.workspace }}/artifacts/linux/target/release/examples/clear_probe
+          KIOSKCTL_BIN: ${{ github.workspace }}/artifacts/linux/target/release/examples/kioskctl
+          KIOSK_SMOKE_DRIVER: ${{ github.workspace }}/packaging/smoke/run-smoke.sh
+          KIOSK_CONFIG_PUBKEY_B64: ${{ needs.smoke-key.outputs.public_key }}
+          KIOSK_SIGNING_KEY_B64: ${{ needs.smoke-key.outputs.seed }}
+          KIOSK_SMOKE_I_MEAN_IT: "1"
+          KIOSK_SMOKE_TEST: ${{ steps.smoke-binary.outputs.path }}
+        shell: bash
+        run: |
+          set +e
+          run_subset() {
+            local failed=0 test_name scenario
+            while IFS=: read -r test_name scenario; do
+              KIOSK_SCENARIO="$scenario" "$KIOSK_SMOKE_TEST" \
+                --ignored --exact "$test_name" --test-threads=1 || failed=1
+            done <<'SCENARIOS'
+          scenario_1_boot_and_fullscreen:1
+          scenario_2_navigation_block:2
+          scenario_3_offline_fallback:3
+          scenario_5_iframe_scope:5
+          scenario_7_safe_boot:7
+          scenario_8_linux_hardening:8
+          scenario_9_egress_filter:9
+          scenario_10_keyboard_and_print:10
+          scenario_11_permissions:11
+          scenario_16_idle_clear:16
+          SCENARIOS
+            return "$failed"
+          }
+          run_subset
+          first=$?
+          if [ "$first" -eq 0 ]; then exit 0; fi
+          echo "first smoke subset attempt failed; retrying once"
+          run_subset
+          second=$?
+          if [ "$second" -eq 0 ] && [ -n "${{ vars.FLAKY_SMOKE_ISSUE }}" ]; then
+            echo "flaky: smoke passed on retry" >> "$GITHUB_STEP_SUMMARY"
+            gh issue comment "${{ vars.FLAKY_SMOKE_ISSUE }}" \
+              --body "flaky: smoke subset · ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} · ${{ github.sha }}" || true
+          fi
+          exit "$second"
+      - name: Upload smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-linux-${{ github.sha }}
           path: |
-            target/release/kiosk-main
-            target/release/kiosk-launcher
-          if-no-files-found: error
+            /var/lib/kiosk/spool
+            /tmp/**/weston.log
+          if-no-files-found: warn

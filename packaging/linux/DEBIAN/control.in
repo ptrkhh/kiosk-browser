@@ -1,0 +1,12 @@
+Source: kiosk
+Section: misc
+Priority: optional
+Maintainer: kiosk browser maintainers
+Standards-Version: 4.6.2
+
+Package: kiosk
+Architecture: amd64
+Depends: ${shlibs:Depends}, cage, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav
+Conflicts: swayidle, xautolock, xscreensaver, light-locker, gnome-screensaver, xfce4-power-manager
+Description: locked-down kiosk browser
+ A signed-configuration kiosk browser with a supervised WebView.

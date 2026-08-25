@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/kiosk-core", "crates/kiosk-main", "crates/kiosk-launcher"]
+members = [
+    "crates/kiosk-core",
+    "crates/kiosk-main",
+    "crates/kiosk-launcher",
+    "crates/kiosk-smoke",
+]
 
 [workspace.package]
 version = "0.1.0"

@@ -82,6 +82,7 @@ pub async fn run(
     refetch: Arc<Notify>,
     cancel: CancellationToken,
     nav_policy: SharedNavPolicy,
+    policy_updates: std::sync::mpsc::Sender<Arc<NavPolicy>>,
     credential_path: PathBuf,
     credential_violation_tx: mpsc::Sender<String>,
 ) {
@@ -110,15 +111,18 @@ pub async fn run(
                 revision,
                 warnings,
             } => {
+                telem.set_level(&manager.current().logging.level);
                 telem.config_applied(revision, &warnings);
                 // Store the new policy BEFORE the FSM (and thus any navigation it
                 // triggers) hears about the applied config — so a navigation kicked off
                 // by this very apply is judged against the new allowlist, never the
                 // stale one.
-                nav_policy.store(Arc::new(NavPolicy::from_config(
+                let policy = Arc::new(NavPolicy::from_config(
                     &manager.current().content,
                     &home_url,
-                )));
+                ));
+                nav_policy.store(policy.clone());
+                let _ = policy_updates.send(policy);
                 let _ = tx.send(AppEvent::ConfigApplied { url: home_url }).await;
             }
             FetchOutcome::Rejected(reason) => telem.config_error(&reason),
