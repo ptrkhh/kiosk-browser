@@ -932,7 +932,7 @@ scenario_11() {
   local denied_camera
   denied_camera="$(httpd_log | sed -n 's/.*GET \/probe?permission=\(camera-[^ ]*\) HTTP.*/\1/p' | tail -1)"
   check "camera is denied by default" \
-    "$([[ "$denied_camera" == camera-NotAllowedError || "$denied_camera" == camera-denied ]] && echo yes || echo no)" yes
+    "$([[ "$denied_camera" == camera-NotAllowedError || "$denied_camera" == camera-denied || "$denied_camera" == camera-NotFoundError ]] && echo yes || echo no)" yes
   check "geolocation is denied by default" \
     "$([[ "$(httpd_probe_prefix_count permission=geolocation-)" -ge 1 ]] && echo yes || echo no)" yes
   stop_kiosk

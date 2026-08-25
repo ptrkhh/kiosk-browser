@@ -250,10 +250,14 @@ mod linux_impl {
             };
 
             let storage_path = data_dir.join("content-filters");
-            if let Err(error) = std::fs::create_dir_all(&storage_path) {
-                telem.config_error("egress.filter_absent");
-                eprintln!("egress: cannot create {}: {error}", storage_path.display());
-            }
+            let storage_available = match std::fs::create_dir_all(&storage_path) {
+                Ok(()) => true,
+                Err(error) => {
+                    telem.config_error("egress.filter_absent");
+                    eprintln!("egress: cannot create {}: {error}", storage_path.display());
+                    false
+                }
+            };
 
             // CSP is a belt only. It is replaced/removed on every policy update;
             // a refused pattern never leaves an older, tighter CSP behind.
@@ -274,13 +278,15 @@ mod linux_impl {
                 saving: false,
                 next_identifier: 0,
             }));
-            enqueue_policy(
-                &manager,
-                &filter_state,
-                &storage_path,
-                &telem,
-                &nav_policy.load(),
-            );
+            if storage_available {
+                enqueue_policy(
+                    &manager,
+                    &filter_state,
+                    &storage_path,
+                    &telem,
+                    &nav_policy.load(),
+                );
+            }
 
             // Layer 2 companion: record only failed off-policy resources. The
             // filter remains the enforcement authority, so this callback never
@@ -320,13 +326,15 @@ mod linux_impl {
                         app_origin,
                         asset_origin,
                     );
-                    enqueue_policy(
-                        &manager_updates,
-                        &state_updates,
-                        &storage_updates,
-                        &telem_updates,
-                        &policy,
-                    );
+                    if storage_available {
+                        enqueue_policy(
+                            &manager_updates,
+                            &state_updates,
+                            &storage_updates,
+                            &telem_updates,
+                            &policy,
+                        );
+                    }
                 } else {
                     // The receiver is allowed to outlive fetch during normal
                     // shutdown; ArcSwap remains the source for the observer.

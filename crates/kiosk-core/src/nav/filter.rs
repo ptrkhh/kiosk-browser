@@ -28,10 +28,17 @@ pub fn compile_filter(allow: &super::allowlist::Allowlist) -> FilterOutput {
     sources.sort();
     sources.dedup();
 
-    let mut rules = vec![json!({
-        "trigger": { "url-filter": "^(https?|wss?)://" },
-        "action": { "type": "block" }
-    })];
+    // WebKit's content-rule regex dialect does not support alternation.
+    let mut rules = vec![
+        json!({
+            "trigger": { "url-filter": "^https?://" },
+            "action": { "type": "block" }
+        }),
+        json!({
+            "trigger": { "url-filter": "^wss?://" },
+            "action": { "type": "block" }
+        }),
+    ];
     for source in sources {
         rules.push(json!({
             "trigger": { "url-filter": source },
@@ -223,9 +230,10 @@ mod tests {
     }
 
     #[test]
-    fn the_block_rule_is_narrowed_to_network_schemes() {
+    fn the_block_rules_are_narrowed_to_network_schemes() {
         let out = compile(&["https://app.example.com/*"], "https://app.example.com/");
-        assert!(out.json.contains(r#""url-filter":"^(https?|wss?)://"#));
+        assert!(out.json.contains(r#""url-filter":"^https?://"#));
+        assert!(out.json.contains(r#""url-filter":"^wss?://"#));
         assert!(!out.json.contains(r#""url-filter":".*"#));
     }
 

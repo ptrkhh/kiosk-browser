@@ -89,7 +89,14 @@ fn serve(root: &Path, mut stream: TcpStream, requests: &Arc<Mutex<Vec<String>>>)
         .push(target.to_string());
 
     let path = target.split('?').next().unwrap_or("/");
-    let relative = path.trim_start_matches('/');
+    // The prober deliberately checks the home origin (`/`) rather than a page
+    // path. Treat it as the fixture's healthy home document so a 404 from this
+    // tiny test server does not look like an offline origin.
+    let relative = if path == "/" {
+        "home.html"
+    } else {
+        path.trim_start_matches('/')
+    };
     let safe = !relative.split('/').any(|component| component == "..");
     let file = safe.then(|| root.join(relative));
     let (status, content_type, disposition, body) = match file {
@@ -153,6 +160,22 @@ mod tests {
         stream.read_to_string(&mut body).unwrap();
         assert!(body.contains("<h1>home</h1>"));
         assert_eq!(server.requests(), vec!["/home.html"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_root_path_is_a_healthy_origin_probe() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("home.html"), "<h1>home</h1>").unwrap();
+        let server = FixtureServer::start(&dir).unwrap();
+        let mut stream = TcpStream::connect(("127.0.0.1", server.port())).unwrap();
+        write!(stream, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("<h1>home</h1>"));
+        assert_eq!(server.requests(), vec!["/"]);
+        drop(server);
         let _ = std::fs::remove_dir_all(dir);
     }
 
