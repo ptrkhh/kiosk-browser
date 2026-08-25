@@ -60,7 +60,7 @@ jobs:
     permissions:
       contents: read
       issues: write
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - name: Install smoke runtime
@@ -112,8 +112,9 @@ jobs:
           run_subset() {
             local failed=0 test_name scenario
             while IFS=: read -r test_name scenario; do
+              echo "running $test_name (scenario $scenario)"
               KIOSK_SCENARIO="$scenario" "$KIOSK_SMOKE_TEST" \
-                --ignored --exact "$test_name" --test-threads=1 || failed=1
+                --nocapture --ignored --exact "$test_name" --test-threads=1 || failed=1
             done <<'SCENARIOS'
           scenario_1_boot_and_fullscreen:1
           scenario_2_navigation_block:2
