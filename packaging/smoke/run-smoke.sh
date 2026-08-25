@@ -416,7 +416,23 @@ stop_kiosk() {
   fi
 }
 
-kiosk_alive() { kill -0 "${KIOSK_PID:-0}" 2>/dev/null; }
+kiosk_alive() {
+  if kill -0 "${KIOSK_PID:-0}" 2>/dev/null; then
+    return 0
+  fi
+
+  local marker="$RUNTIME_DIR/kiosk-main.${KIOSK_PID:-unknown}.exit-reported"
+  if [ ! -e "$marker" ]; then
+    : >"$marker"
+    log "kiosk-main pid ${KIOSK_PID:-unknown} exited before the smoke assertion"
+    if [ -s "$RUNTIME_DIR/kiosk-main.log" ]; then
+      sed -n '1,120p' "$RUNTIME_DIR/kiosk-main.log" >&2
+    else
+      log "kiosk-main.log is empty"
+    fi
+  fi
+  return 1
+}
 
 # ---------------------------------------------------------------------------
 # Assertion helpers. The spool is the durable telemetry record (no fake GCL
