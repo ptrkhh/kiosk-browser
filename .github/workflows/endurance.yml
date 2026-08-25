@@ -62,7 +62,7 @@ jobs:
           find artifacts/linux -type f -name 'fixture-httpd' -exec chmod +x {} +
           find artifacts/linux -type f -name 'clear_probe' -exec chmod +x {} +
           find artifacts/linux -type f -name 'kioskctl' -exec chmod +x {} +
-          find artifacts/linux -type f -name 'smoke_linux-*' -exec chmod +x {} +
+          find artifacts/linux -type f -name 'smoke_linux-*' ! -name '*.d' -exec chmod +x {} +
           install -d -m 0750 /run/kiosk /var/lib/kiosk
       - name: Container probe
         run: |
@@ -85,7 +85,7 @@ jobs:
           KIOSK_SMOKE_I_MEAN_IT: "1"
         run: |
           smoke_test="$(find artifacts/linux -type f \
-            -name 'smoke_linux-*' -perm -111 | head -n 1)"
+            -name 'smoke_linux-*' ! -name '*.d' -perm -111 -print -quit)"
           test -n "$smoke_test"
           test -x "$KIOSK_BIN" -a -x "$KIOSKCTL_BIN"
           "$GITHUB_WORKSPACE/$smoke_test" --ignored --test-threads=1

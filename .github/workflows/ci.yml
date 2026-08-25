@@ -83,13 +83,13 @@ jobs:
           find artifacts/linux -type f -name 'fixture-httpd' -exec chmod +x {} +
           find artifacts/linux -type f -name 'clear_probe' -exec chmod +x {} +
           find artifacts/linux -type f -name 'kioskctl' -exec chmod +x {} +
-          find artifacts/linux -type f -name 'smoke_linux-*' -exec chmod +x {} +
+          find artifacts/linux -type f -name 'smoke_linux-*' ! -name '*.d' -exec chmod +x {} +
       - name: Locate the release smoke test binary
         id: smoke-binary
         shell: bash
         run: |
           smoke_test="$(find artifacts/linux -type f \
-            -name 'smoke_linux-*' -perm -111 | head -n 1)"
+            -name 'smoke_linux-*' ! -name '*.d' -perm -111 -print -quit)"
           test -n "$smoke_test"
           echo "path=$GITHUB_WORKSPACE/$smoke_test" >> "$GITHUB_OUTPUT"
       - name: Run fast smoke subset with one retry
@@ -148,3 +148,8 @@ jobs:
           path: |
             /var/lib/kiosk/spool
           if-no-files-found: warn
+      - name: Fail if smoke subset failed
+        if: always() && steps.smoke.outcome == 'failure'
+        run: |
+          echo "::error::Linux smoke subset failed after retry"
+          exit 1
