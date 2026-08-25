@@ -35,7 +35,7 @@ export WAYLAND_DISPLAY="wayland-smoke"
 export WEBKIT_DISABLE_COMPOSITING_MODE=1   # smoke environment ONLY -- never in shipped code or units
 chmod 700 "$RUNTIME_DIR"
 
-# start_kiosk unconditionally `rm -rf`s DATA_DIR before every scenario. Refuse to
+# start_kiosk unconditionally clears DATA_DIR before every scenario. Refuse to
 # run at all unless the operator has explicitly confirmed that is safe -- a
 # provisioned kiosk device's real /var/lib/kiosk must never be silently wiped by
 # a human running this harness on the wrong host (review round 2, Minor 11).
@@ -333,11 +333,11 @@ stage_probe_config() {
 # ---------------------------------------------------------------------------
 prepare_kiosk_files() {
   local ini="${1:-kiosk.ini}"
-  rm -rf "$DATA_DIR" || return 1
   mkdir -p "$DATA_DIR" || {
     log "cannot prepare disposable data directory: $DATA_DIR"
     return 1
   }
+  find "$DATA_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + || return 1
   rm -rf "$CONFIG_DIR" || return 1
   mkdir -p "$CONFIG_DIR" || return 1
   cp "$SMOKE_DIR/fixtures/$ini" "$CONFIG_DIR/kiosk.ini" || return 1

@@ -69,8 +69,8 @@ jobs:
           sudo apt-get install -y jq weston cage xwayland xdotool \
             gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
             gstreamer1.0-plugins-bad gstreamer1.0-libav
-          sudo install -d -m 0750 -o "$(id -un)" -g "$(id -gn)" /var/lib/kiosk
-          sudo install -d -m 0750 -o "$(id -un)" -g "$(id -gn)" /run/kiosk
+          sudo rm -rf /var/lib/kiosk /run/kiosk
+          sudo install -d -m 0750 -o "$(id -un)" -g "$(id -gn)" /var/lib/kiosk /run/kiosk
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/download-artifact@v4
         with:
