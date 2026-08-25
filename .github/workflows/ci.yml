@@ -42,7 +42,9 @@ jobs:
           seed="$(printf '%s\n' "$output" | sed -n 's/^KIOSK_SIGNING_KEY_B64=//p')"
           public_key="$(printf '%s\n' "$output" | sed -n 's/^KIOSK_CONFIG_PUBKEY_B64=//p')"
           test -n "$seed" -a -n "$public_key"
-          echo "::add-mask::$seed"
+          # This is an ephemeral per-run fixture key, not a production secret.
+          # GitHub drops masked job outputs, so masking it here would leave
+          # downstream smoke signing with an empty key.
           echo "seed=$seed" >> "$GITHUB_OUTPUT"
           echo "public_key=$public_key" >> "$GITHUB_OUTPUT"
 
