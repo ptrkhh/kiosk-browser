@@ -81,12 +81,12 @@ jobs:
           find artifacts/linux -type f -name 'fixture-httpd' -exec chmod +x {} +
           find artifacts/linux -type f -name 'clear_probe' -exec chmod +x {} +
           find artifacts/linux -type f -name 'kioskctl' -exec chmod +x {} +
-          find artifacts/linux/target/release/deps -maxdepth 1 -type f -name 'smoke_linux-*' -exec chmod +x {} +
+          find artifacts/linux -type f -name 'smoke_linux-*' -exec chmod +x {} +
       - name: Locate the release smoke test binary
         id: smoke-binary
         shell: bash
         run: |
-          smoke_test="$(find artifacts/linux/target/release/deps -maxdepth 1 -type f \
+          smoke_test="$(find artifacts/linux -type f \
             -name 'smoke_linux-*' -perm -111 | head -n 1)"
           test -n "$smoke_test"
           echo "path=$GITHUB_WORKSPACE/$smoke_test" >> "$GITHUB_OUTPUT"
@@ -94,11 +94,11 @@ jobs:
         id: smoke
         continue-on-error: true
         env:
-          KIOSK_BIN: ${{ github.workspace }}/artifacts/linux/target/release/kiosk-main
-          KIOSK_LAUNCHER: ${{ github.workspace }}/artifacts/linux/target/release/kiosk-launcher
-          KIOSK_HTTPD_BIN: ${{ github.workspace }}/artifacts/linux/target/release/fixture-httpd
-          KIOSK_CLEAR_PROBE: ${{ github.workspace }}/artifacts/linux/target/release/examples/clear_probe
-          KIOSKCTL_BIN: ${{ github.workspace }}/artifacts/linux/target/release/examples/kioskctl
+          KIOSK_BIN: ${{ github.workspace }}/artifacts/linux/kiosk-main
+          KIOSK_LAUNCHER: ${{ github.workspace }}/artifacts/linux/kiosk-launcher
+          KIOSK_HTTPD_BIN: ${{ github.workspace }}/artifacts/linux/fixture-httpd
+          KIOSK_CLEAR_PROBE: ${{ github.workspace }}/artifacts/linux/examples/clear_probe
+          KIOSKCTL_BIN: ${{ github.workspace }}/artifacts/linux/examples/kioskctl
           KIOSK_SMOKE_DRIVER: ${{ github.workspace }}/packaging/smoke/run-smoke.sh
           KIOSK_CONFIG_PUBKEY_B64: ${{ needs.smoke-key.outputs.public_key }}
           KIOSK_SIGNING_KEY_B64: ${{ needs.smoke-key.outputs.seed }}
@@ -145,5 +145,4 @@ jobs:
           name: smoke-linux-${{ github.sha }}
           path: |
             /var/lib/kiosk/spool
-            /tmp/**/weston.log
           if-no-files-found: warn

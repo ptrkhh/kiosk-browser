@@ -72,8 +72,8 @@ jobs:
       - name: Stage release binaries
         run: |
           mkdir -p target/release
-          cp artifacts/linux/target/release/kiosk-main target/release/
-          cp artifacts/linux/target/release/kiosk-launcher target/release/
+          cp artifacts/linux/kiosk-main target/release/
+          cp artifacts/linux/kiosk-launcher target/release/
           chmod +x target/release/kiosk-main target/release/kiosk-launcher
       - name: Assemble package in the declared order
         run: packaging/linux/build-deb.sh "$GITHUB_WORKSPACE/kiosk_0.1.0_amd64.deb"

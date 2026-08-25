@@ -60,29 +60,29 @@ jobs:
           find artifacts/linux -type f -name 'fixture-httpd' -exec chmod +x {} +
           find artifacts/linux -type f -name 'clear_probe' -exec chmod +x {} +
           find artifacts/linux -type f -name 'kioskctl' -exec chmod +x {} +
-          find artifacts/linux/target/release/deps -maxdepth 1 -type f -name 'smoke_linux-*' -exec chmod +x {} +
+          find artifacts/linux -type f -name 'smoke_linux-*' -exec chmod +x {} +
           install -d -m 0750 /run/kiosk /var/lib/kiosk
       - name: Container probe
         run: |
           cage -v
-          test -x artifacts/linux/target/release/kiosk-main
-          test -x artifacts/linux/target/release/kiosk-launcher
-          test -x artifacts/linux/target/release/fixture-httpd
-          test -x artifacts/linux/target/release/examples/clear_probe
+          test -x artifacts/linux/kiosk-main
+          test -x artifacts/linux/kiosk-launcher
+          test -x artifacts/linux/fixture-httpd
+          test -x artifacts/linux/examples/clear_probe
           bash packaging/linux/container-assertions.sh --probe-only
       - name: Run A–D matrix by scenario ID
         env:
-          KIOSK_BIN: ${{ github.workspace }}/artifacts/linux/target/release/kiosk-main
-          KIOSK_LAUNCHER: ${{ github.workspace }}/artifacts/linux/target/release/kiosk-launcher
-          KIOSK_HTTPD_BIN: ${{ github.workspace }}/artifacts/linux/target/release/fixture-httpd
-          KIOSK_CLEAR_PROBE: ${{ github.workspace }}/artifacts/linux/target/release/examples/clear_probe
-          KIOSKCTL_BIN: ${{ github.workspace }}/artifacts/linux/target/release/examples/kioskctl
+          KIOSK_BIN: ${{ github.workspace }}/artifacts/linux/kiosk-main
+          KIOSK_LAUNCHER: ${{ github.workspace }}/artifacts/linux/kiosk-launcher
+          KIOSK_HTTPD_BIN: ${{ github.workspace }}/artifacts/linux/fixture-httpd
+          KIOSK_CLEAR_PROBE: ${{ github.workspace }}/artifacts/linux/examples/clear_probe
+          KIOSKCTL_BIN: ${{ github.workspace }}/artifacts/linux/examples/kioskctl
           KIOSK_SMOKE_DRIVER: ${{ github.workspace }}/packaging/smoke/run-smoke.sh
           KIOSK_CONFIG_PUBKEY_B64: ${{ needs.smoke-key.outputs.public_key }}
           KIOSK_SIGNING_KEY_B64: ${{ needs.smoke-key.outputs.seed }}
           KIOSK_SMOKE_I_MEAN_IT: "1"
         run: |
-          smoke_test="$(find artifacts/linux/target/release/deps -maxdepth 1 -type f \
+          smoke_test="$(find artifacts/linux -type f \
             -name 'smoke_linux-*' -perm -111 | head -n 1)"
           test -n "$smoke_test"
           test -x "$KIOSK_BIN" -a -x "$KIOSKCTL_BIN"
@@ -107,8 +107,8 @@ jobs:
             gstreamer1.0-libav
       - name: Run scenario 18
         env:
-          KIOSK_BIN: ${{ github.workspace }}/artifacts/linux/target/release/kiosk-main
-          KIOSK_LAUNCHER: ${{ github.workspace }}/artifacts/linux/target/release/kiosk-launcher
+          KIOSK_BIN: ${{ github.workspace }}/artifacts/linux/kiosk-main
+          KIOSK_LAUNCHER: ${{ github.workspace }}/artifacts/linux/kiosk-launcher
           KIOSK_CONFIG_DIR: ${{ github.workspace }}/packaging/soak
           KIOSK_DATA_DIR: /tmp/kiosk-soak-data
           KIOSK_SOAK_RUNNER: ${{ vars.KIOSK_SOAK_RUNNER }}
@@ -120,7 +120,6 @@ jobs:
           name: offline-video-${{ github.sha }}
           path: |
             /tmp/kiosk-soak-data
-            /tmp/**/weston.log
           if-no-files-found: warn
 
   windows-w2:
