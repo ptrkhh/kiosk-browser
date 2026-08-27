@@ -46,6 +46,22 @@ if [ -z "${KIOSK_SMOKE_I_MEAN_IT:-}" ]; then
   exit 1
 fi
 
+# start_fixtures' readiness probe is only "something accepts TCP on FIXTURE_PORT",
+# which a leftover fixture httpd from an earlier aborted run satisfies while
+# serving a document root that has since been deleted. Every fixture GET then 404s
+# and the whole run false-fails in ways that look exactly like app defects (the
+# offline page renders, nav.error fires, no GET is ever logged). Refuse to start
+# rather than produce that. Checked once, here, not in start_fixtures -- which is
+# also called mid-run by with_fixtures_stopped, where the port is legitimately in
+# the process of being handed over.
+if { exec 3<>"/dev/tcp/127.0.0.1/$FIXTURE_PORT"; } 2>/dev/null; then
+  exec 3<&-; exec 3>&-
+  echo "refusing to run: something is already listening on 127.0.0.1:$FIXTURE_PORT." >&2
+  echo "that is almost certainly a fixture httpd left behind by an aborted run." >&2
+  echo "kill it first: pkill -f SimpleHTTPRequestHandler" >&2
+  exit 1
+fi
+
 PASS_COUNT=0
 FAIL_COUNT=0
 RESULTS=()   # "N|name|PASS" or "N|name|FAIL" per scenario, printed as the summary table
@@ -114,7 +130,31 @@ start_fixtures() {
   # exited. Found the hard way: every httpd-log assertion in the first real run
   # false-failed with this omitted, despite the underlying page loads genuinely
   # succeeding (confirmed independently via the spool). See task-9-report.md.
-  ( cd "$SERVE_DIR" && exec python3 -u -m http.server "$FIXTURE_PORT" ) >"$RUNTIME_DIR/httpd.log" 2>&1 &
+  #
+  # `Cache-Control: no-store` on every fixture response, which is why this is a
+  # 5-line handler instead of a bare `-m http.server`. Every scenario in this file
+  # treats the access log as a faithful record of top-level navigations; without
+  # no-store that is FALSE -- WebKit serves a re-navigation to an already-loaded
+  # URL out of its own cache and the httpd never hears about it. That is not
+  # hypothetical: it made scenario 4's "fresh GET after the crash" report a
+  # recovery failure while recovery had in fact worked (proven independently --
+  # the reloaded page's own JS re-ran and produced a nav.blocked). The assertion
+  # was measuring WebKit's cache policy, not the app.
+  #
+  # `>>`, not `>`: with_fixtures_stopped restarts this httpd mid-run (scenario 3),
+  # and truncating there silently invalidated every count baseline taken before
+  # the restart -- scenario 3's own RELOAD_GETS_BEFORE_RECOVERY was captured while
+  # the httpd was down and then compared against a log that had restarted at zero.
+  # Appending keeps the log monotonic for the whole run, which is what the
+  # per-scenario baselines below assume.
+  ( cd "$SERVE_DIR" && exec python3 -u -c '
+import http.server, sys
+class H(http.server.SimpleHTTPRequestHandler):
+    def end_headers(self):
+        self.send_header("Cache-Control", "no-store")
+        super().end_headers()
+http.server.test(HandlerClass=H, port=int(sys.argv[1]), bind="127.0.0.1")
+' "$FIXTURE_PORT" ) >>"$RUNTIME_DIR/httpd.log" 2>&1 &
   HTTPD_PID=$!
   for _ in $(seq 1 50); do
     { exec 3<>"/dev/tcp/127.0.0.1/$FIXTURE_PORT"; } 2>/dev/null && { exec 3<&-; exec 3>&-; return 0; }
@@ -243,6 +283,51 @@ event_count() { spool_events | grep -cF "\"event\":\"$1\""; }
 # Count spool lines whose jsonPayload.event equals $1 AND jsonPayload.reason equals $2.
 event_count_with_reason() { spool_events | grep -F "\"event\":\"$1\"" | grep -cF "\"reason\":\"$2\""; }
 
+# Count config.applied lines carrying revision $1. `revision` is emitted as a
+# STRING (telemetry.rs stringifies the Option<i64>), hence "revision":"1", and the
+# boot-time config.applied for a bootstrap config carries "" -- so this genuinely
+# distinguishes "the SIGNED config was applied" from "the process started".
+config_applied_rev_count() { spool_events | grep -F '"event":"config.applied"' | grep -cF "\"revision\":\"$1\""; }
+config_rev_at_least() { [ "$(config_applied_rev_count "$1")" -ge "$2" ]; }
+
+# --- offline-page oracle -------------------------------------------------------
+# The one externally observable proof that the bundled offline page actually
+# rendered. offline.html's <video> src is computed page-locally from
+# `location.protocol`; on Linux that resolves to
+# `kioskasset://localhost/kiosk-offline.mp4`, which kiosk-main's OWN custom-scheme
+# handler serves by `std::fs::read`ing exactly this file (main.rs
+# register_uri_scheme_protocol("kioskasset")). So an open() of it proves BOTH that
+# the FSM navigated to the bundled offline page AND that the page's script picked
+# the Linux origin -- if it had picked the Windows spelling
+# (`http://kioskasset.localhost/...`) WebKit would treat it as an ordinary HTTP
+# host and the handler would never run.
+#
+# This is not belt-and-braces: scenario 3 passed with `PageTarget::Offline => {}`
+# (offline page never shown at all) until this check existed -- nav.error,
+# net.offline and the rule-4 re-navigate are all produced by paths that do not
+# touch the offline page. See task-9-report.md's mutation table.
+watch_offline_asset() {
+  : >"$RUNTIME_DIR/mp4-access.log"
+  MP4_WATCH_PID=""
+  command -v inotifywait >/dev/null 2>&1 || return 0
+  inotifywait -m -e open --format OPEN "$CONFIG_DIR/kiosk-offline.mp4" \
+    >>"$RUNTIME_DIR/mp4-access.log" 2>/dev/null &
+  MP4_WATCH_PID=$!
+  # inotifywait establishes the watch asynchronously; a read that beats it is
+  # invisible. Wait for the watch to be live rather than sleeping a guessed amount.
+  for _ in $(seq 1 50); do
+    [ -n "$(ls "/proc/$MP4_WATCH_PID/fd" 2>/dev/null)" ] && break
+    sleep 0.1
+  done
+}
+stop_offline_asset_watch() {
+  [ -n "${MP4_WATCH_PID:-}" ] || return 0
+  kill "$MP4_WATCH_PID" 2>/dev/null || true
+  wait "$MP4_WATCH_PID" 2>/dev/null || true
+  MP4_WATCH_PID=""
+}
+offline_asset_opened() { grep -qc OPEN "$RUNTIME_DIR/mp4-access.log" 2>/dev/null; }
+
 httpd_log() { cat "$RUNTIME_DIR/httpd.log" 2>/dev/null; }
 
 # Count httpd access-log lines for a GET of exactly $1 (e.g. "/home.html" or
@@ -327,10 +412,29 @@ scenario_1() {
   stage_config config.json
   start_kiosk x11
   wait_until 15 httpd_get_at_least /home.html 1
+  # kiosk.ini's [bootstrap] url is the SAME /home.html the signed config names (it
+  # has to be -- see README's "The boot/fetch race"), so the GET above proves only
+  # that SOMETHING navigated: the bootstrap load satisfies it before the signed
+  # config has necessarily been fetched, and the FSM then treats the identical
+  # applied URL as a no-op (state.rs `online_config_applied_same_url_is_a_noop`),
+  # so no second GET ever marks the apply. Waiting on the load and then reading
+  # the spool is therefore a race against a signal that cannot appear in the log
+  # at all. Poll for the event this scenario actually asserts.
+  wait_until 20 config_rev_at_least 1 1
 
   check "kiosk-main alive after boot" "$(kiosk_alive && echo yes || echo no)" yes
-  check "config.applied revision=1 exactly once" \
-    "$(spool_events | grep -F '"event":"config.applied"' | grep -cF '"revision":"1"')" 1
+  # A 0 here is almost always the build, not the app: `signature::pinned_key()`
+  # reads KIOSK_CONFIG_PUBKEY_B64 through `option_env!` at COMPILE time, so a
+  # kiosk-main built without it rejects every signed config fail-closed and this
+  # is the only assertion in the harness that notices. Surface the spooled reason
+  # instead of leaving a bare "expected 1, got 0" to be re-derived from scratch.
+  if [ "$(config_applied_rev_count 1)" -eq 0 ]; then
+    log "  hint: no config.applied{revision=1}; spooled config.error reason(s):" \
+        "$(spool_events | grep -F '"event":"config.error"' | sed -n 's/.*"error":"\([^"]*\)".*/\1/p' | sort -u | tr '\n' ' ')"
+    log "  hint: if that says the pinned key is missing, rebuild with" \
+        "KIOSK_CONFIG_PUBKEY_B64=<key from README> (compile-time, not run-time)."
+  fi
+  check "config.applied revision=1 exactly once" "$(config_applied_rev_count 1)" 1
   check "fixture httpd received GET /home.html" "$(httpd_get_count /home.html)" 1
 
   local win geo
@@ -360,17 +464,20 @@ scenario_1() {
 # ---------------------------------------------------------------------------
 scenario_2() {
   stage_config config.json
+  # Baseline BEFORE boot. The access log is shared and monotonic across the whole
+  # run, so scenario 1's /home.html GET already satisfies an absolute "at least 1"
+  # -- the wait below returned INSTANTLY, and the snapshot underneath it captured
+  # a count this scenario's own boot load had not landed in yet. The
+  # "top-level unchanged" check at the end then compared post-boot against
+  # pre-boot and read 2-vs-1 on every sequenced run. Both the wait threshold and
+  # the snapshot have to be relative to this scenario's own boot.
+  local gets_before_boot
+  gets_before_boot="$(httpd_get_count /home.html)"
   start_kiosk wayland
-  wait_until 15 httpd_get_at_least /home.html 1
+  wait_until 15 httpd_get_at_least /home.html "$((gets_before_boot + 1))"
 
   check "kiosk-main alive after boot" "$(kiosk_alive && echo yes || echo no)" yes
 
-  # Snapshot, not a hardcoded "1" (same order-independence reasoning as scenario
-  # 4's Important-3 fix): the fixture httpd's access log accumulates across the
-  # WHOLE run (start_fixtures runs once in main(), before scenario 1), so by the
-  # time scenario 2 boots, this is already the run's SECOND /home.html GET, not
-  # its first. Caught empirically: a hardcoded "1" here passed in isolation and
-  # failed in the real 5-scenario sequence.
   local gets_after_initial_load
   gets_after_initial_load="$(httpd_get_count /home.html)"
 
@@ -428,6 +535,10 @@ scenario_2() {
 scenario_3() {
   stage_config config-reload.json
   start_kiosk wayland kiosk-reload.ini
+  # Armed BEFORE the link drop, since the offline page's asset request happens
+  # within a second of it. start_kiosk re-creates CONFIG_DIR, so this cannot move
+  # any earlier.
+  watch_offline_asset
   wait_until 15 httpd_get_at_least '/home.html?probe=reload' 1
 
   check "kiosk-main alive after boot" "$(kiosk_alive && echo yes || echo no)" yes
@@ -470,9 +581,13 @@ scenario_3() {
     "$([ "$(event_count net.offline)" -ge 1 ] && echo yes || echo no)" yes
   check "kiosk-main still alive (fell to the offline page, did not crash)" "$(kiosk_alive && echo yes || echo no)" yes
 
-  log "  offline.html's app-origin load and its kioskasset://localhost mp4-URL computation are" \
-      "deterministic page-local JS (verified by reading offline.html; not runtime-introspectable" \
-      "from this shell harness -- no remote-debugging channel is wired). See task-9-report.md."
+  if [ -z "${MP4_WATCH_PID:-}" ] && ! command -v inotifywait >/dev/null 2>&1; then
+    note_blocked "offline page rendered: inotifywait is not installed, so the offline page's own kioskasset:// asset request cannot be observed from outside the process. Install inotify-tools to make this scenario prove the offline fallback at all -- without it scenario 3 passes even when the offline page is never shown."
+  else
+    check "offline page rendered (its kioskasset:// video request reached the handler)" \
+      "$(offline_asset_opened && echo yes || echo no)" yes
+  fi
+  stop_offline_asset_watch
   # Best-effort screenshot (design spec's gate section: non-blocking) was tried
   # and dropped: weston-screenshooter hits `screenshot_create_shm_buffer:
   # Assertion 'width > 0' failed` against the headless backend every time
@@ -511,6 +626,7 @@ scenario_3_offline_window() {
   log "  fixture httpd stopped; waiting for the page's self-reload to hit a closed port"
   wait_until 12 event_at_least nav.error 1    # reload fires at T+2s after load; localhost connection-refused is fast
   wait_until 90 event_at_least net.offline 1  # 2 consecutive failed probes at the (default) 30s online-interval
+  wait_until 15 offline_asset_opened          # the offline page's own kioskasset:// video request
   RELOAD_GETS_BEFORE_RECOVERY="$(httpd_get_count '/home.html?probe=reload')"
 }
 
@@ -519,19 +635,25 @@ scenario_3_offline_window() {
 # ---------------------------------------------------------------------------
 scenario_4() {
   stage_config config.json
+  # Baseline BEFORE boot -- same reason as scenario 2. This used to be an absolute
+  # "at least 1" that happened to be correct only because scenario 3's httpd
+  # restart truncated the shared log first; now that the log appends (see
+  # start_fixtures) that accident is gone and the baseline is load-bearing.
+  local gets_before_boot
+  gets_before_boot="$(httpd_get_count /home.html)"
   start_kiosk wayland
-  wait_until 15 httpd_get_at_least /home.html 1
+  wait_until 15 httpd_get_at_least /home.html "$((gets_before_boot + 1))"
 
   check "kiosk-main alive after boot" "$(kiosk_alive && echo yes || echo no)" yes
-  check "initial GET /home.html before the crash" "$([ "$(httpd_get_count /home.html)" -ge 1 ] && echo yes || echo no)" yes
+  check "initial GET /home.html before the crash" \
+    "$([ "$(httpd_get_count /home.html)" -gt "$gets_before_boot" ] && echo yes || echo no)" yes
 
   # Snapshot BEFORE the kill rather than asserting a fixed "== 2" (review round 2,
-  # Important 3): scenarios 1 and 2 each already GET /home.html once, so a
-  # re-homed run that reorders or drops scenario 3 (which is what currently
-  # truncates the shared httpd access log, via start_fixtures) would satisfy a
-  # fixed ">= 2" before the crash below ever happens. Comparing against this
-  # scenario's OWN pre-kill count is order-independent -- it only ever proves
-  # something NEW happened after the crash.
+  # Important 3): the shared access log is monotonic across the whole run, so
+  # scenarios 1 and 2's own /home.html GETs would satisfy a fixed ">= 2" before
+  # the crash below ever happens. Comparing against this scenario's OWN pre-kill
+  # count is order-independent -- it only ever proves something NEW happened
+  # after the crash.
   local gets_before_crash
   gets_before_crash="$(httpd_get_count /home.html)"
 
