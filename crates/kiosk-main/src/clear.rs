@@ -152,7 +152,8 @@ mod linux_impl {
     use kiosk_core::app::state::Event as AppEvent;
     use tokio::sync::mpsc;
     use webkit2gtk::{
-        gio, glib, WebContextExt, WebViewExt, WebsiteDataManagerExtManual, WebsiteDataTypes,
+        gio, glib, CookieManagerExt, WebContextExt, WebViewExt, WebsiteDataManagerExt,
+        WebsiteDataManagerExtManual, WebsiteDataTypes,
     };
 
     use crate::telemetry::Telemetry;
@@ -183,6 +184,13 @@ mod linux_impl {
                 let _ = tx.try_send(AppEvent::ProfileCleared);
                 return;
             };
+            // Keep the explicit cookie-store operation alongside the full data
+            // clear. On WebKitGTK, an active WebProcess can retain a session
+            // cookie view until the next navigation even after `clear` completes.
+            if let Some(cookie_manager) = manager.cookie_manager() {
+                #[allow(deprecated)]
+                cookie_manager.delete_all_cookies();
+            }
             let telem_done = telem.clone();
             let tx_done = tx.clone();
             // `TimeSpan::from_seconds(0)` means *all data, all time* — it is not a

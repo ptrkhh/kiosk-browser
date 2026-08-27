@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = purge ]; then
+    deb-systemd-helper purge kiosk.service || true
+fi
+
+if [ -x "$(command -v deb-systemd-invoke 2>/dev/null || true)" ] &&
+   [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
+    deb-systemd-invoke daemon-reload || true
+fi
+
+exit 0

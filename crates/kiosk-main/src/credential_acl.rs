@@ -219,7 +219,10 @@ fn read_grantee_sids(dacl: *const windows::Win32::Security::ACL) -> io::Result<V
 fn mask_grants_read(mask: u32) -> bool {
     use windows::Win32::Foundation::GENERIC_READ;
     use windows::Win32::Security::{MapGenericMask, GENERIC_MAPPING};
-    use windows::Win32::Storage::FileSystem::{FILE_ALL_ACCESS, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_GENERIC_EXECUTE, FILE_READ_DATA};
+    use windows::Win32::Storage::FileSystem::{
+        FILE_ALL_ACCESS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        FILE_READ_DATA,
+    };
 
     let mut mapped = mask;
     let mapping = GENERIC_MAPPING {
@@ -234,7 +237,8 @@ fn mask_grants_read(mask: u32) -> bool {
     unsafe { MapGenericMask(&mut mapped, &mapping) };
 
     const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
-    const READ_BITS: u32 = FILE_GENERIC_READ.0 | GENERIC_READ.0 | FILE_READ_DATA.0 | MAXIMUM_ALLOWED;
+    const READ_BITS: u32 =
+        FILE_GENERIC_READ.0 | GENERIC_READ.0 | FILE_READ_DATA.0 | MAXIMUM_ALLOWED;
     mapped & READ_BITS != 0
 }
 
@@ -595,8 +599,7 @@ mod tests {
 #[cfg(all(test, windows))]
 mod drift_guard_tests {
     const THIS_FILE: &str = include_str!("credential_acl.rs");
-    const LAUNCHER_FILE: &str =
-        include_str!("../../kiosk-launcher/src/credential_acl.rs");
+    const LAUNCHER_FILE: &str = include_str!("../../kiosk-launcher/src/credential_acl.rs");
 
     /// Extracts `fn {name}`'s source, from the `fn` keyword through its
     /// matching closing brace (by simple brace counting — good enough for
@@ -639,7 +642,11 @@ mod drift_guard_tests {
 
     #[test]
     fn shared_functions_match_the_launcher_crates_copy() {
-        for name in ["credential_is_owner_only", "read_grantee_sids", "mask_grants_read"] {
+        for name in [
+            "credential_is_owner_only",
+            "read_grantee_sids",
+            "mask_grants_read",
+        ] {
             let mine = extract_fn(THIS_FILE, name);
             let theirs = extract_fn(LAUNCHER_FILE, name);
             assert_eq!(

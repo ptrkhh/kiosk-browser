@@ -14,6 +14,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use kiosk_core::config::schema::{Content, Permissions};
 use kiosk_core::nav::allowlist::Allowlist;
+use kiosk_core::nav::filter::compile_filter;
 use kiosk_core::nav::{decide, Decision};
 
 /// Shared handle to the live policy: cloned into every reader (the nav guard) and
@@ -87,6 +88,18 @@ impl NavPolicy {
     /// consulted directly (that would let a callsite skip the default-deny mapping).
     pub fn permissions(&self) -> &Permissions {
         &self.permissions
+    }
+
+    /// Compile the Linux WebKit content filter from this exact policy snapshot.
+    pub fn egress_filter(&self) -> kiosk_core::nav::filter::FilterOutput {
+        compile_filter(&self.allowlist)
+    }
+
+    /// Derive the optional CSP belt for this exact policy snapshot. `None` is a
+    /// deliberate belt decision; the native content filter remains authoritative
+    /// when a URLPattern cannot be expressed safely as CSP.
+    pub fn csp_policy(&self, app_origin: &str, asset_origin: &str) -> Option<String> {
+        derive_csp(&self.allowlist, app_origin, asset_origin)
     }
 
     /// The single per-navigation verdict, routed through `kiosk_core::nav::decide` —
@@ -195,6 +208,38 @@ pub fn csp_policy(content_origin: &str) -> String {
     )
 }
 
+/// Derive the CSP belt from the same accepted allowlist entries used by the Linux native
+/// content filter. The conversion is all-or-nothing: a pattern that cannot be represented
+/// at origin granularity disables the belt rather than silently tightening the policy.
+pub fn derive_csp(allow: &Allowlist, app_origin: &str, asset_origin: &str) -> Option<String> {
+    if !compile_filter(allow).refused.is_empty() {
+        return None;
+    }
+
+    let mut sources = allow.origins();
+    sources.extend([
+        app_origin.to_string(),
+        asset_origin.to_string(),
+        "data:".to_string(),
+        "blob:".to_string(),
+    ]);
+    sources.sort();
+    sources.dedup();
+    let sources = sources.join(" ");
+
+    Some(format!(
+        "default-src {sources} 'unsafe-inline' 'unsafe-eval'; \
+         img-src {sources}; \
+         style-src {sources}; \
+         script-src {sources}; \
+         font-src {sources}; \
+         connect-src {sources}; \
+         media-src {sources}; \
+         frame-src {sources}; \
+         object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+    ))
+}
+
 /// A LOCAL mirror of the WebView2 `COREWEBVIEW2_PERMISSION_KIND` values `hardening`'s
 /// `PermissionRequested` handler actually maps (P1-D2b Task 5, spec M9) — never the
 /// full webview2-com-sys enum (autoplay/file-read-write/local-fonts/MIDI-sysex/
@@ -202,6 +247,7 @@ pub fn csp_policy(content_origin: &str) -> String {
 /// same as anything genuinely unrecognized). Pure and host-tested here so the
 /// default-deny mapping is checkable without a live WebView2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub enum PermissionKind {
     Camera,
     Microphone,
@@ -455,6 +501,40 @@ mod tests {
         assert!(csp.contains("default-src"));
         assert!(csp.contains("https://home.test"));
         assert!(csp.contains("http://tauri.localhost"));
+    }
+
+    #[test]
+    fn an_inexpressible_pattern_skips_the_whole_belt() {
+        for pattern in [
+            "https://api-*.example.com/*",
+            "*://example.com/*",
+            "https://:sub.example.com/*",
+        ] {
+            let allow = Allowlist::new(&[pattern.to_string()], "https://home.test/app");
+            assert_eq!(
+                derive_csp(&allow, "tauri://localhost", "kioskasset://localhost"),
+                None,
+                "{pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_derived_belt_contains_hostless_sources_and_declared_restrictions() {
+        let allow = Allowlist::new(
+            &["https://cdn.example.com/assets/*".to_string()],
+            "https://home.test/app",
+        );
+        let csp = derive_csp(&allow, "tauri://localhost", "kioskasset://localhost")
+            .expect("expressible allowlist");
+        assert!(csp.contains("data:"));
+        assert!(csp.contains("blob:"));
+        assert!(csp.contains("'unsafe-inline'"));
+        assert!(csp.contains("'unsafe-eval'"));
+        assert!(csp.contains("object-src 'none'"));
+        assert!(csp.contains("base-uri 'none'"));
+        assert!(csp.contains("frame-ancestors 'none'"));
+        assert!(!csp.contains("/assets"));
     }
 
     // ---- permission_allowed (P1-D2b Task 5, spec M9 default-deny) --------------------

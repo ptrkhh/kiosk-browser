@@ -1,0 +1,54 @@
+<!doctype html>
+<html>
+  <body>
+    <input id="entry" type="text" aria-label="smoke input" />
+    <button id="context-target" type="button">context target</button>
+    <p id="status">controls probe</p>
+    <script>
+      function probe(value) {
+        fetch('/probe?' + value).catch(function () {});
+      }
+      document.addEventListener('contextmenu', function () {
+        probe('contextmenu=event');
+      }, true);
+      document.getElementById('entry').addEventListener('input', function () {
+        probe('keyboard=' + encodeURIComponent(this.value));
+      });
+      for (var i = 0; i < 3; i += 1) {
+        setTimeout(function () { alert('smoke-dialog'); }, 100 + i * 150);
+      }
+      setTimeout(function () {
+        var input = document.getElementById('entry');
+        input.focus();
+        setTimeout(function () {
+          var key = document.querySelector('#kiosk-osk [aria-label="q"]');
+          if (key) {
+            key.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+          } else {
+            probe('keyboard=missing');
+          }
+          setTimeout(function () {
+            input.blur();
+            probe('keyboard-panel=' + (document.getElementById('kiosk-osk') ? 'present' : 'gone'));
+          }, 250);
+        }, 500);
+      }, 700);
+      setTimeout(function () {
+        var frame = document.createElement('iframe');
+        frame.src = 'about:blank';
+        frame.onload = function () {
+          try { frame.contentWindow.print(); } catch (_) {}
+          probe('print=called');
+        };
+        document.body.appendChild(frame);
+      }, 1800);
+      setTimeout(function () {
+        window.onbeforeunload = function (event) {
+          event.returnValue = 'leave';
+          return 'leave';
+        };
+        location.href = '/controls-next.html';
+      }, 4000);
+    </script>
+  </body>
+</html>

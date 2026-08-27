@@ -66,8 +66,9 @@ pub(crate) const ENFORCE_ALL_FRAMES: bool = true;
 ///
 /// That `is_main_frame == false` carve-out is a Windows-only escape in practice: Linux's
 /// caller (`main.rs`'s builder line) always passes [`ENFORCE_ALL_FRAMES`] (`true`), so on
-/// Linux every frame — sub-frames included — IS this guard's job, because `egress.rs` has
-/// no Linux body yet (P2-A scope) to catch them instead.
+/// Linux every frame — sub-frames included — is covered here as the navigation-policy
+/// fallback; the WebKit content filter in `egress.rs` independently enforces resource
+/// egress for the same signed origin set.
 pub(crate) fn should_block(
     policy: &NavPolicy,
     url: &str,

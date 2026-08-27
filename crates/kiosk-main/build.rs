@@ -4,6 +4,6 @@ fn main() {
     // `allow-verify-pin`/`deny-verify-pin` permissions the `default` capability
     // references.
     let attrs = tauri_build::Attributes::new()
-        .app_manifest(tauri_build::AppManifest::new().commands(&["verify_pin"]));
+        .app_manifest(tauri_build::AppManifest::new().commands(&["verify_pin", "media_error"]));
     tauri_build::try_build(attrs).expect("tauri-build failed");
 }

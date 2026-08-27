@@ -11,7 +11,7 @@
 //! live on the tokio runtime — see [`run`]).
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,6 +21,7 @@ use kiosk_core::logging::auth::{ServiceAccount, TokenSource};
 use kiosk_core::logging::client::GclClient;
 use kiosk_core::logging::entry::{redact_url, EntryContext, LogEntry};
 use kiosk_core::logging::event::Event as LogEvent;
+use kiosk_core::logging::event::Severity;
 use kiosk_core::logging::ratelimit::RateLimiter;
 use kiosk_core::logging::spool::{Spool, SpoolConfig};
 use kiosk_core::logging::time::TrustedClock;
@@ -47,9 +48,38 @@ pub struct LogReq {
 #[derive(Clone)]
 pub struct Telemetry {
     tx: SyncSender<LogReq>,
+    min_severity: Arc<AtomicU8>,
+}
+
+fn severity_rank(severity: Severity) -> u8 {
+    match severity {
+        Severity::Debug => 0,
+        Severity::Info => 1,
+        Severity::Warning => 2,
+        Severity::Error => 3,
+        Severity::Critical => 4,
+    }
+}
+
+fn configured_severity(level: &str) -> Severity {
+    match level {
+        "debug" => Severity::Debug,
+        "warning" => Severity::Warning,
+        "error" => Severity::Error,
+        "critical" => Severity::Critical,
+        _ => Severity::Info,
+    }
 }
 
 impl Telemetry {
+    #[cfg(test)]
+    fn from_sender(tx: SyncSender<LogReq>) -> Telemetry {
+        Telemetry {
+            tx,
+            min_severity: Arc::new(AtomicU8::new(severity_rank(Severity::Info))),
+        }
+    }
+
     /// A telemetry handle that silently drops everything. Used when [`build`] fails
     /// (missing/malformed credential) so the kiosk still shows content — telemetry is
     /// never worth a black screen. The receiver is dropped immediately, so every
@@ -57,13 +87,24 @@ impl Telemetry {
     /// queue. No logger task is spawned for this handle.
     pub fn disabled() -> Telemetry {
         let (tx, _rx) = mpsc::sync_channel(1);
-        Telemetry { tx }
+        Telemetry {
+            tx,
+            min_severity: Arc::new(AtomicU8::new(severity_rank(Severity::Info))),
+        }
+    }
+
+    pub fn set_level(&self, level: &str) {
+        self.min_severity
+            .store(severity_rank(configured_severity(level)), Ordering::Relaxed);
     }
 
     /// `try_send`, never `send().await`: telemetry must never block or panic
     /// the caller. A full queue silently drops the event — the Logger's own
     /// spool is telemetry's durability layer, not this in-memory hop.
     fn emit(&self, event: LogEvent, fields: Map<String, Value>) {
+        if severity_rank(event.severity()) < self.min_severity.load(Ordering::Relaxed) {
+            return;
+        }
         let _ = self.tx.try_send(LogReq { event, fields });
     }
 
@@ -147,6 +188,22 @@ impl Telemetry {
         let mut f = Map::new();
         f.insert("kind".into(), Value::from(kind));
         self.emit(LogEvent::WebviewCrash, f);
+    }
+
+    pub fn media_error(&self, kind: &'static str, at: Option<f64>, ms_since_wrap: Option<f64>) {
+        let mut f = Map::new();
+        f.insert("kind".into(), Value::from(kind));
+        f.insert(
+            "at".into(),
+            at.map(Value::from).unwrap_or(serde_json::Value::Null),
+        );
+        f.insert(
+            "ms_since_wrap".into(),
+            ms_since_wrap
+                .map(Value::from)
+                .unwrap_or(serde_json::Value::Null),
+        );
+        self.emit(LogEvent::MediaError, f);
     }
 
     /// A periodic `health.sample` (spec §6, P1-D2e Task 2): BASIC host metrics
@@ -238,7 +295,14 @@ pub fn build(
 
     let logger = Logger::new(ctx, spool, client, limiter, clock);
     let (tx, rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
-    Ok((Telemetry { tx }, logger, rx))
+    Ok((
+        Telemetry {
+            tx,
+            min_severity: Arc::new(AtomicU8::new(severity_rank(Severity::Info))),
+        },
+        logger,
+        rx,
+    ))
 }
 
 /// The one place `EntryContext` is assembled from a `BootstrapConfig` — shared by
@@ -515,7 +579,7 @@ mod tests {
         let mut logger = logger_with(dir.path(), transport.clone());
 
         let (tx, rx) = mpsc::sync_channel(8);
-        let telemetry = Telemetry { tx };
+        let telemetry = Telemetry::from_sender(tx);
         telemetry.net_offline();
 
         let req = rx
@@ -551,7 +615,7 @@ mod tests {
         let mut logger = logger_with(dir.path(), transport.clone());
 
         let (tx, rx) = mpsc::sync_channel(8);
-        let telemetry = Telemetry { tx };
+        let telemetry = Telemetry::from_sender(tx);
         telemetry.nav_error("COREWEBVIEW2_WEB_ERROR_STATUS(12)");
 
         let req = rx
@@ -585,7 +649,7 @@ mod tests {
         let mut logger = logger_with(dir.path(), transport.clone());
 
         let (tx, rx) = mpsc::sync_channel(8);
-        let telemetry = Telemetry { tx };
+        let telemetry = Telemetry::from_sender(tx);
         telemetry.nav_blocked("not_allowlisted", "https://evil.test/steal?token=secret");
 
         let req = rx
@@ -626,7 +690,7 @@ mod tests {
         let mut logger = logger_with(dir.path(), transport.clone());
 
         let (tx, rx) = mpsc::sync_channel(8);
-        let telemetry = Telemetry { tx };
+        let telemetry = Telemetry::from_sender(tx);
         telemetry.webview_crash("render_process_unresponsive");
 
         let req = rx
@@ -655,6 +719,27 @@ mod tests {
             "webview.crash"
         );
         assert_eq!(posted["entries"][0]["severity"], "ERROR");
+    }
+
+    #[test]
+    fn configured_level_drops_lower_severity_before_the_channel() {
+        let (tx, rx) = mpsc::sync_channel(8);
+        let telemetry = Telemetry::from_sender(tx);
+        telemetry.set_level("warning");
+        telemetry.health(Map::new());
+        telemetry.nav_error("boom");
+
+        let req = rx.try_recv().expect("warning must remain admitted");
+        assert_eq!(req.event, LogEvent::NavError);
+        assert!(rx.try_recv().is_err(), "info must be dropped at the facade");
+    }
+
+    #[test]
+    fn default_level_admits_info() {
+        let (tx, rx) = mpsc::sync_channel(8);
+        let telemetry = Telemetry::from_sender(tx);
+        telemetry.health(Map::new());
+        assert_eq!(rx.try_recv().unwrap().event, LogEvent::HealthSample);
     }
 
     /// The disabled handle (used when telemetry init fails) must swallow every helper

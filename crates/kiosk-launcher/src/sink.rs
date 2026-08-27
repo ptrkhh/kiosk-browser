@@ -12,7 +12,6 @@
 use std::io;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::process::Child;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -34,7 +33,7 @@ use crate::clock::now;
 use crate::credential_acl;
 use crate::job::Job;
 use crate::loop_::ActionSink;
-use crate::spawn::spawn_main;
+use crate::spawn::{spawn_main, ChildHandle};
 
 /// The exact message SEC-09's launcher gate reports (mirrors kiosk-main's boot
 /// gate — same wording, same fault, two separate binaries reading the same
@@ -296,7 +295,7 @@ pub struct LauncherSink {
     /// and an orphan keeps holding the heartbeat pipe — `nMaxInstances` is 1, so
     /// the new child could never connect). Two kiosk-mains from two LAUNCHERS is
     /// now prevented upstream, by `job::acquire_single_instance` in `main`.
-    child: Option<Child>,
+    child: Option<ChildHandle>,
     /// The kill-on-close Job Object every spawned child is assigned to, so an
     /// unexpected launcher death (taskkill, panic, fast shutdown) takes
     /// kiosk-main with it instead of leaving an unsupervised full-screen orphan.
@@ -827,6 +826,16 @@ mod tests {
         std::fs::write(&cred_path, test_service_account_json()).unwrap();
         #[cfg(windows)]
         force_owner_only_acl(&cred_path);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&cred_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            if !credential_acl::credential_is_owner_only(&cred_path).unwrap_or(false) {
+                eprintln!("skipping owner-only credential test on a mode-insensitive filesystem");
+                return;
+            }
+        }
         let bootstrap = BootstrapConfig::parse(
             "[kiosk]\nconfig_url = https://e/c.json\nsite = hq\nproject_id = p\n\
              credential = cred.json\ndevice_id = lobby-01\n\n[bootstrap]\nurl = https://app.example.com/\n",

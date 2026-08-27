@@ -1,16 +1,27 @@
-# P2-A smoke harness — weston headless
+# Linux smoke harness — weston/cage headless
 
-Scenarios 1–5 (this task's scope; 6–7 land in a later P2-A task). Human-run
-in-session; deliberately **not** wired into `ci.yml` — automating the compositor
-harness is P2-F, which re-homes these scenario *bodies* into `crates/kiosk-smoke`
-(F owns A 1–7 · B 8–12 · C 13–15 · D 16–17).
+Scenarios 1–17. The shell driver owns the executable scenario bodies; CI and
+the Debian endurance job invoke them through the ignored tests in
+`crates/kiosk-smoke` (F owns A 1–7 · B 8–12 · C 13–15 · D 16–17).
 
 ## Run it
 
 ```bash
-KIOSK_CONFIG_PUBKEY_B64=<see below> cargo build -p kiosk-main
-bash packaging/smoke/run-smoke.sh
+KIOSK_CONFIG_PUBKEY_B64=<see below> cargo build --release -p kiosk-main
+cargo build --release -p kiosk-core --example kioskctl
+cargo test --release -p kiosk-smoke --no-run
+SMOKE_TEST="$(find target/release/deps -maxdepth 1 -type f -name 'smoke_linux-*' -perm -111 | head -n 1)"
+KIOSK_SMOKE_I_MEAN_IT=1 KIOSK_BIN=target/release/kiosk-main \
+  KIOSKCTL_BIN=target/release/examples/kioskctl \
+  KIOSK_SIGNING_KEY_B64=<ephemeral-seed> \
+  KIOSK_SMOKE_DRIVER="$PWD/packaging/smoke/run-smoke.sh" \
+  "$SMOKE_TEST" --ignored --exact scenario_1_boot_and_fullscreen
 ```
+
+Scenarios 8–17 also require the release `kioskctl`, a matching ephemeral
+`KIOSK_SIGNING_KEY_B64`, and the release `fixture-httpd`; CI supplies all three.
+The harness deliberately wipes `/var/lib/kiosk` between scenarios, so the
+explicit `KIOSK_SMOKE_I_MEAN_IT=1` acknowledgement is required.
 
 `kiosk-main` must be built with the pinned public key that matches the signed
 fixtures below baked in via `option_env!` at **compile time** — `signature::pinned_key()`
@@ -22,16 +33,32 @@ rejecting every signed config fail-closed. The pinned key for this fixture set:
 KIOSK_CONFIG_PUBKEY_B64=ZVW08teLiFV5pIQ7YKNrMZMP8EFqJHyHcHvKYQ9Pyeo=
 ```
 
-The matching private signing seed was used once, locally, to sign the three
-config fixtures below and then discarded — it is not committed (same discipline
-as `docs/testing/p1d2-signed-config-smoke.md`'s "Security" section). Regenerate
-both with `cargo run -p kiosk-core --example kioskctl -- keygen`, re-sign the
-three `config*.src.json` sources (not committed either — see below) with
-`kioskctl sign`, and rebuild with the new public key if the fixtures ever need
-to change.
+The matching private signing seed was used once, locally, to sign the static
+fixtures below and then discarded — it is not committed (same discipline as
+`docs/testing/p1d2-signed-config-smoke.md`'s "Security" section). Probe
+scenarios generate their signed variants at runtime with the ephemeral seed;
+if a static fixture changes, regenerate a key pair, sign the fixture with
+`kioskctl`, and rebuild `kiosk-main` with the new public key.
 
-`KIOSK_MAIN` env var overrides the binary path (default: `target/debug/kiosk-main`
-relative to this directory).
+`KIOSK_BIN` (or the legacy `KIOSK_MAIN`) overrides the binary path.
+
+## Media harness
+
+The Linux smoke/soak environment installs the runtime decoder set used by the
+deployed offline page:
+
+\`\`\`text
+gstreamer1.0-plugins-base
+gstreamer1.0-plugins-good
+gstreamer1.0-plugins-bad
+gstreamer1.0-libav
+\`\`\`
+
+The deliberate missing-decoder variant is owned by
+\`packaging/soak/fixtures/no-libav.sh\`. It must run in an environment that
+does not contain \`avdec_h264\`; the wrapper refuses to remove packages from a
+developer host, then records the page's enumerated \`media.error\` kind while
+asserting the black fallback.
 
 ## What each scenario proves
 
@@ -42,6 +69,18 @@ relative to this directory).
 | 3 | Offline fallback: a failed reload falls to the bundled offline page | stops the fixture httpd, the page's own `location.reload()` hits a closed port |
 | 4 | Renderer crash → `webview.crash` spooled, recovery navigates home | `pkill -f WebKitWebProcess` against the real subprocess (confirmed via `ps` before writing this: `/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/WebKitWebProcess`) |
 | 5 | Iframe main-frame-scope pin: an off-allowlist iframe is blocked with no leak into the top-level FSM | `fixtures/iframe-host.html`, loaded directly as `content.url` via `fixtures/config-iframe.json` |
+| 6 | Profile clear completion: the privacy gate receives exactly one completion event | `kiosk-main --example clear_probe` uses the production `clear::clear` callback |
+| 7 | Malformed bootstrap enters the safe renderer without a remote fetch | `fixtures/kiosk-malformed.ini`; device id is sourced from `/etc/machine-id` |
+| 8 | Native egress filter plus CSP degraded path | `hardening.html` drives off-list image/CSS/fetch/beacon/service-worker requests; the regular-file filter variant must emit `config.error` |
+| 9 | Attachment downloads are cancelled before persistence | `download.html` reaches the attachment response, while the spool records `nav.blocked{reason:download}` and `/var/lib/kiosk` stays clear |
+| 10 | Dialog/chrome suppression, bundled keyboard, print and beforeunload | `controls.html` plus real XTest right-click on the Xwayland floor |
+| 11 | Permission default-deny and signed camera capability | `permissions.html` records geolocation/camera outcomes in denied and capability-enabled boots |
+| 12 | Bus-less keep-awake degradation is non-fatal | `systemd-inhibit` child failure becomes `config.warn{field:display.keep_awake}` |
+| 13 | cage → launcher → main chain and child restart | the real release launcher runs under cage; killing its main child must produce a fresh home load |
+| 14 | Technician exit through the real cage chain | Xwayland chord and pin pad drive exit status 86 through cage |
+| 15 | Heartbeat hang recovery and orphan reap | SIGSTOP of the supervised main child must be detected, restarted and durably logged |
+| 16 | Idle expiry clears profile data once | `idle.html` sets a cookie, then observes it absent after the real clear completion |
+| 17 | Gesture/chord activity backstop | the Xwayland floor driver exercises corner taps, technician chord, ordinary input and idle suppression |
 
 ## Why the pages drive themselves (no xdotool)
 
@@ -52,7 +91,7 @@ The only input-injection tool present, `xdotool`, speaks X11/XTest via Xwayland,
 and XTest input synthesis **reproducibly segfaults Xwayland** in this
 environment (confirmed twice, under both `desktop-shell` and `kiosk-shell`, on
 the very first `mousemove`/`click`/`windowactivate` call — see
-`task-9-report.md`'s Concerns section for the full backtrace and root cause: no
+the input note below for the root cause: no
 input devices ⇒ weston's headless backend creates no seat capability ⇒
 Xwayland's XTest code dereferences it anyway).
 
@@ -129,8 +168,8 @@ ConfigApplied` arm) rather than a second, colliding navigate.
 - `fixtures/config.json`, `fixtures/config-reload.json`, `fixtures/config-iframe.json`
   — three genuinely signed configs (all `revision: 1`, all `device_id: smoke-01`
   matching each ini's `[kiosk] device_id`), differing only in `content.url`.
-  **Three config variants and three ini variants, not the brief's literal
-  one-of-each** — see task-9-report.md's Deviations for the full rationale
+  **Three config variants and three ini variants, not one-of-each** — the extra
+  variants keep the bootstrap URL aligned with each probe
   (no click mechanism exists to chain scenario progression through a single
   config the way the brief's design implicitly assumed, and the boot/fetch race
   below forced the ini variants specifically).
@@ -148,17 +187,13 @@ ConfigApplied` arm) rather than a second, colliding navigate.
   handler serving real bytes instead of 404) — playback quality is explicitly
   P2-E's scope, not P2-A's (design spec, Scope/defer).
 
-## Compositor: `kiosk-shell.so`, not the brief's implicit default
+## Compositor floor
 
-The brief's Step 1 code block starts weston with no `--shell` flag, which
-defaults to `desktop-shell`. Under `desktop-shell`, the kiosk window measured
-`X=0 Y=32 WIDTH=1280 HEIGHT=720` on a 1280×720 output — desktop-shell reserves
-a ~32px panel strip at the top, which no fullscreen request can reclaim, so a
-literal "the window reached fullscreen" assertion would fail through no fault
-of `kiosk-main`. Under `kiosk-shell.so` (a weston-shipped shell built for
-exactly this — single fullscreen kiosk client, no chrome), the same window
-measures `X=0 Y=0 WIDTH=1280 HEIGHT=720` — edge-to-edge, matching the output
-exactly. `run-smoke.sh` uses `--shell=kiosk-shell.so`.
+`run-smoke.sh` uses weston's default `desktop-shell` for scenarios 1–12 and
+16–17. The geometry check tolerates its panel offset and asserts only the
+window's X coordinate and output width/height. Scenarios 13–15 stop weston and
+run the real launcher under `cage --` with `WLR_BACKENDS=headless`; scenario 14
+uses cage's Xwayland backend for the declared xdotool floor driver.
 
 ## tao's observed monitor behavior under weston (closes the spec's open decision)
 
@@ -193,5 +228,5 @@ only one output to be out-of-range against. Two observations on top of that:
 
 ## Concerns / carry-forwards
 
-See `task-9-report.md` for the full per-scenario evidence table, the Xwayland
-crash backtrace, and both carry-forward results in detail.
+The Xwayland/xdotool limitation is a declared floor-driver constraint; native
+touch validation remains a P2-G hardware checklist item.

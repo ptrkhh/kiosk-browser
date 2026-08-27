@@ -1,0 +1,72 @@
+name: build
+
+on:
+  workflow_call:
+    inputs:
+      pubkey_b64:
+        description: SEC-01 public config key baked through KIOSK_CONFIG_PUBKEY_B64
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Guard — SEC-01 key must be non-empty
+        shell: bash
+        run: '[ -n "${{ inputs.pubkey_b64 }}" ] || { echo "::error::pubkey_b64 empty"; exit 1; }'
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Linux release artifacts
+        env:
+          KIOSK_CONFIG_PUBKEY_B64: ${{ inputs.pubkey_b64 }}
+        run: |
+          cargo build --release -p kiosk-main -p kiosk-launcher
+          cargo build --release -p kiosk-main --example clear_probe
+          cargo build --release -p kiosk-core --example kioskctl
+          cargo build --release -p kiosk-smoke --bin fixture-httpd
+          cargo test --release -p kiosk-smoke --no-run
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kiosk-linux-x86_64-${{ github.sha }}
+          path: |
+            target/release/kiosk-main
+            target/release/kiosk-launcher
+            target/release/fixture-httpd
+            target/release/examples/clear_probe
+            target/release/examples/kioskctl
+            target/release/deps/smoke_linux-*
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Guard — SEC-01 key must be non-empty
+        shell: bash
+        run: '[ -n "${{ inputs.pubkey_b64 }}" ] || { echo "::error::pubkey_b64 empty"; exit 1; }'
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Windows release artifacts
+        env:
+          KIOSK_CONFIG_PUBKEY_B64: ${{ inputs.pubkey_b64 }}
+        run: |
+          cargo build --release -p kiosk-main -p kiosk-launcher
+          cargo build --release -p kiosk-core --example kioskctl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kiosk-windows-${{ github.sha }}
+          path: |
+            target/release/kiosk-main.exe
+            target/release/kiosk-launcher.exe
+            target/release/examples/kioskctl.exe
+          if-no-files-found: error

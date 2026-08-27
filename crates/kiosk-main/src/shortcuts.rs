@@ -100,6 +100,28 @@ pub fn is_technician_chord(vk: u32, mods: Modifiers) -> bool {
     vk == VK_K && mods.ctrl && mods.alt && mods.shift
 }
 
+#[cfg(not(windows))]
+fn vk_from_keyval(keyval: gtk::gdk::keys::Key) -> Option<u32> {
+    use gtk::gdk::keys::constants as key;
+
+    match keyval {
+        key::K | key::k => Some(VK_K),
+        _ => None,
+    }
+}
+
+#[cfg(not(windows))]
+fn mods_from_state(state: gtk::gdk::ModifierType) -> Modifiers {
+    use gtk::gdk::ModifierType as modifier;
+
+    Modifiers {
+        ctrl: state.contains(modifier::CONTROL_MASK),
+        alt: state.contains(modifier::MOD1_MASK),
+        shift: state.contains(modifier::SHIFT_MASK),
+        win: state.intersects(modifier::MOD4_MASK | modifier::SUPER_MASK),
+    }
+}
+
 #[cfg(windows)]
 pub fn install(
     window: &tauri::WebviewWindow,
@@ -111,11 +133,38 @@ pub fn install(
 
 #[cfg(not(windows))]
 pub fn install(
-    _window: &tauri::WebviewWindow,
-    _app: tauri::AppHandle,
-    _gesture: Option<crate::gesture::EffectiveGesture>,
+    window: &tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    gesture: Option<crate::gesture::EffectiveGesture>,
 ) {
-    eprintln!("shortcuts: only implemented on Windows; nothing will be swallowed");
+    use gtk::prelude::WidgetExt;
+
+    let Ok(gtk_window) = window.gtk_window() else {
+        eprintln!("shortcuts: GTK window unavailable; Linux key observation is disabled");
+        return;
+    };
+
+    let app_key = app.clone();
+    let gesture_key = gesture.clone();
+    gtk_window.connect_key_press_event(crate::gesture::observe(
+        move |event: &gtk::gdk::EventKey| {
+            crate::idle::note_activity();
+            let Some(vk) = vk_from_keyval(event.keyval()) else {
+                return;
+            };
+            let mods = mods_from_state(event.state());
+            if should_swallow(vk, mods) {
+                return;
+            }
+            if is_technician_chord(vk, mods) {
+                crate::gesture::open_pin_pad(&app_key, gesture_key.as_ref());
+            }
+        },
+    ));
+
+    gtk_window.connect_key_release_event(crate::gesture::observe(|_event: &gtk::gdk::EventKey| {
+        crate::idle::note_activity();
+    }));
 }
 
 #[cfg(windows)]
@@ -268,6 +317,41 @@ mod windows_impl {
 #[cfg(test)]
 mod tests {
     use super::{should_swallow, Modifiers};
+
+    #[cfg(not(windows))]
+    mod keyval_map {
+        use super::super::*;
+        use gtk::gdk::keys::constants as key;
+        use gtk::gdk::ModifierType;
+
+        #[test]
+        fn both_cases_of_k_map_to_vk_k() {
+            assert_eq!(vk_from_keyval(key::K), Some(VK_K));
+            assert_eq!(vk_from_keyval(key::k), Some(VK_K));
+        }
+
+        #[test]
+        fn every_other_key_maps_to_none() {
+            assert_eq!(vk_from_keyval(key::a), None);
+            assert_eq!(vk_from_keyval(key::F5), None);
+            assert_eq!(vk_from_keyval(key::Escape), None);
+        }
+
+        #[test]
+        fn the_chord_modifiers_map_from_gdk_state() {
+            let state =
+                ModifierType::CONTROL_MASK | ModifierType::MOD1_MASK | ModifierType::SHIFT_MASK;
+            let mapped = mods_from_state(state);
+            assert!(mapped.ctrl && mapped.alt && mapped.shift && !mapped.win);
+            assert!(is_technician_chord(VK_K, mapped));
+        }
+
+        #[test]
+        fn super_and_mod4_both_read_as_win() {
+            assert!(mods_from_state(ModifierType::MOD4_MASK).win);
+            assert!(mods_from_state(ModifierType::SUPER_MASK).win);
+        }
+    }
 
     fn mods(ctrl: bool, alt: bool, shift: bool, win: bool) -> Modifiers {
         Modifiers {

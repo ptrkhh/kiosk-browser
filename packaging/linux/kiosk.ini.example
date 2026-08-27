@@ -1,0 +1,15 @@
+; Copy this file to /etc/kiosk/kiosk.ini and replace every deployment value.
+[kiosk]
+config_url = https://config.example.invalid/devices/replace-me.json
+device_id =
+site = replace-me
+region =
+project_id = replace-me
+credential = kiosk-credential.json
+startup_grace_s = 90
+healthy_run_s = 120
+channel_grace_s = 30
+demo_mode = false
+
+[bootstrap]
+url = https://site.example.invalid/kiosk

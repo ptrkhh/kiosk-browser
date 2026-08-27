@@ -12,7 +12,7 @@
     <a id="blank-block-link" href="http://evil.test/blank-blocked" target="_blank" rel="noopener">target=_blank, off-allowlist</a>
     <script>
       // This container has no real input devices (no /dev/input): a hardware click
-      // cannot be synthesized (confirmed empirically -- see task-9-report.md). A
+      // cannot be synthesized (confirmed empirically -- see the smoke README). A
       // real top-level navigation attempt does NOT require a user gesture in
       // WebKit, so this script drives it for real via `.click()` on the anchors --
       // that is a genuine decide-policy navigation request, not a simulation of the
@@ -22,7 +22,7 @@
       // one (isTrusted is always false for a script-dispatched event), so those two
       // steps are still attempted and their real, honest outcome (a silent no-op,
       // observed from outside via the fixture httpd's access log and the spool)
-      // is exactly the evidence recorded in task-9-report.md's Concerns section.
+      // is exactly the evidence recorded in the smoke README's input note.
       var status = document.getElementById('status');
       function step(n, label, fn) {
         setTimeout(function () {

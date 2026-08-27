@@ -32,6 +32,8 @@
 use crate::clock::now;
 use kiosk_core::ipc::{decode, Frame};
 use kiosk_core::watchdog::Event;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -51,12 +53,53 @@ use std::sync::Arc;
 /// client must retry the open on `ERROR_FILE_NOT_FOUND` as well as on
 /// `ERROR_PIPE_BUSY`, not only the latter.
 pub const PIPE_NAME: &str = r"\\.\pipe\kiosk-heartbeat";
+const MAX_LINE_BYTES: usize = 64 * 1024;
 
 /// The concrete, per-process pipe name. Uses the launcher's own PID as the
 /// per-boot suffix: unique per launcher run, and trivially reproducible by
 /// whichever code needs to pass it to the child (see module docs).
-pub fn instance_name() -> String {
-    format!("{PIPE_NAME}-{}", std::process::id())
+pub fn runtime_dir(data_dir: &Path) -> PathBuf {
+    #[cfg(unix)]
+    {
+        let systemd_runtime = Path::new("/run/kiosk");
+        if systemd_runtime.is_dir() {
+            systemd_runtime.to_path_buf()
+        } else {
+            data_dir.to_path_buf()
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        data_dir.to_path_buf()
+    }
+}
+
+pub fn instance_name(data_dir: &Path) -> io::Result<String> {
+    #[cfg(windows)]
+    {
+        let _ = data_dir;
+        return Ok(format!("{PIPE_NAME}-{}", std::process::id()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let path = runtime_dir(data_dir).join(format!("hb-{}.sock", std::process::id()));
+        // sockaddr_un.sun_path is 108 bytes including its terminating NUL on
+        // Linux. Reject before bind: std::os::unix::net reports the same limit,
+        // but doing it here makes the derived name itself testable.
+        if path.as_os_str().as_bytes().len() >= 108 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "heartbeat socket path is too long for sockaddr_un",
+            ));
+        }
+        return Ok(path.to_string_lossy().into_owned());
+    }
+    #[allow(unreachable_code)]
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "heartbeat transport is unsupported on this platform",
+    ))
 }
 
 /// Pure line -> Event mapping: the seam this module exists to make
@@ -85,6 +128,61 @@ pub fn accept_client(client: Option<u32>, expected: u32, current: u32) -> bool {
     match client {
         Some(p) if p != 0 => p == expected || p == current,
         _ => false,
+    }
+}
+
+#[cfg(unix)]
+mod peercred {
+    use std::io;
+    use std::os::raw::{c_int, c_void};
+    use std::os::unix::io::{AsRawFd, RawFd};
+    use std::os::unix::net::UnixStream;
+
+    const SOL_SOCKET: c_int = 1;
+    const SO_PEERCRED: c_int = 17;
+
+    #[repr(C)]
+    struct Ucred {
+        pid: i32,
+        uid: u32,
+        gid: u32,
+    }
+
+    extern "C" {
+        fn getsockopt(
+            socket: RawFd,
+            level: c_int,
+            name: c_int,
+            value: *mut c_void,
+            value_len: *mut u32,
+        ) -> c_int;
+    }
+
+    /// Linux's SO_PEERCRED records the connecting process credentials at
+    /// connect(2) time, so there is no accept/check time-of-check race here.
+    pub fn peer_pid(stream: &UnixStream) -> Option<u32> {
+        let mut cred = Ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut len = std::mem::size_of::<Ucred>() as u32;
+        // Safety: `stream` owns a live AF_UNIX fd; `cred` and `len` are valid
+        // writable buffers of the exact kernel ABI shape for SO_PEERCRED.
+        let rc = unsafe {
+            getsockopt(
+                stream.as_raw_fd(),
+                SOL_SOCKET,
+                SO_PEERCRED,
+                (&mut cred as *mut Ucred).cast(),
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            let _ = io::Error::last_os_error();
+            return None;
+        }
+        (cred.pid > 0).then_some(cred.pid as u32)
     }
 }
 
@@ -514,17 +612,167 @@ fn await_child_pid(child_pid: &AtomicU32, cancel: &AtomicBool) -> u32 {
     child_pid.load(Ordering::Relaxed)
 }
 
-/// Non-Windows stub: named pipes are a Windows-only IPC mechanism here (the
-/// kiosk target is Windows x64; other host platforms are dev-only).
-#[cfg(not(windows))]
+#[cfg(unix)]
+fn sleep_retry() {
+    std::thread::sleep(std::time::Duration::from_millis(100));
+}
+
+#[cfg(unix)]
+fn await_child_pid(child_pid: &AtomicU32, cancel: &AtomicBool) -> u32 {
+    for _ in 0..100 {
+        let pid = child_pid.load(Ordering::Relaxed);
+        if pid != 0 || cancel.load(Ordering::Relaxed) {
+            return pid;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    child_pid.load(Ordering::Relaxed)
+}
+
+#[cfg(unix)]
+fn read_line_capped<R: std::io::BufRead>(reader: &mut R) -> io::Result<Option<String>> {
+    let mut line = Vec::new();
+    let mut oversized = false;
+    loop {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            return Ok(None);
+        }
+        if let Some(pos) = chunk.iter().position(|byte| *byte == b'\n') {
+            if !oversized {
+                line.extend_from_slice(&chunk[..=pos]);
+            }
+            reader.consume(pos + 1);
+            if oversized || line.len() > MAX_LINE_BYTES {
+                return Ok(Some(String::new()));
+            }
+            let line = &line[..line.len() - 1];
+            return Ok(Some(
+                String::from_utf8_lossy(line)
+                    .trim_end_matches('\r')
+                    .to_string(),
+            ));
+        }
+        let len = chunk.len();
+        if !oversized {
+            if line.len().saturating_add(len) > MAX_LINE_BYTES {
+                oversized = true;
+                line.clear();
+            } else {
+                line.extend_from_slice(chunk);
+            }
+        }
+        reader.consume(len);
+    }
+}
+
+/// Unix-domain-socket heartbeat server. It mirrors the Windows accept loop:
+/// PID-authenticate before reading frames, preserve ChannelFault/Reconnected
+/// ordering, and emit no channel fault for the already-dead child's EOF.
+#[cfg(unix)]
 pub fn serve(
-    _pipe_name: &str,
-    _data_dir: &std::path::Path,
-    _tx: Sender<Event>,
-    _cancel: Arc<AtomicBool>,
-    _child_pid: Arc<AtomicU32>,
+    pipe_name: &str,
+    data_dir: &Path,
+    tx: Sender<Event>,
+    cancel: Arc<AtomicBool>,
+    child_pid: Arc<AtomicU32>,
 ) {
-    eprintln!("kiosk-launcher pipe::serve is Windows-only; not serving on this platform");
+    use std::io::BufReader;
+    use std::os::unix::net::UnixListener;
+
+    let mut awaiting_reconnect_event = false;
+    let mut faulted_pid: u32 = 0;
+    let mut logged_failure = false;
+    let mut logged_impostor = false;
+
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        // The path is owned by this launcher's RuntimeDirectory/data directory;
+        // remove a stale socket file before every bind attempt.
+        let _ = std::fs::remove_file(pipe_name);
+        let listener = match UnixListener::bind(pipe_name) {
+            Ok(listener) => listener,
+            Err(error) => {
+                if !logged_failure {
+                    logged_failure = true;
+                    eprintln!(
+                        "kiosk-launcher: cannot create heartbeat socket {pipe_name}: {error}"
+                    );
+                    crate::sink::breadcrumb(data_dir, "pipe", &error.to_string());
+                }
+                sleep_retry();
+                continue;
+            }
+        };
+        let expected = await_child_pid(&child_pid, &cancel);
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        let (stream, _) = match listener.accept() {
+            Ok(connection) => connection,
+            Err(error) => {
+                if !logged_failure {
+                    logged_failure = true;
+                    eprintln!("kiosk-launcher: heartbeat socket accept failed: {error}");
+                }
+                sleep_retry();
+                continue;
+            }
+        };
+        logged_failure = false;
+
+        let client = peercred::peer_pid(&stream);
+        if !accept_client(client, expected, child_pid.load(Ordering::Relaxed)) {
+            if !logged_impostor {
+                logged_impostor = true;
+                eprintln!(
+                    "kiosk-launcher: heartbeat socket rejected a client with an unexpected PID"
+                );
+            }
+            drop(stream);
+            sleep_retry();
+            continue;
+        }
+        logged_impostor = false;
+        let expected = client.unwrap_or(expected);
+        if expected != faulted_pid {
+            awaiting_reconnect_event = false;
+        }
+
+        let mut reader = BufReader::new(stream);
+        loop {
+            match read_line_capped(&mut reader) {
+                Ok(Some(line)) => {
+                    if let Some(event) = frame_to_event(&line, now()) {
+                        if awaiting_reconnect_event {
+                            awaiting_reconnect_event = false;
+                            if tx.send(Event::ChannelReconnected).is_err() {
+                                return;
+                            }
+                        }
+                        if tx.send(event).is_err() {
+                            return;
+                        }
+                    }
+                }
+                Ok(None) | Err(_) => {
+                    if child_pid.load(Ordering::Relaxed) == expected {
+                        if tx.send(Event::ChannelFault { at: now() }).is_err() {
+                            return;
+                        }
+                        awaiting_reconnect_event = true;
+                        faulted_pid = expected;
+                    }
+                    break;
+                }
+            }
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+    }
 }
 
 #[cfg(test)]

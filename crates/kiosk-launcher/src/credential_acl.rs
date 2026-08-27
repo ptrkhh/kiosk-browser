@@ -97,10 +97,62 @@ pub fn credential_is_owner_only(path: &Path) -> io::Result<bool> {
     ))
 }
 
-/// Non-Windows stub (dev hosts only; the kiosk target is Windows x64).
-#[cfg(not(windows))]
-pub fn credential_is_owner_only(_path: &Path) -> io::Result<bool> {
-    Ok(true)
+/// Linux credential gate. The packaged service runs as root and provisions the
+/// credential as root-owned `0600`; mode bits are therefore the complete
+/// proof needed here. If P2-G ever adds a non-root `User=`, this must gain an
+/// owner-UID check at the same time.
+#[cfg(unix)]
+pub fn credential_is_owner_only(path: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)?.permissions().mode();
+    Ok(mode & 0o077 == 0)
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn fixture(mode: u32) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "kiosk-credential-acl-{}-{}-{}.json",
+            std::process::id(),
+            mode,
+            crate::clock::now()
+        ));
+        std::fs::write(&path, b"{}\n").expect("fixture");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+            .expect("permissions");
+        path
+    }
+
+    #[test]
+    fn owner_only_mode_passes() {
+        let path = fixture(0o600);
+        assert!(credential_is_owner_only(&path).expect("mode check"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn group_or_other_read_modes_fail() {
+        for mode in [0o640, 0o604, 0o666] {
+            let path = fixture(mode);
+            assert!(!credential_is_owner_only(&path).expect("mode check"));
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn missing_credential_fails_closed() {
+        let path = std::env::temp_dir().join(format!(
+            "kiosk-credential-acl-missing-{}-{}",
+            std::process::id(),
+            crate::clock::now()
+        ));
+        let check = credential_is_owner_only(&path);
+        assert!(check.is_err());
+        assert!(is_violation(check));
+    }
 }
 
 /// Frees the security descriptor `GetNamedSecurityInfoW` allocated, on every
@@ -211,7 +263,10 @@ fn read_grantee_sids(dacl: *const windows::Win32::Security::ACL) -> io::Result<V
 fn mask_grants_read(mask: u32) -> bool {
     use windows::Win32::Foundation::GENERIC_READ;
     use windows::Win32::Security::{MapGenericMask, GENERIC_MAPPING};
-    use windows::Win32::Storage::FileSystem::{FILE_ALL_ACCESS, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_GENERIC_EXECUTE, FILE_READ_DATA};
+    use windows::Win32::Storage::FileSystem::{
+        FILE_ALL_ACCESS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        FILE_READ_DATA,
+    };
 
     let mut mapped = mask;
     let mapping = GENERIC_MAPPING {
@@ -226,7 +281,8 @@ fn mask_grants_read(mask: u32) -> bool {
     unsafe { MapGenericMask(&mut mapped, &mapping) };
 
     const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
-    const READ_BITS: u32 = FILE_GENERIC_READ.0 | GENERIC_READ.0 | FILE_READ_DATA.0 | MAXIMUM_ALLOWED;
+    const READ_BITS: u32 =
+        FILE_GENERIC_READ.0 | GENERIC_READ.0 | FILE_READ_DATA.0 | MAXIMUM_ALLOWED;
     mapped & READ_BITS != 0
 }
 
