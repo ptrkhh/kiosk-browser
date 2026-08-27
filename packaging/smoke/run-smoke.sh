@@ -114,6 +114,7 @@ stop_compositor() {
   wait "${CAGE_PID:-}" 2>/dev/null || true
   kill "${WESTON_PID:-}" 2>/dev/null || true
   wait "${WESTON_PID:-}" 2>/dev/null || true
+  reap_launch_dir   # before RUNTIME_DIR goes away -- LAUNCH_DIR lives inside it
   rm -rf "$RUNTIME_DIR" "$SERVE_DIR" "$CONFIG_DIR"
 }
 trap stop_compositor EXIT
@@ -204,6 +205,25 @@ supervised_main_changed() {
   [ -n "$current" ] && [ "$current" != "$old" ]
 }
 
+# Kill anything still running out of this run's private LAUNCH_DIR, by path rather
+# than by PID. cage runs the launcher as a GRANDCHILD, so killing $CAGE_PID never
+# reaps it, and on the early-bail path (`start_cage_launcher` returning non-zero)
+# LAUNCHER_PID was never discovered at all -- pgrep simply timed out. A leaked
+# launcher is anything but harmless: draining a dead main's spool is its whole
+# job, so it renames /var/lib/kiosk/spool to spool.orphaned underneath whatever
+# runs next and silently empties the spool every later scenario asserts against.
+# Observed for real: three launchers leaked by scenarios 13-15 kept doing this for
+# 18 minutes afterwards, and made scenario 3 fail every spool-based check while
+# its httpd-based checks all passed. It survives the harness exiting, so it
+# poisons later runs on the same host too, not just the rest of this one.
+# LAUNCH_DIR is under the per-run RUNTIME_DIR mktemp, so this pattern can never
+# match a real deployment's launcher.
+reap_launch_dir() {
+  [ -n "${LAUNCH_DIR:-}" ] || return 0
+  pkill -f "^$LAUNCH_DIR/kiosk-launcher" 2>/dev/null || true
+  pkill -f "^$LAUNCH_DIR/kiosk-main" 2>/dev/null || true
+}
+
 stop_cage_app() {
   if [ -n "${LAUNCHER_PID:-}" ]; then
     kill "$LAUNCHER_PID" 2>/dev/null || true
@@ -217,6 +237,7 @@ stop_cage_app() {
   wait "${CAGE_PID:-}" 2>/dev/null || true
   CAGE_PID=""
   LAUNCHER_PID=""
+  reap_launch_dir
 }
 
 # ---------------------------------------------------------------------------
@@ -517,7 +538,7 @@ config_rev_at_least() { [ "$(config_applied_rev_count "$1")" -ge "$2" ]; }
 # This is not belt-and-braces: scenario 3 passed with `PageTarget::Offline => {}`
 # (offline page never shown at all) until this check existed -- nav.error,
 # net.offline and the rule-4 re-navigate are all produced by paths that do not
-# touch the offline page. See task-9-report.md's mutation table.
+# touch the offline page. See README.md's "Mutation evidence" section.
 watch_offline_asset() {
   : >"$RUNTIME_DIR/mp4-access.log"
   MP4_WATCH_PID=""

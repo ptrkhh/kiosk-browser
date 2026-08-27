@@ -226,6 +226,68 @@ only one output to be out-of-range against. Two observations on top of that:
   against). A future task that wants the `config.warn{display.monitor}`
   fallback genuinely exercised needs a headless setup with 2+ outputs.
 
+## Mutation evidence (what proves these scenarios are not vacuous)
+
+A green scenario only means something if it can go red. Two of the P2-A
+scenarios were found, in adversarial review, to pass for reasons that had
+nothing to do with what they were named for, and a third assertion turned out to
+prove less than its own source comment claimed. Each was checked by mutating the
+app and re-running; a scenario that stays green under its own mutation is not a
+test.
+
+| Mutation | Expected | Observed |
+|---|---|---|
+| delete `window.set_fullscreen(true)` (`kiosk-main/src/main.rs`) | scenario 1 RED | RED — window came up `800x600` at `(32,32)` against an asserted `1280x720` at `X=0`; three checks failed |
+| `PageTarget::Offline => {}` — offline page never shown (`kiosk-main/src/main.rs`) | scenario 3 RED | RED — but **only** on the offline-page check below |
+| force `is_policy_cancellation` to `false` (`kiosk-main/src/nav.rs`) | scenario 5 RED | **GREEN** — see below |
+
+Mutations were reverted; `main.rs` and `nav.rs` are unmodified.
+
+The third row is the interesting one, and it corrects a claim the source used to
+make about itself. `nav.rs` documents an assumption its failure latch rests on —
+that `load-changed`/`load-failed` track the main frame only — and said scenario 5
+pinned it observationally, on the grounds that a blocked off-allowlist iframe
+produces no `nav.error`. Disabling the policy-cancellation filter outright shows
+that reasoning does not hold: scenario 5 stays green with `nav.error == 0`, and
+so does scenario 2, whose block is a **main-frame** navigation. A guard-cancelled
+load raises no `load-failed` on the WebView at all on WebKitGTK 2.52.3, in either
+frame. "No `nav.error` from the blocked iframe" was therefore equally consistent
+with "the signal fired and was filtered" — it pinned nothing. `nav.rs`'s module
+doc now records what was actually measured, and marks the filter as defensive
+rather than load-bearing.
+
+**Scenario 1** previously ran weston with `--shell=kiosk-shell.so`, which forces
+every top-level surface to the output's full extent whether or not the client
+ever asked to be fullscreen. The geometry check therefore passed identically
+with the app's fullscreen request deleted — it was measuring the compositor.
+Running under the default `desktop-shell` (see "Compositor floor") is what makes
+it measure the app; the panel offset that costs us is why `Y` is logged rather
+than asserted.
+
+**Scenario 3** is the more instructive one. With the offline page disabled
+outright, every other assertion in the scenario still passed — `nav.error`,
+`net.offline`, the process staying alive, and the rule-4 re-navigate on
+reconnect. All of them are produced by paths that never touch the offline page,
+so the scenario would have passed on a device that black-screens on network
+loss. The check that closes it:
+
+```
+check "offline page rendered (its kioskasset:// video request reached the handler)"
+```
+
+`offline.html` computes its `<video>` src page-locally from `location.protocol`,
+which on Linux resolves to `kioskasset://localhost/kiosk-offline.mp4`, served by
+kiosk-main's own custom-scheme handler via `std::fs::read` of that exact file.
+An inotify watch on the file is therefore external proof of **both** facts at
+once: the FSM really navigated to the bundled offline page, and that page picked
+the Linux origin — had it picked the Windows spelling
+(`http://kioskasset.localhost/...`) WebKit would have treated it as an ordinary
+HTTP host and the handler would never have run.
+
+This check needs `inotify-tools`. Without it the scenario records the sub-check
+as BLOCKED rather than passing silently — which matters, because without it
+scenario 3 passes even when the offline page is never shown at all.
+
 ## Concerns / carry-forwards
 
 The Xwayland/xdotool limitation is a declared floor-driver constraint; native

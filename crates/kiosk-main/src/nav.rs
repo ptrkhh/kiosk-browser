@@ -307,10 +307,23 @@ mod windows_impl {
 /// `load-failed-with-tls-errors` are `WebKitWebView`-level signals that track the **main
 /// frame's** load only, so a sub-frame's (iframe's) load never fires them —
 /// `webkit2gtk-2.0.2`'s bindings (`web_view.rs:2287,2316,2355`) give signatures only, no
-/// doc text confirming frame scope. The failure latch and the policy-cancellation filter
-/// below both depend on this holding. Pinned observationally by smoke scenario 5 (an
-/// off-allowlist iframe must produce no `NavigationFailed`, no `nav.error` and no
-/// error-page transition), not asserted here.
+/// doc text confirming frame scope. The failure latch depends on this holding.
+///
+/// Measured on WebKitGTK 2.52.3 by disabling [`is_policy_cancellation`] (forcing it to
+/// `false`) and re-running smoke scenarios 2 and 5: **both stayed green with
+/// `nav.error == 0`**. So a navigation this guard cancels — sub-frame (scenario 5) *and*
+/// main-frame (scenario 2) alike — raises no `load-failed` on the WebView at all. Two
+/// consequences worth stating plainly, because the obvious readings are both wrong:
+///
+/// * Scenario 5 does **not** pin the frame-scope assumption. It passes identically with
+///   the filter removed, so "no `nav.error` from the blocked iframe" is equally
+///   consistent with "the signal fired and was filtered". It is evidence that nothing
+///   reaches the WebView, not evidence about which frame it would have come from.
+/// * [`is_policy_cancellation`] is therefore currently **defensive, not load-bearing**:
+///   nothing in the smoke suite exercises it. Keep it — a `decide-policy` `ignore()` is
+///   documented to be able to surface as `FrameLoadInterruptedByPolicyChange`, and
+///   P2-B's RESPONSE/download decisions raise that same code from a different cause
+///   (see below) — but do not read a green scenario 5 as proof that it works.
 #[cfg(not(windows))]
 mod linux_impl {
     use std::cell::Cell;
