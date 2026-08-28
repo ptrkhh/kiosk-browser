@@ -67,6 +67,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y jq weston cage xwayland xdotool \
+            inotify-tools \
             libwebkit2gtk-4.1-0 \
             gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
             gstreamer1.0-plugins-bad gstreamer1.0-libav
@@ -112,6 +113,15 @@ jobs:
           set +e
           run_subset() {
             local failed=0 test_name scenario
+            # 10 and 16 are deliberately NOT here, and 17 never was. All three need a
+            # seat with real input devices: 10 drives xdotool, 16 needs the idle
+            # reset, which only fires once idle::note_activity() has been called from
+            # a GDK input event. weston's headless backend creates no seat at all, so
+            # they cannot pass on any runner, hosted or self-hosted -- on this one
+            # kiosk-main segfaults outright under GDK_BACKEND=x11 with no seat. They
+            # stay in run-smoke.sh for P2-G's hardware validation, where a real seat
+            # exists; running them here only ever produced red that meant "no input
+            # devices", never "the kiosk is broken".
             while IFS=: read -r test_name scenario; do
               echo "running $test_name (scenario $scenario)"
               KIOSK_SCENARIO="$scenario" "$KIOSK_SMOKE_TEST" \
@@ -124,9 +134,7 @@ jobs:
           scenario_7_safe_boot:7
           scenario_8_linux_hardening:8
           scenario_9_egress_filter:9
-          scenario_10_keyboard_and_print:10
           scenario_11_permissions:11
-          scenario_16_idle_clear:16
           SCENARIOS
             return "$failed"
           }

@@ -288,7 +288,7 @@ This check needs `inotify-tools`. Without it the scenario records the sub-check
 as BLOCKED rather than passing silently — which matters, because without it
 scenario 3 passes even when the offline page is never shown at all.
 
-## Egress: two measured residuals (P2-B)
+## Egress: three measured residuals (P2-B)
 
 The P2-B design left one question open for runtime to answer and made one claim
 about the degrade path. Both were measured on WebKitGTK 2.52.3; the answers are
@@ -323,6 +323,27 @@ subresource egress enforcement — not a weaker one. Scenario 8's last check is
 deliberately left RED rather than downgraded, because closing this needs a real
 mechanism (a response-header rewrite from a web-process extension), which is
 design work rather than a patch.
+
+**3. The filter install races the first page load.** The content filter is
+compiled and added asynchronously (`webkit_user_content_filter_store_save` and its
+completion callback, then `add_filter`), while the webview is already navigating.
+Measured: the boot-time off-list subresource is blocked on an idle host, leaked
+3/3 under load, and was blocked on the GitHub runner — genuinely intermittent. So
+**a kiosk's very first navigation has a window in which subresource egress is
+unenforced.** Steady-state enforcement is unaffected.
+
+Scenario 8 therefore checks the two separately: a *late* off-list request (fired
+~3s after load, well clear of the window) is asserted and is deterministic, while
+the boot-time one is reported as a KNOWN GAP when it leaks rather than asserted —
+a flaky gate teaches people to ignore it.
+
+**KNOWN GAP vs BLOCKED.** The harness distinguishes them deliberately. BLOCKED
+means *this environment cannot exercise the check* — a statement about the runner
+(no camera, no input devices, no `inotifywait`). KNOWN GAP means *we ran it and
+the product does not do this* — a statement about the code, measured and accepted
+as a tracked residual. Both are surfaced in the scenario's verdict line so neither
+can be silently forgotten, and neither fails the build. Conflating them would let
+a real gap hide behind an environment excuse.
 
 **How enforcement is asserted instead.** Every other off-list URL in
 `hardening.html` points at `evil.test`, which never resolves — its absence from

@@ -40,7 +40,19 @@
           if (registration.active) registration.active.postMessage('off-list-fetch');
         }).catch(function () {});
       }
-      setTimeout(function () { probe('ready=1'); }, 1500);
+      // A SECOND off-list subresource, requested late. The one in the markup above
+      // races the native content filter's own installation: the filter is compiled
+      // and added asynchronously (webkit_user_content_filter_store_save + its
+      // completion callback), so on a loaded machine the document's subresources
+      // can go out before add_filter has run. Measured: blocked on an idle host,
+      // leaked 3/3 under load. This request fires well after that window, so
+      // "blocked" here is a deterministic statement about steady-state enforcement,
+      // while the markup one above is the boot-race detector.
+      setTimeout(function () {
+        var late = new Image();
+        late.src = 'http://127.0.0.1:8099/off-list-probe-late';
+      }, 3000);
+      setTimeout(function () { probe('ready=1'); }, 4500);
     </script>
   </body>
 </html>
