@@ -296,6 +296,17 @@ Windows emits (`egress.rs:22`, made `pub(crate)`), the same per-request granular
 `nav.blocked` rate bucket (`egress.rs:112-118`'s explicit no-second-limiter doctrine; 20/burst
 pinned at `crates/kiosk-core/src/logging/ratelimit.rs:182`).
 
+**MEASURED (WebKitGTK 2.52.3, weston headless, 2026-08-27) — it does not.** Both callbacks were
+instrumented and scenario 8 run in both configurations: with the native filter active, the four
+off-list URLs never reach `resource-load-started` at all; with the filter absent, all four reach
+it, fail, and emit `nav.blocked{egress}`. The signal and the enforcement are therefore mutually
+exclusive. **Host-scoped blocks are enforced but silent on Linux: zero `nav.blocked{egress}` is
+the healthy reading.** Scenario 8's healthy arm now asserts enforcement from outside the process
+(an off-allowlist but *served* URL that must never appear in the fixture access log) and asserts
+the observer only in the degraded arm. A second residual was found in the same run: the CSP belt
+does **not** block off-list egress when the filter is unavailable — see `packaging/smoke/README.md`,
+"Egress: two measured residuals". The original open question is retained below for context.
+
 **Whether a content-blocked load reaches this signal at all is runtime and is pinned by smoke
 scenario 8(b), not asserted.** If it does not, host-scoped blocks are enforced but *silent* on
 Linux — a declared divergence, recorded before merge rather than discovered in the field.

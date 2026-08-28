@@ -288,6 +288,49 @@ This check needs `inotify-tools`. Without it the scenario records the sub-check
 as BLOCKED rather than passing silently — which matters, because without it
 scenario 3 passes even when the offline page is never shown at all.
 
+## Egress: two measured residuals (P2-B)
+
+The P2-B design left one question open for runtime to answer and made one claim
+about the degrade path. Both were measured on WebKitGTK 2.52.3; the answers are
+recorded here because the spec asked for exactly that ("recorded in this spec
+*before merge*, not discovered in the field").
+
+**1. Host-scoped blocks are enforced but silent.** A resource the native content
+filter blocks never reaches `resource-load-started`, so the observer that emits
+`nav.blocked{egress}` (`egress.rs`, `connect_resource_load_started` →
+`WebResource::connect_failed`) never runs for it. Measured by instrumenting both
+callbacks: in the healthy arm the four off-list URLs never appear at all; with
+the filter absent, all four appear and all four report. So that telemetry exists
+only when enforcement is *absent* — the signal and the enforcement are mutually
+exclusive.
+
+Consequence for operators: **on a working Linux kiosk, blocked subresource egress
+produces no telemetry.** Zero `nav.blocked{egress}` is the healthy reading, not
+evidence that nothing was blocked. Scenario 8 therefore asserts enforcement from
+outside the process (see below) and asserts the observer only in the degraded arm.
+
+**2. The CSP belt does not block off-list egress.** The design's degrade path
+states that with the native filter unavailable "an off-list `fetch()` is still
+blocked by the belt". It is not. Scenario 8's degraded arm now loads an off-list
+subresource from a *served* host and the fixture httpd records the GET — the
+request goes out. The belt injects its policy as a `<meta http-equiv>` element
+from a document-start user script, and a meta CSP only governs resources fetched
+after that element is inserted; the page's own subresources are already in flight
+by then, and re-assigning `.content` on an existing meta element has no effect.
+
+Consequence: when `config.error{egress.filter_absent}` fires, Linux has **no**
+subresource egress enforcement — not a weaker one. Scenario 8's last check is
+deliberately left RED rather than downgraded, because closing this needs a real
+mechanism (a response-header rewrite from a web-process extension), which is
+design work rather than a patch.
+
+**How enforcement is asserted instead.** Every other off-list URL in
+`hardening.html` points at `evil.test`, which never resolves — its absence from
+the access log proves nothing. `http://127.0.0.1:8099/off-list-probe` is
+off-allowlist (the allowlist names host `localhost`) but *is* served, so its
+absence is real evidence. The two arms falsify each other: with the filter on the
+GET never lands, with the filter gone it does.
+
 ## Concerns / carry-forwards
 
 The Xwayland/xdotool limitation is a declared floor-driver constraint; native

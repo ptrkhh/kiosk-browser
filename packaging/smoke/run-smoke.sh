@@ -238,6 +238,16 @@ stop_cage_app() {
   CAGE_PID=""
   LAUNCHER_PID=""
   reap_launch_dir
+  # start_cage_app stopped weston (stop_weston_only) and repointed
+  # XDG_RUNTIME_DIR/WAYLAND_DISPLAY at cage's own socket. Both have to go back, or
+  # every later weston-backed scenario boots with no display at all: observed as
+  # scenarios 16 and 17 dying in tao's EventLoop::new with "Failed to initialize
+  # gtk backend!", which reads like an app crash and is not one. CI runs one
+  # scenario per process so it never meets this; a full local run of the driver
+  # does, and scenario 13-15 are the only scenarios that take the compositor away.
+  export XDG_RUNTIME_DIR="$RUNTIME_DIR"
+  export WAYLAND_DISPLAY="wayland-smoke"
+  start_compositor
 }
 
 # ---------------------------------------------------------------------------
@@ -572,6 +582,29 @@ httpd_probe_prefix_count() { httpd_log | grep -cF "GET /probe?$1"; }
 httpd_path_count() { httpd_log | grep -cF "GET $1 HTTP/1."; }
 
 httpd_get_at_least() { [ "$(httpd_get_count "$1")" -ge "$2" ]; }
+
+# Threshold predicates for the probe/config-error counters. These exist because
+# `wait_until` takes a COMMAND and tests its EXIT STATUS, while the *_count
+# helpers above are pipelines ending in `grep -c`: their exit status is grep's, so
+# it is 0 as soon as ONE line matches and the trailing threshold argument is
+# silently discarded. Every `wait_until N httpd_probe_count foo 2` therefore
+# waited for one probe, not two, and returned while the scenario's real
+# precondition was still outstanding -- which is exactly why scenario 11's
+# geolocation check read 0 while the probe was in flight. Same shape as
+# httpd_get_at_least/event_at_least, which were always written correctly.
+# The Linux idle clock is driven by idle::note_activity(), called only from the
+# GDK event handlers in gesture.rs/shortcuts.rs. With no input device there is no
+# seat, no events, so LAST_INPUT_MS stays 0 -- and idle_secs() returns 0 for that
+# case by design ("the zero value is reserved for no observation source"), so
+# should_fire() is never true and the idle reset can never fire. That is a
+# deliberate fail-safe rather than a defect: a kiosk that cannot observe input
+# must not wipe the session on a timer it has no basis to trust. Scenarios that
+# depend on the reset firing have to record that, not fail on it.
+have_input_devices() { [ -e /dev/input ] || [ -e /dev/uinput ]; }
+
+httpd_probe_at_least() { [ "$(httpd_probe_count "$1")" -ge "$2" ]; }
+httpd_probe_prefix_at_least() { [ "$(httpd_probe_prefix_count "$1")" -ge "$2" ]; }
+config_error_at_least() { [ "$(config_error_count "$1")" -ge "$2" ]; }
 event_at_least() { [ "$(event_count "$1")" -ge "$2" ]; }
 event_with_reason_at_least() { [ "$(event_count_with_reason "$1" "$2")" -ge "$3" ]; }
 config_error_count() { spool_events | grep -F '"event":"config.error"' | grep -cF "\"error\":\"$1\""; }
@@ -982,10 +1015,26 @@ scenario_8() {
     return
   fi
   KIOSK_BOOTSTRAP_URL="http://localhost:${FIXTURE_PORT}/hardening.html" start_kiosk wayland
-  wait_until 20 httpd_probe_count ready=1 1
-  wait_until 20 event_with_reason_at_least nav.blocked egress 4
-  local blocked="$(event_count_with_reason nav.blocked egress)"
-  check "four off-list resource classes are blocked" "$([ "$blocked" -ge 4 ] && echo yes || echo no)" yes
+  wait_until 20 httpd_probe_at_least ready=1 1
+  # Enforcement is asserted from OUTSIDE the process, not from nav.blocked{egress}.
+  # Measured on WebKitGTK 2.52.3: a resource the native content filter blocks never
+  # reaches `resource-load-started` at all, so the observer that emits
+  # nav.blocked{egress} (egress.rs, connect_resource_load_started ->
+  # WebResource::connect_failed) never runs for it. That signal therefore appears
+  # only when enforcement is ABSENT -- asserting >= 4 of it here demanded that the
+  # filter be broken. The P2-B design anticipated exactly this ("whether a
+  # content-blocked load reaches this signal at all is runtime and is pinned by
+  # smoke scenario 8(b), not asserted") and required the residual be recorded
+  # before merge; see README's "Egress block telemetry" section.
+  #
+  # /off-list-probe is served by the fixture httpd on the off-allowlist host
+  # 127.0.0.1, so its ABSENCE from the access log is real evidence. The degraded
+  # arm below re-checks the same URL with the filter gone, which is what proves
+  # this check can go red.
+  local off_host_gets_healthy
+  off_host_gets_healthy="$(httpd_get_count /off-list-probe)"
+  check "off-list subresource on a served host is blocked before the network" \
+    "$off_host_gets_healthy" 0
   check "the data: image still renders" \
     "$([ "$(httpd_probe_count data-image=rendered)" -ge 1 ] && echo yes || echo no)" yes
   check "service-worker fixture was installed" \
@@ -998,11 +1047,40 @@ scenario_8() {
   KIOSK_EGRESS_FILTER_FILE=1 \
     KIOSK_BOOTSTRAP_URL="http://localhost:${FIXTURE_PORT}/hardening.html" \
     start_kiosk wayland
-  wait_until 20 config_error_count egress.filter_absent 1
-  wait_until 20 httpd_probe_prefix_count csp= 1
+  wait_until 20 config_error_at_least egress.filter_absent 1
+  wait_until 20 httpd_probe_prefix_at_least csp= 1
+  wait_until 20 event_with_reason_at_least nav.blocked egress 4
   check "missing native filter is a config.error" \
     "$(config_error_count egress.filter_absent)" 1
-  check "CSP still reports the blocked off-list fetch" \
+  # This is where nav.blocked{egress} genuinely lives: with no native filter the
+  # off-list loads reach resource-load-started, fail, and the observer reports
+  # each one. Asserting it here rather than in the healthy arm both tests the
+  # observer and pins the divergence between the two layers.
+  check "the observer reports off-list resources once the filter is gone" \
+    "$([ "$(event_count_with_reason nav.blocked egress)" -ge 4 ] && echo yes || echo no)" yes
+  # The counterpart to the healthy arm's check on the same URL: with enforcement
+  # gone this GET must land, which is what makes that check falsifiable rather
+  # than a hardcoded 0. It also measures what the CSP belt is actually worth on
+  # this platform -- the design calls the belt a fallback that still blocks
+  # off-list egress when the filter is unavailable.
+  local off_host_gets_degraded
+  off_host_gets_degraded="$(httpd_get_count /off-list-probe)"
+  check "the same off-list subresource is no longer blocked without the filter" \
+    "$([ "$off_host_gets_degraded" -gt 0 ] && echo yes || echo no)" yes
+  # KNOWN RED -- a real residual, deliberately not downgraded to a note.
+  # The P2-B design's degrade path claims "an off-list fetch() is still blocked by
+  # the belt". Measured here, it is not: the check directly above shows the
+  # off-list subresource LOADING once the native filter is gone, so there is no
+  # violation for the page to report and no csp= probe follows. The belt injects
+  # its policy as a <meta http-equiv> from a document-start user script, and a meta
+  # CSP only governs resources fetched after the element is inserted -- by which
+  # point the page's own subresources are already in flight (and re-assigning
+  # .content on an existing meta has no effect at all).
+  # Consequence: when egress.filter_absent fires, Linux has NO subresource egress
+  # enforcement, not a weaker one. Closing it needs a real mechanism (a response
+  # -header rewrite from a web-process extension), which is design work, not a
+  # patch -- so this stays red rather than green-by-redefinition.
+  check "CSP belt still blocks off-list egress when the native filter is absent" \
     "$([ "$(httpd_probe_prefix_count csp=)" -ge 1 ] && echo yes || echo no)" yes
   check "kiosk-main survives filter degradation" "$(kiosk_alive && echo yes || echo no)" yes
   stop_kiosk
@@ -1017,7 +1095,7 @@ scenario_9() {
     return
   fi
   KIOSK_BOOTSTRAP_URL="http://localhost:${FIXTURE_PORT}/download.html" start_kiosk wayland
-  wait_until 15 httpd_probe_count download=attempted 1
+  wait_until 15 httpd_probe_at_least download=attempted 1
   wait_until 15 event_with_reason_at_least nav.blocked download 1
   check "exactly one download block is spooled" "$(event_count_with_reason nav.blocked download)" 1
   check "attachment response was reached before cancellation" \
@@ -1039,10 +1117,10 @@ scenario_10() {
     return
   fi
   KIOSK_BOOTSTRAP_URL="http://localhost:${FIXTURE_PORT}/controls.html" start_kiosk x11
-  wait_until 15 httpd_probe_prefix_count keyboard= 1
-  wait_until 15 httpd_probe_count keyboard-panel=gone 1
-  wait_until 15 httpd_probe_count print=called 1
-  wait_until 15 httpd_probe_count beforeunload=passed 1
+  wait_until 15 httpd_probe_prefix_at_least keyboard= 1
+  wait_until 15 httpd_probe_at_least keyboard-panel=gone 1
+  wait_until 15 httpd_probe_at_least print=called 1
+  wait_until 15 httpd_probe_at_least beforeunload=passed 1
 
   local win
   win="$(DISPLAY=":$X11_DISPLAY" xdotool search --onlyvisible --name 'SMOKE CONTROLS' 2>/dev/null | head -1)"
@@ -1074,11 +1152,29 @@ scenario_11() {
     return
   fi
   KIOSK_BOOTSTRAP_URL="http://localhost:${FIXTURE_PORT}/permissions.html" start_kiosk wayland
-  wait_until 15 httpd_probe_prefix_count permission= 2
+  wait_until 15 httpd_probe_prefix_at_least permission= 2
   local denied_camera
   denied_camera="$(httpd_log | sed -n 's/.*GET \/probe?permission=\(camera-[^ ]*\) HTTP.*/\1/p' | tail -1)"
-  check "camera is denied by default" \
-    "$([[ "$denied_camera" == camera-NotAllowedError || "$denied_camera" == camera-denied || "$denied_camera" == camera-NotFoundError ]] && echo yes || echo no)" yes
+  # getUserMedia matches CONSTRAINTS before the app's permission decision is
+  # observable, so on a host with no camera WebKit rejects with
+  # OverconstrainedError/NotFoundError whatever the policy says. Measured here:
+  # the deny arm and the camera-enabled arm below report the IDENTICAL value
+  # (camera-OverconstrainedError), so neither arm can demonstrate the policy.
+  # NotAllowedError/denied is the only outcome that shows a decision was made --
+  # note the rest rather than failing this arm and passing the next one
+  # vacuously, which is what happened before: the allow arm's assertion is
+  # "!= NotAllowedError", true in every configuration on a device-less host.
+  # NotFoundError was previously accepted here AS a denial; it is device absence.
+  local camera_observable=yes
+  case "$denied_camera" in
+    camera-OverconstrainedError | camera-NotFoundError | camera-unavailable) camera_observable=no ;;
+  esac
+  if [ "$camera_observable" = no ]; then
+    note_blocked "camera permission is unobservable on this host: no camera device, so getUserMedia rejects with '$denied_camera' from constraint matching before the permission decision. Both arms of this scenario report the same value, so neither can measure default-deny. Needs a host with a real or virtual camera (v4l2loopback)."
+  else
+    check "camera is denied by default" \
+      "$([[ "$denied_camera" == camera-NotAllowedError || "$denied_camera" == camera-denied ]] && echo yes || echo no)" yes
+  fi
   check "geolocation is denied by default" \
     "$([[ "$(httpd_probe_prefix_count permission=geolocation-)" -ge 1 ]] && echo yes || echo no)" yes
   stop_kiosk
@@ -1087,12 +1183,23 @@ scenario_11() {
     check "signed camera-enabled permission probe was staged" no yes
     return
   fi
+  # Baseline BEFORE this arm boots: the access log is shared with the deny arm
+  # above, whose camera probe already satisfies an absolute "at least 1". The wait
+  # returned instantly and `tail -1` then read the DENY arm's value back, so this
+  # check passed without the camera-enabled arm ever having reported -- it was
+  # comparing the first arm against itself.
+  local camera_probes_before
+  camera_probes_before="$(httpd_probe_prefix_count permission=camera-)"
   KIOSK_BOOTSTRAP_URL="http://localhost:${FIXTURE_PORT}/permissions.html" start_kiosk wayland
-  wait_until 15 httpd_probe_prefix_count permission=camera- 1
+  wait_until 15 httpd_probe_prefix_at_least permission=camera- "$((camera_probes_before + 1))"
   local allowed_camera
   allowed_camera="$(httpd_log | sed -n 's/.*GET \/probe?permission=\(camera-[^ ]*\) HTTP.*/\1/p' | tail -1)"
-  check "camera capability changes the permission decision" \
-    "$([[ "$allowed_camera" != camera-NotAllowedError && "$allowed_camera" != camera-denied ]] && echo yes || echo no)" yes
+  if [ "$camera_observable" = no ]; then
+    note_blocked "camera capability arm: same device-absence limitation as the deny arm (reported '$allowed_camera'); not asserted, because '!= NotAllowedError' is true here regardless of what the capability is set to."
+  else
+    check "camera capability changes the permission decision" \
+      "$([[ "$allowed_camera" != camera-NotAllowedError && "$allowed_camera" != camera-denied ]] && echo yes || echo no)" yes
+  fi
   check "kiosk-main remains alive after permission probes" "$(kiosk_alive && echo yes || echo no)" yes
   stop_kiosk
 }
@@ -1126,16 +1233,20 @@ scenario_16() {
     return
   fi
   KIOSK_BOOTSTRAP_URL="http://localhost:${FIXTURE_PORT}/idle.html" start_kiosk wayland
-  wait_until 15 httpd_probe_count idle=set 1
-  wait_until 20 httpd_probe_count idle=absent 2
+  wait_until 15 httpd_probe_at_least idle=set 1
+  wait_until 20 httpd_probe_at_least idle=absent 2
   check "idle fixture persisted its session cookie" \
     "$([ "$(httpd_probe_count idle=set)" -ge 1 ] && echo yes || echo no)" yes
-  check "profile clear removed the cookie on the second home load" \
-    "$([ "$(httpd_probe_count idle=absent)" -ge 2 ] && echo yes || echo no)" yes
-  local absent_count="$(httpd_probe_count idle=absent)"
-  sleep 5
-  check "idle reset fired only once while the page stayed untouched" \
-    "$(httpd_probe_count idle=absent)" "$absent_count"
+  if have_input_devices; then
+    check "profile clear removed the cookie on the second home load" \
+      "$([ "$(httpd_probe_count idle=absent)" -ge 2 ] && echo yes || echo no)" yes
+    local absent_count="$(httpd_probe_count idle=absent)"
+    sleep 5
+    check "idle reset fired only once while the page stayed untouched" \
+      "$(httpd_probe_count idle=absent)" "$absent_count"
+  else
+    note_blocked "idle-triggered profile clear: this host has no /dev/input, so idle::note_activity() is never called, LAST_INPUT_MS stays 0, and idle_secs() returns 0 by design -- the reset cannot fire and the second idle=absent is unreachable. Observed $(httpd_probe_count idle=absent) idle=absent probe(s). The follow-on 'fired only once' check is skipped with it: comparing 0 resets against 0 resets proves nothing."
+  fi
   check "kiosk-main remains alive after profile clear" "$(kiosk_alive && echo yes || echo no)" yes
   stop_kiosk
 }
@@ -1195,7 +1306,7 @@ scenario_17() {
   local gets_before="$(httpd_get_count /input-echo.html)"
   DISPLAY=":$X11_DISPLAY" xdotool mousemove --window "$win" 100 80 click 1
   DISPLAY=":$X11_DISPLAY" xdotool key --window "$win" x
-  wait_until 10 httpd_probe_prefix_count input= 2
+  wait_until 10 httpd_probe_prefix_at_least input= 2
   sleep 4
   check "ordinary click and key events still reach the page" \
     "$([ "$(httpd_probe_prefix_count input=)" -ge 2 ] && echo yes || echo no)" yes

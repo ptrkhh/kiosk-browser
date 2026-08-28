@@ -12,6 +12,14 @@
     <div id="css-probe"></div>
     <img id="data-image" alt="data image" src="data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=" />
     <img id="off-image" alt="off-list image" src="http://evil.test/image" />
+    <!-- Off-allowlist but SERVED. The allowlist is http://localhost:8099/*, and
+         127.0.0.1 is a different host to a URL pattern, while the fixture httpd
+         binds 127.0.0.1 and answers on both. So this is the one off-list resource
+         whose blocking is externally observable: if egress is enforced the access
+         log never records it; if enforcement is off, the GET lands. Every other
+         off-list URL here points at evil.test, which never resolves, so its
+         absence from the log proves nothing. -->
+    <img id="off-host-image" alt="off-host image" src="http://127.0.0.1:8099/off-list-probe" />
     <script>
       function probe(value) {
         fetch('/probe?' + value).catch(function () {});
