@@ -1114,12 +1114,12 @@ scenario_8() {
   # egress.filter_absent fires, Linux has NO subresource egress enforcement, not a
   # weaker one. Closing it needs a real mechanism (a response-header rewrite from a
   # WebKit web-process extension), which is design work rather than a patch. The
-  # residual is written up in README's "Egress: two measured residuals" and in the
+  # residual is written up in README's "Egress: three measured residuals" and in the
   # P2-B spec; if the belt is ever fixed, turn this back into a `check`.
   if [ "$(httpd_probe_prefix_count csp=)" -ge 1 ]; then
     check "CSP belt still blocks off-list egress when the native filter is absent" yes yes
   else
-    note_known_gap "the CSP belt does not block off-list egress when the native filter is absent: the off-list subresource above LOADED, so no securitypolicyviolation fires and no csp= probe follows. Linux therefore has no subresource egress enforcement at all in the degraded state. See README, 'Egress: two measured residuals'."
+    note_known_gap "the CSP belt does not block off-list egress when the native filter is absent: the off-list subresource above LOADED, so no securitypolicyviolation fires and no csp= probe follows. Linux therefore has no subresource egress enforcement at all in the degraded state. See README, 'Egress: three measured residuals'."
   fi
   check "kiosk-main survives filter degradation" "$(kiosk_alive && echo yes || echo no)" yes
   stop_kiosk

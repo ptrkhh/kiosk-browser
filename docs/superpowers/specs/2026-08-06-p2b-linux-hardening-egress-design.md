@@ -305,7 +305,7 @@ the healthy reading.** Scenario 8's healthy arm now asserts enforcement from out
 (an off-allowlist but *served* URL that must never appear in the fixture access log) and asserts
 the observer only in the degraded arm. A second residual was found in the same run: the CSP belt
 does **not** block off-list egress when the filter is unavailable — see `packaging/smoke/README.md`,
-"Egress: two measured residuals". The original open question is retained below for context.
+"Egress: three measured residuals". The original open question is retained below for context.
 
 **Whether a content-blocked load reaches this signal at all is runtime and is pinned by smoke
 scenario 8(b), not asserted.** If it does not, host-scoped blocks are enforced but *silent* on
