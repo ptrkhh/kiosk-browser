@@ -1,8 +1,8 @@
 //! Periodic `health.sample` timer (spec §6, P1-D2e Task 2). BASIC (P1) fields only —
 //! CPU %, mem used/total, disk-free for the data-dir volume, uptime, and
-//! `spool_dropped_expired`. Webview-process RSS / `max_webview_mem_mb` enforcement
-//! is P2 and does not belong here. All sampling logic lives in
-//! `kiosk_core::metrics` (Task 1); this module only owns the tick/cancel loop.
+//! `spool_dropped_expired`. The webview-process RSS cap is evaluated here because
+//! this task owns the health cadence; sampling itself lives in
+//! `kiosk_core::metrics`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -30,8 +30,10 @@ pub async fn run(
     dropped: Arc<dyn Fn() -> u64 + Send + Sync>,
     telem: Telemetry,
     cancel: CancellationToken,
+    max_webview_mem_mb: u64,
 ) {
     let mut tick = interval(Duration::from_secs(period_s.clamp(10, 3600)));
+    let mut mem_cap = kiosk_core::memory::MemCap::default();
     // A heartbeat wants a steady cadence, not catch-up: after a suspend/resume or
     // runtime stall, fire one tick and resync rather than bursting every missed one.
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -41,6 +43,9 @@ pub async fn run(
             _ = tick.tick() => {
                 let s = kiosk_core::metrics::sample(&mut sys, &mut disks, &data_dir, started);
                 telem.health(kiosk_core::metrics::to_fields(&s, dropped()));
+                if mem_cap.observe(s.webview_rss_mb, max_webview_mem_mb) {
+                    std::process::exit(80);
+                }
             }
         }
     }
@@ -63,6 +68,7 @@ mod tests {
             Arc::new(|| 0),
             Telemetry::disabled(),
             cancel,
+            0,
         );
         tokio::time::timeout(Duration::from_secs(1), task)
             .await

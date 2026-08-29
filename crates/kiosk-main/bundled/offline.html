@@ -12,6 +12,8 @@
         overflow: hidden;
       }
       video {
+        position: absolute;
+        inset: 0;
         width: 100%;
         height: 100%;
         object-fit: cover;
@@ -23,11 +25,18 @@
          §3.4), served by kiosk-main's `kioskasset` custom URI scheme (NOT embedded in
          this bundle). Windows origin form: http://<scheme>.localhost/<path>. -->
     <video
-      loop
+      id="offline-video"
+      preload="auto"
       autoplay
       muted
       playsinline
-      src="http://kioskasset.localhost/kiosk-offline.mp4"
+    ></video>
+    <video
+      id="offline-video-next"
+      preload="auto"
+      muted
+      playsinline
+      style="display: none"
     ></video>
     <script>
       // arch-09 decode-failure robustness (spec §3.4): a corrupt/incompatible codec, a
@@ -35,37 +44,135 @@
       // splash — this page's own black background — never a hung/frozen frame. The
       // <video> is simply hidden; the body stays black.
       (function () {
-        var v = document.querySelector("video");
+        var front = document.getElementById("offline-video");
+        var back = document.getElementById("offline-video-next");
         var degraded = false;
-        function fallback(why) {
+        var ticks = 0;
+        var lastT = 0;
+        var wrapAt = 0;
+        var misses = 0;
+        var backReady = false;
+
+        function report(kind, at, msSinceWrap) {
+          try {
+            var internals = window.__TAURI_INTERNALS__;
+            if (internals && typeof internals.invoke === "function") {
+              internals.invoke("media_error", {
+                kind: kind,
+                at: typeof at === "number" ? at : 0,
+                msSinceWrap:
+                  typeof msSinceWrap === "number" ? msSinceWrap : null,
+              });
+            }
+          } catch (_) {
+            // Telemetry is observation only; the black fallback must still win.
+          }
+        }
+
+        function fallback(kind, at, msSinceWrap) {
           if (degraded) return;
           degraded = true;
-          v.style.display = "none";
-          // Durable media.error telemetry from the page needs an IPC command bridge
-          // (not wired in D2a — app-origin pages get no custom IPC yet); the console
-          // marker is the honest minimal signal until that lands.
-          console.error("media.error:", why);
+          front.style.display = "none";
+          back.style.display = "none";
+          report(kind, at, msSinceWrap);
+          console.error("media.error:", kind);
         }
-        v.addEventListener("error", function () {
-          fallback("video error event");
-        });
-        v.addEventListener("stalled", function () {
-          fallback("video stalled");
-        });
-        v.addEventListener("emptied", function () {
-          fallback("video emptied");
-        });
-        // Autoplay policy is satisfied by muted+playsinline, but honor the rejection.
-        var p = v.play();
-        if (p && typeof p.catch === "function") {
-          p.catch(function (e) {
-            fallback("play() rejected: " + e);
+
+        function watch(video) {
+          video.addEventListener("error", function () {
+            fallback("error", video.currentTime, Date.now() - wrapAt);
+          });
+          video.addEventListener("stalled", function () {
+            fallback("stalled", video.currentTime, Date.now() - wrapAt);
+          });
+          video.addEventListener("emptied", function () {
+            fallback("emptied", video.currentTime, Date.now() - wrapAt);
+          });
+          video.addEventListener("canplaythrough", function () {
+            if (video === back) backReady = true;
+          });
+          video.addEventListener("ended", advance);
+          video.addEventListener("timeupdate", function () {
+            if (video !== front || degraded) return;
+            if (video.currentTime < lastT) wrapAt = Date.now();
+            lastT = video.currentTime;
+            ticks++;
+            if (
+              video.duration > 0 &&
+              video.currentTime >= video.duration - 0.25 &&
+              !backReady
+            ) {
+              fallback("stall", video.currentTime, Date.now() - wrapAt);
+            }
           });
         }
-        // Watchdog: currentTime must advance within 3 s of load, else assume no decode.
+
+        function advance() {
+          if (degraded) return;
+          if (!backReady) {
+            fallback("stall", front.currentTime, Date.now() - wrapAt);
+            return;
+          }
+          var oldFront = front;
+          front = back;
+          back = oldFront;
+          front.style.display = "block";
+          back.style.display = "none";
+          back.pause();
+          backReady = false;
+          back.load();
+          var p = front.play();
+          if (p && typeof p.catch === "function") {
+            p.catch(function () {
+              fallback("play_rejected", front.currentTime, Date.now() - wrapAt);
+            });
+          }
+        }
+
+        watch(front);
+        watch(back);
+        // The asset origin differs per platform (`http://kioskasset.localhost` on
+        // Windows, `kioskasset://localhost` on Linux/WebKitGTK). Chosen page-locally
+        // from the origin this page itself was served from — no serve-time templating.
+        var source =
+          location.protocol === "tauri:"
+            ? "kioskasset://localhost/kiosk-offline.mp4"
+            : "http://kioskasset.localhost/kiosk-offline.mp4";
+        front.src = source;
+        back.src = source;
+        back.load();
+
+        // Autoplay policy is satisfied by muted+playsinline, but honor the rejection.
+        var p = front.play();
+        if (p && typeof p.catch === "function") {
+          p.catch(function () {
+            fallback("play_rejected", front.currentTime, Date.now() - wrapAt);
+          });
+        }
+
+        // Startup watchdog: a page that never emits engine activity is not healthy.
         setTimeout(function () {
-          if (!degraded && v.currentTime === 0) fallback("no playback progress in 3s");
+          if (!degraded && ticks === 0) {
+            fallback("no_progress", front.currentTime, Date.now() - wrapAt);
+          }
         }, 3000);
+
+        // Loop watchdog: count engine activity, not currentTime samples. This catches
+        // the WebKit loop-boundary stall even when currentTime is repeatedly 0.0.
+        setInterval(function () {
+          if (degraded || front.paused) {
+            misses = 0;
+            return;
+          }
+          if (ticks > 0) {
+            ticks = 0;
+            misses = 0;
+            return;
+          }
+          if (++misses >= 2) {
+            fallback("stall", front.currentTime, Date.now() - wrapAt);
+          }
+        }, 5000);
       })();
     </script>
   </body>

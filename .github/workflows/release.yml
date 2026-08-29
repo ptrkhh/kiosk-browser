@@ -1,0 +1,151 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Run every gate without creating a release
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  issues: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-22.04
+    outputs:
+      dry_run: ${{ inputs.dry_run || false }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require a fresh green endurance run on an ancestor
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          runs="$(gh run list --workflow=endurance.yml --branch=main --status=success --limit=1 \
+            --json databaseId,headSha,createdAt,conclusion)"
+          head_sha="$(printf '%s' "$runs" | jq -r '.[0].headSha // empty')"
+          created="$(printf '%s' "$runs" | jq -r '.[0].createdAt // empty')"
+          run_id="$(printf '%s' "$runs" | jq -r '.[0].databaseId // empty')"
+          test -n "$head_sha" -a -n "$created" -a -n "$run_id"
+          tag_sha="$GITHUB_SHA"
+          git merge-base --is-ancestor "$head_sha" "$tag_sha"
+          created_epoch="$(date -d "$created" +%s)"
+          now_epoch="$(date +%s)"
+          test "$((now_epoch - created_epoch))" -le 604800
+          w2_dir="$RUNNER_TEMP/windows-w2"
+          mkdir -p "$w2_dir"
+          gh run download "$run_id" --name "windows-w2-$head_sha" --dir "$w2_dir"
+          floor_file="$(find "$w2_dir" -type f -name 'w2-floor.json' -print -quit)"
+          test -n "$floor_file"
+          bash packaging/soak/check-w2-floor.sh "$floor_file"
+      - name: Refuse an empty configured production key
+        run: test -n "${{ vars.KIOSK_CONFIG_PUBKEY_B64 }}"
+
+  build:
+    needs: gate
+    uses: ./.github/workflows/build.yml
+    with:
+      pubkey_b64: ${{ vars.KIOSK_CONFIG_PUBKEY_B64 }}
+
+  build-deb:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev lintian cage
+      - uses: actions/download-artifact@v4
+        with:
+          name: kiosk-linux-x86_64-${{ github.sha }}
+          path: artifacts/linux
+      - name: Stage release binaries
+        run: |
+          mkdir -p target/release
+          cp artifacts/linux/kiosk-main target/release/
+          cp artifacts/linux/kiosk-launcher target/release/
+          chmod +x target/release/kiosk-main target/release/kiosk-launcher
+      - name: Assemble package in the declared order
+        run: packaging/linux/build-deb.sh "$GITHUB_WORKSPACE/kiosk_0.1.0_amd64.deb"
+      - name: Lint package
+        run: lintian --fail-on error kiosk_0.1.0_amd64.deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kiosk-deb-${{ github.sha }}
+          path: kiosk_0.1.0_amd64.deb
+          if-no-files-found: error
+
+  windows-sign:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: kiosk-windows-${{ github.sha }}
+          path: artifacts/windows
+      - name: Require signing inputs
+        shell: pwsh
+        env:
+          KIOSK_SIGNING_PFX_B64: ${{ secrets.KIOSK_SIGNING_PFX_B64 }}
+          KIOSK_SIGNING_PFX_PASSWORD: ${{ secrets.KIOSK_SIGNING_PFX_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:KIOSK_SIGNING_PFX_B64)) {
+            throw "KIOSK_SIGNING_PFX_B64 is required; unsigned Windows artifacts are never published"
+          }
+          if ([string]::IsNullOrWhiteSpace($env:KIOSK_SIGNING_PFX_PASSWORD)) {
+            throw "KIOSK_SIGNING_PFX_PASSWORD is required"
+          }
+      - name: Sign binaries
+        shell: pwsh
+        env:
+          KIOSK_SIGNING_PFX_B64: ${{ secrets.KIOSK_SIGNING_PFX_B64 }}
+          KIOSK_SIGNING_PFX_PASSWORD: ${{ secrets.KIOSK_SIGNING_PFX_PASSWORD }}
+          KIOSK_SIGNING_TIMESTAMP_URL: ${{ secrets.KIOSK_SIGNING_TIMESTAMP_URL }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP "kiosk-signing.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:KIOSK_SIGNING_PFX_B64))
+          $targets = @(Get-ChildItem artifacts/windows -Recurse -File | Where-Object Name -in @("kiosk-main.exe", "kiosk-launcher.exe"))
+          if ($targets.Count -ne 2) { throw "expected exactly two Windows binaries" }
+          & .\packaging\windows\sign.ps1 -Stage Binaries -Path $targets.FullName -TimestampUrl $env:KIOSK_SIGNING_TIMESTAMP_URL -PfxPath $pfx
+          Remove-Item -Force $pfx
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kiosk-windows-signed-${{ github.sha }}
+          path: artifacts/windows
+          if-no-files-found: error
+
+  publish:
+    if: always()
+    needs: [gate, build-deb, windows-sign]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: kiosk-deb-${{ github.sha }}
+          path: release
+      - name: Record absent Windows set or publish it
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ needs.windows-sign.result }}" != success ]; then
+            echo "Windows artifact set absent: signing job did not produce a verified set."
+            exit 0
+          fi
+          if [ "${{ inputs.dry_run || false }}" = true ]; then
+            echo "dry_run: all gates passed; release creation skipped"
+            exit 0
+          fi
+          gh release create "$GITHUB_REF_NAME" release/kiosk_0.1.0_amd64.deb \
+            --draft --title "$GITHUB_REF_NAME" --generate-notes

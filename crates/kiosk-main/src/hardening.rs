@@ -36,7 +36,7 @@
 //! `beforeunload`->leave-the-page) — belt (flag off) and suspenders (handler always
 //! resolves synchronously) agree. The parts of the brief's Step 3 that assumed a visible
 //! dialog to suppress or be lenient about are moot while the flag stays false; see the
-//! per-branch comment and task-5-report.md "Descoped (with reason)".
+//! per-branch comment and the hardware validation checklist.
 
 use crate::nav_policy::{PermissionKind, SharedNavPolicy};
 use crate::telemetry::Telemetry;
@@ -53,14 +53,12 @@ pub fn apply(
 
 #[cfg(not(windows))]
 pub fn apply(
-    _window: &tauri::WebviewWindow,
-    _nav_policy: SharedNavPolicy,
-    _zoom: f64,
-    _telem: Telemetry,
+    window: &tauri::WebviewWindow,
+    nav_policy: SharedNavPolicy,
+    zoom: f64,
+    telem: Telemetry,
 ) {
-    eprintln!(
-        "hardening: only implemented on Windows; settings flags/script-dialog/permission policy will never apply"
-    );
+    linux_impl::apply(window, nav_policy, zoom, telem);
 }
 
 /// Maps a WebView2 `COREWEBVIEW2_PERMISSION_KIND` (via its raw `i32`, so this stays
@@ -69,6 +67,7 @@ pub fn apply(
 /// value this crate does not explicitly recognize (autoplay, file-read-write,
 /// local-fonts, MIDI-sysex, window-management, or a genuinely unknown future value)
 /// falls into `Other`, which `permission_allowed` always denies.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn classify_permission_kind(raw: i32) -> PermissionKind {
     // Values pinned against webview2-com-sys 0.38.2's `COREWEBVIEW2_PERMISSION_KIND_*`
     // constants (bindings.rs:571-597) rather than depending on the `windows`-generated
@@ -81,6 +80,22 @@ fn classify_permission_kind(raw: i32) -> PermissionKind {
         4 => PermissionKind::Notifications,
         6 => PermissionKind::ClipboardRead,
         _ => PermissionKind::Other,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Deny,
+    Kind(PermissionKind),
+    Both,
+}
+
+fn classify_user_media(audio: bool, video: bool) -> Verdict {
+    match (audio, video) {
+        (false, false) => Verdict::Deny,
+        (true, false) => Verdict::Kind(PermissionKind::Microphone),
+        (false, true) => Verdict::Kind(PermissionKind::Camera),
+        (true, true) => Verdict::Both,
     }
 }
 
@@ -278,7 +293,7 @@ mod windows_impl {
                     //   * app-origin-vs-remote (`is_remote_origin`) leniency — there is
                     //     no leniency to grant when nothing is shown. `args.Uri()` is
                     //     therefore deliberately not read.
-                    // See task-5-report.md "Descoped (with reason)".
+                    // See the hardware validation checklist for the remaining floor work.
                     //
                     // ponytail: this counter is a NO-OP today (both branches dismiss
                     // identically; it has no JS-observable effect). Kept — not deleted —
@@ -334,6 +349,121 @@ mod windows_impl {
     }
 }
 
+#[cfg(not(windows))]
+mod linux_impl {
+    //! Linux/WebKitGTK hardening is installed on the GTK main thread. The signal
+    //! return values below are intentionally the WebKit convention: returning
+    //! `true` stops the default handler. The exact suppression semantics and the
+    //! meaning of `confirm_set_confirmed(true)` for BeforeUnload are pinned by the
+    //! Linux smoke scenarios; the generated bindings expose signatures, not the
+    //! default-handler prose.
+
+    use webkit2gtk::glib::prelude::Cast;
+    use webkit2gtk::{
+        PermissionRequestExt, SettingsExt, UserMediaPermissionRequestExt, WebViewExt,
+    };
+
+    use super::{classify_user_media, Verdict};
+    use crate::nav_policy::{permission_allowed, PermissionKind, SharedNavPolicy};
+    use crate::telemetry::Telemetry;
+
+    pub fn apply(
+        window: &tauri::WebviewWindow,
+        nav_policy: SharedNavPolicy,
+        zoom: f64,
+        telem: Telemetry,
+    ) {
+        let result = window.with_webview(move |platform_webview| {
+            let webview = platform_webview.inner();
+
+            if let Some(settings) = webview.settings() {
+                settings.set_enable_developer_extras(false);
+                settings.set_zoom_text_only(false);
+            } else {
+                telem.config_warn(
+                    "hardening.settings",
+                    "WebKitGTK settings object unavailable; developer extras and zoom mode were not changed",
+                );
+            }
+            webview.set_zoom_level(zoom);
+
+            // Returning true consumes the context-menu signal, so no GTK/WebKit
+            // context menu (and consequently no inspect/copy/download chrome) is
+            // offered by the page.
+            webview.connect_context_menu(|_, _, _, _| true);
+
+            // WebKit has no Windows-style default-dialog setting. Close every
+            // ordinary dialog and explicitly accept BeforeUnload so navigation
+            // leaves the page without surfacing native chrome.
+            webview.connect_script_dialog(|_, dialog| {
+                if matches!(
+                    dialog.dialog_type(),
+                    webkit2gtk::ScriptDialogType::BeforeUnloadConfirm
+                ) {
+                    dialog.confirm_set_confirmed(true);
+                } else {
+                    dialog.close();
+                }
+                true
+            });
+
+            // B14: the print signal is the only native print entry point exposed by
+            // this WebKitGTK version. Consuming it denies the operation.
+            webview.connect_print(|_, _| true);
+
+            let policy = nav_policy.clone();
+            webview.connect_permission_request(move |_, request| {
+                let verdict = if request
+                    .downcast_ref::<webkit2gtk::GeolocationPermissionRequest>()
+                    .is_some()
+                {
+                    Verdict::Kind(PermissionKind::Geolocation)
+                } else if request
+                    .downcast_ref::<webkit2gtk::NotificationPermissionRequest>()
+                    .is_some()
+                {
+                    Verdict::Kind(PermissionKind::Notifications)
+                } else if let Some(media) = request
+                    .downcast_ref::<webkit2gtk::UserMediaPermissionRequest>()
+                {
+                    classify_user_media(
+                        media.is_for_audio_device(),
+                        media.is_for_video_device(),
+                    )
+                } else {
+                    // Clipboard and every future/unknown WebKit request are
+                    // deliberately not guessed from a runtime class name.
+                    Verdict::Deny
+                };
+
+                let allowed = match verdict {
+                    Verdict::Deny => false,
+                    Verdict::Kind(kind) => permission_allowed(kind, policy.load().permissions()),
+                    Verdict::Both => {
+                        let permissions = policy.load();
+                        permission_allowed(PermissionKind::Camera, permissions.permissions())
+                            && permission_allowed(
+                                PermissionKind::Microphone,
+                                permissions.permissions(),
+                            )
+                    }
+                };
+                if allowed {
+                    request.allow();
+                } else {
+                    request.deny();
+                }
+                true
+            });
+        });
+        if let Err(e) = result {
+            eprintln!(
+                "hardening: with_webview failed, Linux settings/dialog/permission policy will never apply: {e}"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,5 +497,27 @@ mod tests {
                 ..Permissions::default()
             }
         ));
+    }
+
+    #[test]
+    fn user_media_with_neither_flag_denies_outright() {
+        assert_eq!(classify_user_media(false, false), Verdict::Deny);
+    }
+
+    #[test]
+    fn audio_only_is_microphone_and_video_only_is_camera() {
+        assert_eq!(
+            classify_user_media(true, false),
+            Verdict::Kind(PermissionKind::Microphone)
+        );
+        assert_eq!(
+            classify_user_media(false, true),
+            Verdict::Kind(PermissionKind::Camera)
+        );
+    }
+
+    #[test]
+    fn audio_and_video_requires_both_permissions() {
+        assert_eq!(classify_user_media(true, true), Verdict::Both);
     }
 }

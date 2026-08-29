@@ -173,12 +173,10 @@ impl GclClient {
 
             // Harvest the Date from EVERY response - success or failure - before
             // any branch can return (TEL-01).
-            let response = match response {
-                Ok(r) => {
-                    self.harvest_date(&r);
-                    r
-                }
-                Err(e) => return Err(e.into()),
+            let response = {
+                let r = response?;
+                self.harvest_date(&r);
+                r
             };
 
             if (200..300).contains(&response.status) {

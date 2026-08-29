@@ -1,0 +1,29 @@
+<!doctype html>
+<html>
+  <body>
+    <p>permissions probe</p>
+    <script>
+      function probe(value) {
+        fetch('/probe?permission=' + value).catch(function () {});
+      }
+      if (navigator.geolocation) {
+        navigator.geolocation.getCurrentPosition(
+          function () { probe('geolocation-allowed'); },
+          function (error) { probe('geolocation-' + (error.code || error.name || 'denied')); }
+        );
+      } else {
+        probe('geolocation-unavailable');
+      }
+      if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+        navigator.mediaDevices.getUserMedia({ video: true, audio: false }).then(function (stream) {
+          stream.getTracks().forEach(function (track) { track.stop(); });
+          probe('camera-allowed');
+        }).catch(function (error) {
+          probe('camera-' + (error.name || 'denied'));
+        });
+      } else {
+        probe('camera-unavailable');
+      }
+    </script>
+  </body>
+</html>

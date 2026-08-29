@@ -27,8 +27,9 @@ pub fn is_violation(check: io::Result<bool>) -> bool {
 
 /// `Ok(true)` iff the file's DACL grants read to nobody but its owner or
 /// SYSTEM; `Ok(false)` if some other SID can read it; `Err` if the security
-/// info could not be read at all. Non-Windows dev hosts (the kiosk target is
-/// Windows x64 only) stub this to `Ok(true)` — there is no DACL to check.
+/// info could not be read at all. Windows reads the DACL for this judgment;
+/// Unix reads the file's mode bits (see the `#[cfg(unix)]` twin below) —
+/// both feed the same [`is_violation`] gate.
 #[cfg(windows)]
 pub fn credential_is_owner_only(path: &Path) -> io::Result<bool> {
     use std::os::windows::ffi::OsStrExt;
@@ -97,10 +98,17 @@ pub fn credential_is_owner_only(path: &Path) -> io::Result<bool> {
     ))
 }
 
-/// Non-Windows stub (dev hosts only; the kiosk target is Windows x64).
-#[cfg(not(windows))]
-pub fn credential_is_owner_only(_path: &Path) -> io::Result<bool> {
-    Ok(true)
+/// SEC-09 on Unix: the credential must not be group- or world-accessible. Mode bits
+/// only, no uid check — a root-owned `0o600` file is the deployment shape (P2-G G16).
+///
+/// ponytail: mode bits only; add an owner check if a non-root service user lands.
+///
+/// A missing or unreadable file yields `Err`, which `is_violation` already treats as a
+/// violation — fail-closed, exactly as on Windows.
+#[cfg(unix)]
+pub fn credential_is_owner_only(path: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::PermissionsExt;
+    Ok(std::fs::metadata(path)?.permissions().mode() & 0o077 == 0)
 }
 
 /// Frees the security descriptor `GetNamedSecurityInfoW` allocated, on every
@@ -211,7 +219,10 @@ fn read_grantee_sids(dacl: *const windows::Win32::Security::ACL) -> io::Result<V
 fn mask_grants_read(mask: u32) -> bool {
     use windows::Win32::Foundation::GENERIC_READ;
     use windows::Win32::Security::{MapGenericMask, GENERIC_MAPPING};
-    use windows::Win32::Storage::FileSystem::{FILE_ALL_ACCESS, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_GENERIC_EXECUTE, FILE_READ_DATA};
+    use windows::Win32::Storage::FileSystem::{
+        FILE_ALL_ACCESS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        FILE_READ_DATA,
+    };
 
     let mut mapped = mask;
     let mapping = GENERIC_MAPPING {
@@ -226,7 +237,8 @@ fn mask_grants_read(mask: u32) -> bool {
     unsafe { MapGenericMask(&mut mapped, &mapping) };
 
     const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
-    const READ_BITS: u32 = FILE_GENERIC_READ.0 | GENERIC_READ.0 | FILE_READ_DATA.0 | MAXIMUM_ALLOWED;
+    const READ_BITS: u32 =
+        FILE_GENERIC_READ.0 | GENERIC_READ.0 | FILE_READ_DATA.0 | MAXIMUM_ALLOWED;
     mapped & READ_BITS != 0
 }
 
@@ -280,6 +292,56 @@ mod is_violation_tests {
     #[test]
     fn err_is_a_violation() {
         assert!(is_violation(Err(io::Error::other("access denied"))));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_mode_tests {
+    use super::credential_is_owner_only;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn write_with_mode(name: &str, mode: u32) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(name);
+        std::fs::write(&path, b"{}").expect("fixture write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+            .expect("fixture chmod");
+        path
+    }
+
+    #[test]
+    fn owner_only_0600_passes() {
+        let p = write_with_mode("kiosk-acl-0600.json", 0o600);
+        assert!(credential_is_owner_only(&p).unwrap());
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn group_or_world_readable_fails() {
+        for (name, mode) in [
+            ("kiosk-acl-0640.json", 0o640),
+            ("kiosk-acl-0604.json", 0o604),
+            ("kiosk-acl-0666.json", 0o666),
+        ] {
+            let p = write_with_mode(name, mode);
+            assert!(!credential_is_owner_only(&p).unwrap(), "mode {mode:o}");
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// A missing file is an `Err`, which `is_violation` already treats as a violation —
+    /// fail-closed comes free, exactly as on Windows.
+    #[test]
+    fn a_missing_file_is_an_error_not_a_pass() {
+        let p = std::env::temp_dir().join("kiosk-acl-does-not-exist.json");
+        let _ = std::fs::remove_file(&p);
+        assert!(credential_is_owner_only(&p).is_err());
+    }
+
+    #[test]
+    fn the_error_is_a_violation() {
+        let p = std::env::temp_dir().join("kiosk-acl-missing-2.json");
+        let _ = std::fs::remove_file(&p);
+        assert!(super::is_violation(credential_is_owner_only(&p)));
     }
 }
 
@@ -537,8 +599,7 @@ mod tests {
 #[cfg(all(test, windows))]
 mod drift_guard_tests {
     const THIS_FILE: &str = include_str!("credential_acl.rs");
-    const LAUNCHER_FILE: &str =
-        include_str!("../../kiosk-launcher/src/credential_acl.rs");
+    const LAUNCHER_FILE: &str = include_str!("../../kiosk-launcher/src/credential_acl.rs");
 
     /// Extracts `fn {name}`'s source, from the `fn` keyword through its
     /// matching closing brace (by simple brace counting — good enough for
@@ -581,7 +642,11 @@ mod drift_guard_tests {
 
     #[test]
     fn shared_functions_match_the_launcher_crates_copy() {
-        for name in ["credential_is_owner_only", "read_grantee_sids", "mask_grants_read"] {
+        for name in [
+            "credential_is_owner_only",
+            "read_grantee_sids",
+            "mask_grants_read",
+        ] {
             let mine = extract_fn(THIS_FILE, name);
             let theirs = extract_fn(LAUNCHER_FILE, name);
             assert_eq!(

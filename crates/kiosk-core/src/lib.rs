@@ -11,6 +11,7 @@ pub mod identity;
 pub mod ipc;
 pub mod logging;
 pub mod maintenance;
+pub mod memory;
 pub mod metrics;
 pub mod nav;
 pub mod net;

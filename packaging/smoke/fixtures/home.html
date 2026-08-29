@@ -1,0 +1,55 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>SMOKE HOME</title>
+  </head>
+  <body style="font-family: sans-serif; font-size: 22px;">
+    <p>SMOKE HOME — self-driving nav-guard probe.</p>
+    <p id="status">step: boot</p>
+    <a id="off-link" href="http://evil.test/should-be-blocked">off-allowlist link</a><br />
+    <a id="blank-allow-link" href="http://localhost:8099/allowed-target.html" target="_blank" rel="noopener">target=_blank, in-allowlist</a><br />
+    <a id="blank-block-link" href="http://evil.test/blank-blocked" target="_blank" rel="noopener">target=_blank, off-allowlist</a>
+    <script>
+      // This container has no real input devices (no /dev/input): a hardware click
+      // cannot be synthesized (confirmed empirically -- see the smoke README). A
+      // real top-level navigation attempt does NOT require a user gesture in
+      // WebKit, so this script drives it for real via `.click()` on the anchors --
+      // that is a genuine decide-policy navigation request, not a simulation of the
+      // guard's own logic. `target=_blank`/window.open() DOES require a trusted
+      // user gesture WebKit's own popup policy checks for before it ever raises the
+      // "create" signal our code sees -- a script-dispatched click cannot supply
+      // one (isTrusted is always false for a script-dispatched event), so those two
+      // steps are still attempted and their real, honest outcome (a silent no-op,
+      // observed from outside via the fixture httpd's access log and the spool)
+      // is exactly the evidence recorded in the smoke README's input note.
+      var status = document.getElementById('status');
+      function step(n, label, fn) {
+        setTimeout(function () {
+          status.textContent = 'step: ' + n + ' ' + label;
+          document.title = 'SMOKE HOME step ' + n;
+          fn();
+        }, n * 2000);
+      }
+      if (location.search.indexOf('probe=reload') !== -1) {
+        // Scenario 3 (offline fallback): the harness stops the fixture httpd, then
+        // relies on this self-reload to drive a genuine top-level navigation that
+        // will fail to connect -- exercising the real load-failed path, not a
+        // simulated one.
+        step(1, 'self-reload', function () {
+          location.reload();
+        });
+      } else {
+        step(1, 'off-list-block', function () {
+          document.getElementById('off-link').click();
+        });
+        step(2, 'blank-allow-attempt', function () {
+          document.getElementById('blank-allow-link').click();
+        });
+        step(3, 'blank-block-attempt', function () {
+          document.getElementById('blank-block-link').click();
+        });
+      }
+    </script>
+  </body>
+</html>

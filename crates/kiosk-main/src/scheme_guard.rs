@@ -43,7 +43,7 @@ pub fn pdf_decision(content_type: &str, pdf_view: bool) -> bool {
 /// module owns that have no `kiosk_core::nav::BlockReason` variant (out of scope to
 /// add one — see task brief). `scheme_not_allowed` (the external-scheme block) DOES
 /// have a variant (`BlockReason::SchemeNotAllowed`) and is reused directly instead.
-const REASON_DOWNLOAD: &str = "download";
+pub(crate) const REASON_DOWNLOAD: &str = "download";
 // ponytail: not read from any COM callsite yet — see the module doc comment's PDF
 // section. Pinned by a test below so a future wiring can't drift from the plan's
 // `"pdf"` literal.
@@ -55,11 +55,41 @@ pub fn install(window: &tauri::WebviewWindow, telem: Telemetry, nav_policy: Shar
     windows_impl::install(window, telem, nav_policy);
 }
 
+/// Linux has no separate external-scheme signal in wry. The builder's navigation
+/// callback calls [`navigation_block_reason`] for the hostless/cannot-be-a-base
+/// schemes that the normal URLPattern matcher intentionally does not classify as
+/// remote. Downloads are denied by that same builder hook; this install function is
+/// therefore a Windows-only native-signal entry point.
 #[cfg(not(windows))]
-pub fn install(_window: &tauri::WebviewWindow, _telem: Telemetry, _nav_policy: SharedNavPolicy) {
-    eprintln!(
-        "scheme_guard: only implemented on Windows; external schemes/downloads will never be blocked"
-    );
+pub fn install(_window: &tauri::WebviewWindow, _telem: Telemetry, _nav_policy: SharedNavPolicy) {}
+
+/// Returns the block reason for an external navigation that is outside the normal
+/// host-bearing URLPattern decision. Bundled/local schemes are explicitly allowed;
+/// every other non-network scheme must be present in the operator's scheme allowlist.
+pub fn navigation_block_reason(
+    url: &str,
+    allow: &[String],
+) -> Option<kiosk_core::nav::BlockReason> {
+    let scheme = url.split(':').next().unwrap_or_default();
+    if scheme.is_empty()
+        || matches!(
+            scheme.to_ascii_lowercase().as_str(),
+            "http"
+                | "https"
+                | "ws"
+                | "wss"
+                | "tauri"
+                | "kioskasset"
+                | "ipc"
+                | "about"
+                | "data"
+                | "blob"
+        )
+        || scheme_allowed(scheme, allow)
+    {
+        return None;
+    }
+    Some(kiosk_core::nav::BlockReason::SchemeNotAllowed)
 }
 
 #[cfg(windows)]
@@ -182,7 +212,8 @@ mod windows_impl {
 
 #[cfg(test)]
 mod tests {
-    use super::{pdf_decision, scheme_allowed};
+    use super::{navigation_block_reason, pdf_decision, scheme_allowed};
+    use kiosk_core::nav::BlockReason;
 
     #[test]
     fn unlisted_scheme_is_blocked() {
@@ -198,6 +229,30 @@ mod tests {
     fn scheme_allowlist_membership_is_ascii_case_insensitive() {
         assert!(scheme_allowed("TEL", &["tel".to_string()]));
         assert!(scheme_allowed("tel", &["TEL".to_string()]));
+    }
+
+    #[test]
+    fn hostless_external_navigation_is_denied_by_default() {
+        assert_eq!(
+            navigation_block_reason("mailto:operator@example.test", &[]),
+            Some(BlockReason::SchemeNotAllowed)
+        );
+        assert_eq!(
+            navigation_block_reason("tel:+12025550123", &[]),
+            Some(BlockReason::SchemeNotAllowed)
+        );
+    }
+
+    #[test]
+    fn local_and_explicitly_allowlisted_schemes_are_not_blocked() {
+        assert_eq!(
+            navigation_block_reason("tauri://localhost/safe.html", &[]),
+            None
+        );
+        assert_eq!(
+            navigation_block_reason("tel:+12025550123", &["tel".to_string()]),
+            None
+        );
     }
 
     #[test]

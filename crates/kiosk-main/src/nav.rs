@@ -43,6 +43,16 @@ fn feeds_fsm(url: &str) -> bool {
     crate::nav_policy::is_remote_origin(url)
 }
 
+/// The `is_main_frame` argument Linux's builder line (`main.rs`) always passes to
+/// [`should_block`] — WebKitGTK's `decide-policy`/`NavigationAction` gives no main-frame/
+/// sub-frame distinction at the level wry exposes (`Fn(&Url) -> bool`, no frame info), so
+/// Linux makes a deliberate choice instead of inheriting Windows' distinction: enforce the
+/// guard on EVERY frame. Naming it here, once, means `main.rs`'s call site and this module's
+/// own regression test both read the same value rather than each hardcoding `true`
+/// independently — so a future edit that changes the decision necessarily changes both at
+/// once, and the test cannot silently stay green through a flip.
+pub(crate) const ENFORCE_ALL_FRAMES: bool = true;
+
 /// The pure classification behind the P1-D2b navigation guard (spec §3.6): should this
 /// navigation be cancelled? `None` (allow) when `is_main_frame` is `false` — sub-resource
 /// (iframe/subresource) navigations are Task 4's separate egress boundary, never this
@@ -53,7 +63,17 @@ fn feeds_fsm(url: &str) -> bool {
 /// remote-content allowlist and could self-block) — or when
 /// [`NavPolicy::decision_for`] allows it; `Some(reason)` otherwise. Never reimplements
 /// the matcher: every verdict is `decide`'s, reached only through `decision_for`.
-fn should_block(policy: &NavPolicy, url: &str, is_main_frame: bool) -> Option<BlockReason> {
+///
+/// That `is_main_frame == false` carve-out is a Windows-only escape in practice: Linux's
+/// caller (`main.rs`'s builder line) always passes [`ENFORCE_ALL_FRAMES`] (`true`), so on
+/// Linux every frame — sub-frames included — is covered here as the navigation-policy
+/// fallback; the WebKit content filter in `egress.rs` independently enforces resource
+/// egress for the same signed origin set.
+pub(crate) fn should_block(
+    policy: &NavPolicy,
+    url: &str,
+    is_main_frame: bool,
+) -> Option<BlockReason> {
     if !is_main_frame || !crate::nav_policy::is_remote_origin(url) {
         return None;
     }
@@ -87,13 +107,13 @@ pub fn install(
 
 #[cfg(not(windows))]
 pub fn install(
-    _window: &tauri::WebviewWindow,
-    _tx: mpsc::Sender<AppEvent>,
-    _telem: Telemetry,
-    _nav_policy: SharedNavPolicy,
-    _ready: std::sync::Arc<tokio::sync::Notify>,
+    window: &tauri::WebviewWindow,
+    tx: mpsc::Sender<AppEvent>,
+    telem: Telemetry,
+    nav_policy: SharedNavPolicy,
+    ready: std::sync::Arc<tokio::sync::Notify>,
 ) {
-    eprintln!("nav: only implemented on Windows; NavigationCommitted/Failed will never fire");
+    linux_impl::install(window, tx, telem, nav_policy, ready);
 }
 
 #[cfg(windows)]
@@ -276,9 +296,177 @@ mod windows_impl {
     }
 }
 
+/// Load-lifecycle detection (spec "`nav.rs` — load lifecycle"): outcome-only, mirrors
+/// `windows_impl`'s `NavigationStarting`/`NavigationCompleted` mapping onto the same
+/// `AppEvent`/`Telemetry`/ready-pulse surface. Distinct from the nav GUARD (Task 5's
+/// `on_navigation` builder line in `main.rs`) — this module calls [`super::feeds_fsm`],
+/// never [`super::should_block`]; the guard already ran before WebKit ever started this
+/// load.
+///
+/// **Assumption, not derivable from the pinned bindings:** `load-changed`/`load-failed`/
+/// `load-failed-with-tls-errors` are `WebKitWebView`-level signals that track the **main
+/// frame's** load only, so a sub-frame's (iframe's) load never fires them —
+/// `webkit2gtk-2.0.2`'s bindings (`web_view.rs:2287,2316,2355`) give signatures only, no
+/// doc text confirming frame scope. The failure latch depends on this holding.
+///
+/// Measured on WebKitGTK 2.52.3 by disabling [`is_policy_cancellation`] (forcing it to
+/// `false`) and re-running smoke scenarios 2 and 5: **both stayed green with
+/// `nav.error == 0`**. So a navigation this guard cancels — sub-frame (scenario 5) *and*
+/// main-frame (scenario 2) alike — raises no `load-failed` on the WebView at all. Two
+/// consequences worth stating plainly, because the obvious readings are both wrong:
+///
+/// * Scenario 5 does **not** pin the frame-scope assumption. It passes identically with
+///   the filter removed, so "no `nav.error` from the blocked iframe" is equally
+///   consistent with "the signal fired and was filtered". It is evidence that nothing
+///   reaches the WebView, not evidence about which frame it would have come from.
+/// * [`is_policy_cancellation`] is therefore currently **defensive, not load-bearing**:
+///   nothing in the smoke suite exercises it. Keep it — a `decide-policy` `ignore()` is
+///   documented to be able to surface as `FrameLoadInterruptedByPolicyChange`, and
+///   P2-B's RESPONSE/download decisions raise that same code from a different cause
+///   (see below) — but do not read a green scenario 5 as proof that it works.
+#[cfg(not(windows))]
+mod linux_impl {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use kiosk_core::app::state::Event as AppEvent;
+    use tokio::sync::mpsc;
+    use webkit2gtk::{LoadEvent, PolicyError, WebViewExt};
+
+    use crate::nav_policy::SharedNavPolicy;
+    use crate::telemetry::Telemetry;
+
+    /// A `load-failed` raised by our own guard's cancellation. Dropped statelessly: the
+    /// guard already emitted the single `nav.blocked`, matching Windows'
+    /// one-event-per-blocked-navigation.
+    ///
+    /// **Invariant:** this filter assumes exactly one `navigation_handler` is installed
+    /// and that no RESPONSE or download decision is subscribed. P2-B adds both, and they
+    /// raise the same error code from a different cause — P2-B must re-derive this.
+    fn is_policy_cancellation(err: &webkit2gtk::glib::Error) -> bool {
+        matches!(
+            err.kind::<PolicyError>(),
+            Some(PolicyError::FrameLoadInterruptedByPolicyChange)
+        )
+    }
+
+    pub fn install(
+        window: &tauri::WebviewWindow,
+        tx: mpsc::Sender<AppEvent>,
+        telem: Telemetry,
+        _nav_policy: SharedNavPolicy,
+        ready: std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        let result = window.with_webview(move |platform_webview| {
+            let webview = platform_webview.inner();
+
+            // One latch, GTK-main-thread-only, so `Rc<Cell<..>>` is sufficient.
+            let failed = Rc::new(Cell::new(false));
+            let ready_latch = Rc::new(Cell::new(false));
+
+            let failed_changed = failed.clone();
+            let tx_changed = tx.clone();
+            webview.connect_load_changed(move |wv, event| {
+                match event {
+                    // The only per-load boundary WebKit gives us. Clearing here rather
+                    // than on the suppressed FINISHED is load-bearing: a load-failed with
+                    // no following FINISHED must not arm the latch across navigations,
+                    // which would swallow the next successful load's commit and park the
+                    // kiosk on the offline video with a healthy network.
+                    LoadEvent::Started => failed_changed.set(false),
+                    LoadEvent::Finished => {
+                        if failed_changed.get() {
+                            return;
+                        }
+                        // READY pulses on the first successful load of ANY origin,
+                        // including the bundled offline page: the watchdog asks "is the
+                        // app alive and rendering", not "is the site reachable". Must run
+                        // BEFORE the feeds_fsm filter.
+                        if !ready_latch.replace(true) {
+                            ready.notify_one();
+                        }
+                        // `uri()` is read at signal time and is post-redirect (the Windows
+                        // navId→uri map is pre-redirect); both classify identically for
+                        // `is_remote_origin`, since a redirect cannot cross into our own
+                        // registered schemes. `None` classifies as not-remote — never
+                        // unwrap in a signal handler.
+                        let Some(uri) = wv.uri() else { return };
+                        if !super::feeds_fsm(uri.as_str()) {
+                            return;
+                        }
+                        let _ = tx_changed.try_send(AppEvent::NavigationCommitted);
+                    }
+                    _ => {}
+                }
+            });
+
+            let failed_load = failed.clone();
+            let tx_load = tx.clone();
+            let telem_load = telem.clone();
+            webview.connect_load_failed(move |_wv, _event, failing_uri, err| {
+                if is_policy_cancellation(err) {
+                    // No AppEvent, no telemetry, no latch change.
+                    return true;
+                }
+                failed_load.set(true);
+                // Both the FSM event and the telemetry sit inside the remote-origin
+                // filter, mirroring Windows where `nav_error` sits after the `feeds_fsm`
+                // early return. App-origin load failures stay silent.
+                if super::feeds_fsm(failing_uri) {
+                    telem_load.nav_error(&err.to_string());
+                    let _ = tx_load.try_send(AppEvent::NavigationFailed);
+                }
+                true
+            });
+
+            let failed_tls = failed;
+            let tx_tls = tx;
+            let telem_tls = telem;
+            webview.connect_load_failed_with_tls_errors(move |_wv, failing_uri, _cert, _errors| {
+                failed_tls.set(true);
+                if super::feeds_fsm(failing_uri) {
+                    telem_tls.nav_error("tls_error");
+                    let _ = tx_tls.try_send(AppEvent::NavigationFailed);
+                }
+                true
+            });
+        });
+        if let Err(e) = result {
+            eprintln!("nav: with_webview failed, navigation outcome will never be observed: {e}");
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn policy_cancellation_error_is_recognized() {
+            let err = webkit2gtk::glib::Error::new(
+                PolicyError::FrameLoadInterruptedByPolicyChange,
+                "frame load interrupted by policy change",
+            );
+            assert!(is_policy_cancellation(&err));
+        }
+
+        /// The exact confusable regression Rule 3 exists to prevent: a same-shaped
+        /// "cancelled" error from a DIFFERENT domain (a real network-layer cancellation,
+        /// not our own guard's policy decision) must NOT be recognized. If the domain
+        /// scoping in `is_policy_cancellation` is ever widened or dropped — e.g. "fixed"
+        /// to also catch `NetworkError::Cancelled` — this goes red while the positive
+        /// case above stays green, catching exactly that mistake.
+        #[test]
+        fn a_same_shaped_error_from_a_different_domain_is_not_recognized() {
+            let err =
+                webkit2gtk::glib::Error::new(webkit2gtk::NetworkError::Cancelled, "cancelled");
+            assert!(!is_policy_cancellation(&err));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{feeds_fsm, should_block};
+    use super::{feeds_fsm, should_block, ENFORCE_ALL_FRAMES};
     use crate::nav_policy::NavPolicy;
     use kiosk_core::config::schema::Content;
     use kiosk_core::nav::BlockReason;
@@ -307,6 +495,21 @@ mod tests {
     fn sub_frame_off_allowlist_is_not_this_guards_concern() {
         let p = policy(&["https://home.test/*"], "https://home.test/app");
         assert_eq!(should_block(&p, "https://evil.test/x", false), None);
+    }
+
+    /// Linux enforces the guard on ALL frames — the deliberate divergence from Windows,
+    /// where sub-frames are waved past because `egress.rs` catches them. Asserts against
+    /// [`ENFORCE_ALL_FRAMES`] itself, the same constant `main.rs`'s builder line passes as
+    /// `should_block`'s third argument — not a locally-hardcoded `true` — so flipping that
+    /// constant flips this test's expected outcome too (`Some(NotAllowlisted)` → `None`)
+    /// instead of leaving it silently green.
+    #[test]
+    fn the_guard_blocks_an_off_allowlist_sub_frame_when_told_it_is_in_scope() {
+        let p = policy(&["https://home.test/*"], "https://home.test/app");
+        assert_eq!(
+            should_block(&p, "https://evil.test/frame", ENFORCE_ALL_FRAMES),
+            Some(BlockReason::NotAllowlisted)
+        );
     }
 
     #[test]

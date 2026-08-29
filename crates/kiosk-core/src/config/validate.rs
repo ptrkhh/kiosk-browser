@@ -16,8 +16,6 @@ const UNIMPLEMENTED: &[(&str, &str)] = &[
     ("content.inject_css", "P2"),
     ("content.inject_js", "P2"),
     ("content.pdf_view", "P1"),
-    ("maintenance.max_webview_mem_mb", "P2"),
-    ("maintenance.restart_app", "P2"),
 ];
 
 fn range_u64(value: u64, lo: u64, hi: u64, field: &str, errors: &mut Vec<FieldError>) {
@@ -178,12 +176,6 @@ pub fn validate(cfg: &RemoteConfig) -> Result<Vec<String>, ConfigError> {
             "content.inject_css" => cfg.content.inject_css != defaults.content.inject_css,
             "content.inject_js" => cfg.content.inject_js != defaults.content.inject_js,
             "content.pdf_view" => cfg.content.pdf_view != defaults.content.pdf_view,
-            "maintenance.max_webview_mem_mb" => {
-                cfg.maintenance.max_webview_mem_mb != defaults.maintenance.max_webview_mem_mb
-            }
-            "maintenance.restart_app" => {
-                cfg.maintenance.restart_app != defaults.maintenance.restart_app
-            }
             _ => false,
         };
         if set {
@@ -268,6 +260,18 @@ mod tests {
         assert!(validate(&cfg(r#"{"maintenance":{"max_webview_mem_mb":256}}"#)).is_ok());
         assert!(validate(&cfg(r#"{"maintenance":{"max_webview_mem_mb":100}}"#)).is_err());
         assert!(validate(&cfg(r#"{"maintenance":{"max_webview_mem_mb":9000}}"#)).is_err());
+    }
+
+    #[test]
+    fn restart_app_no_longer_warns_as_unimplemented() {
+        let warnings = validate(&cfg(r#"{"maintenance":{"restart_app":"03:30"}}"#))
+            .expect("restart_app is now implemented");
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.contains("maintenance.restart_app")),
+            "got {warnings:?}"
+        );
     }
 
     #[test]

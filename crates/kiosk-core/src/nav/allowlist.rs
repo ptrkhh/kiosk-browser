@@ -29,6 +29,10 @@ use super::{BlockReason, Decision};
 pub struct Allowlist {
     /// Compiled patterns. Only the ones that compiled — see `invalid`.
     patterns: Vec<UrlPattern>,
+    /// Original spellings for the patterns that compiled. The Linux content filter and
+    /// CSP belt deliberately derive their host rules from the same accepted inputs rather
+    /// than maintaining a second policy list.
+    accepted_patterns: Vec<String>,
     /// The effective home URL, if it parsed. `None` ⇒ no implicit home allow and no origin
     /// lock, i.e. everything is denied. That is the safe direction.
     home: Option<Url>,
@@ -47,16 +51,21 @@ impl Allowlist {
     /// `home_url` is `content.url` **after** `{device_id}` expansion (spec cfg-02).
     pub fn new(patterns: &[String], home_url: &str) -> Self {
         let mut compiled = Vec::with_capacity(patterns.len());
+        let mut accepted_patterns = Vec::with_capacity(patterns.len());
         let mut invalid = Vec::new();
         for p in patterns {
             match compile(p) {
-                Ok(pattern) => compiled.push(pattern),
+                Ok(pattern) => {
+                    compiled.push(pattern);
+                    accepted_patterns.push(p.clone());
+                }
                 Err(_) => invalid.push(p.clone()),
             }
         }
 
         Self {
             patterns: compiled,
+            accepted_patterns,
             home: Url::parse(home_url).ok(),
             origin_locked: patterns.is_empty(),
             invalid,
@@ -66,6 +75,35 @@ impl Allowlist {
     /// The configured patterns that could not be compiled and are therefore inert.
     pub fn invalid_patterns(&self) -> &[String] {
         &self.invalid
+    }
+
+    /// The original spellings of URLPattern entries that compiled successfully.
+    pub(crate) fn accepted_patterns(&self) -> &[String] {
+        &self.accepted_patterns
+    }
+
+    /// The configured origins, excluding path/query/fragment constraints. This is used
+    /// only for the Linux CSP/content-filter belts; `allows` remains the full URLPattern
+    /// authority. Invalid or non-network patterns are omitted by the belt compiler and
+    /// are reported through its refusal list.
+    pub fn origins(&self) -> Vec<String> {
+        let mut origins = self
+            .accepted_patterns
+            .iter()
+            .filter_map(|pattern| super::filter::origin_from_pattern(pattern))
+            .collect::<Vec<_>>();
+        if let Some(home) = &self.home {
+            if let Some(origin) = super::filter::origin_from_url(home) {
+                origins.push(origin);
+            }
+        }
+        origins.sort();
+        origins.dedup();
+        origins
+    }
+
+    pub(crate) fn home_url(&self) -> Option<&Url> {
+        self.home.as_ref()
     }
 
     /// The verdict for one top-level navigation.
@@ -658,6 +696,33 @@ mod tests {
         assert_eq!(a.allows("https://evilexample.com/x"), BLOCKED);
         // `*.` requires the dot, so the bare apex is not included.
         assert_eq!(a.allows("https://example.com/x"), BLOCKED);
+    }
+
+    #[test]
+    fn origins_are_derived_from_accepted_patterns_and_home() {
+        let a = allowlist(
+            &[
+                "https://cdn.example.com/assets/*",
+                "https://*.images.example.com/*",
+                "https://api.example.com:8443/*",
+            ],
+            HOME,
+        );
+        assert_eq!(
+            a.origins(),
+            vec![
+                "https://*.images.example.com".to_string(),
+                "https://api.example.com:8443".to_string(),
+                "https://app.example.com".to_string(),
+                "https://cdn.example.com".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_empty_allowlist_exposes_only_the_home_origin() {
+        let a = allowlist(&[], HOME);
+        assert_eq!(a.origins(), vec!["https://app.example.com".to_string()]);
     }
 
     #[test]

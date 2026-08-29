@@ -24,8 +24,6 @@
 //! * `WatchdogConfig` uses test timings (see `test_config`), not the ini's.
 //! * `LauncherSink` is wrapped by `Spy`, and the process does not `exit()`.
 
-#![cfg(windows)]
-
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -99,15 +97,28 @@ struct Harness {
     torn_down: AtomicBool,
 }
 
-/// A pipe name unique to this scenario. `pipe::instance_name()` is per-launcher
-/// PID, which is not unique when one test binary hosts several launchers.
-fn unique_pipe(tag: &str) -> String {
+/// A transport name unique to this scenario. `pipe::instance_name()` is
+/// per-launcher PID, which is not unique when one test binary hosts several
+/// launchers.
+fn unique_transport(tag: &str, data_dir: &Path) -> String {
     static N: AtomicU32 = AtomicU32::new(0);
-    format!(
-        r"\\.\pipe\kiosk-heartbeat-rt13-{tag}-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    )
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    #[cfg(windows)]
+    {
+        let _ = data_dir;
+        format!(
+            r"\\.\pipe\kiosk-heartbeat-rt13-{tag}-{}-{}",
+            std::process::id(),
+            n
+        )
+    }
+    #[cfg(unix)]
+    {
+        data_dir
+            .join(format!("hb-{tag}-{}-{n}.sock", std::process::id()))
+            .to_string_lossy()
+            .into_owned()
+    }
 }
 
 impl Harness {
@@ -121,7 +132,7 @@ impl Harness {
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let child_pid = Arc::new(AtomicU32::new(0));
-        let pipe_name = unique_pipe(tag);
+        let pipe_name = unique_transport(tag, data_dir.path());
 
         timer::spawn_timer(tx.clone(), cancel.clone());
         {
@@ -226,9 +237,14 @@ impl Harness {
         self.stop.store(true, Ordering::Relaxed);
         let pid = self.child_pid.load(Ordering::Relaxed);
         if pid != 0 {
+            #[cfg(windows)]
             let _ = std::process::Command::new("taskkill")
                 .args(["/PID", &pid.to_string(), "/T", "/F"])
                 .output(); // captured, so the suite's output stays clean
+            #[cfg(unix)]
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .output();
         }
     }
 

@@ -115,7 +115,9 @@ pub fn effective_gesture(
         // unverifiable hash. Remote-present still "wins" over bootstrap; it just wins
         // by disabling.
         if g.pin_hash.trim().is_empty() {
-            eprintln!("gesture: remote input.exit_gesture has an empty pin_hash (cfg-12: disabled)");
+            eprintln!(
+                "gesture: remote input.exit_gesture has an empty pin_hash (cfg-12: disabled)"
+            );
             return None;
         }
         return Some(EffectiveGesture {
@@ -173,12 +175,19 @@ pub fn open_pin_pad(app: &tauri::AppHandle, gesture: Option<&EffectiveGesture>) 
     }
 }
 
+#[cfg(not(windows))]
+pub(crate) fn observe<W, E>(f: impl Fn(&E) + 'static) -> impl Fn(&W, &E) -> gtk::glib::Propagation {
+    move |_widget, event| {
+        f(event);
+        gtk::glib::Propagation::Proceed
+    }
+}
+
 /// A tap must land within this many ms of the *N-th-most-recent* tap to count
 /// toward the gesture (see `TapCounter`'s rolling, not first-tap-anchored, window).
 /// No spec value is pinned for this; 3s is a human-tappable window for the
 /// bootstrap default of 7 taps. ponytail: revisit if field feedback says operators
 /// need more/less time.
-#[cfg(windows)]
 const TAP_WINDOW_MS: i64 = 3000;
 
 #[cfg(windows)]
@@ -192,13 +201,124 @@ pub fn install(
 
 #[cfg(not(windows))]
 pub fn install(
-    _window: &tauri::WebviewWindow,
-    _app: tauri::AppHandle,
-    _gesture: Option<EffectiveGesture>,
+    window: &tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    gesture: Option<EffectiveGesture>,
 ) {
-    eprintln!(
-        "gesture: only implemented on Windows; tap capture will never fire (the technician chord fallback in shortcuts.rs still works)"
-    );
+    linux_impl::install(window, app, gesture);
+}
+
+#[cfg(not(windows))]
+mod linux_impl {
+    use gtk::{gdk, prelude::*};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use super::{in_region, now_ms, EffectiveGesture, TapCounter, TAP_WINDOW_MS};
+
+    fn fire_if_tap(
+        state: &Rc<RefCell<Option<(TapCounter, EffectiveGesture)>>>,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    ) -> Option<EffectiveGesture> {
+        let fired = {
+            let mut state = state.borrow_mut();
+            let (counter, gesture) = state.as_mut()?;
+            in_region(x, y, width, height, gesture.region) && counter.tap(now_ms())
+        };
+        fired.then(|| {
+            state
+                .borrow()
+                .as_ref()
+                .expect("gesture state exists")
+                .1
+                .clone()
+        })
+    }
+
+    pub fn install(
+        window: &tauri::WebviewWindow,
+        app: tauri::AppHandle,
+        gesture: Option<EffectiveGesture>,
+    ) {
+        let result = window.with_webview(move |platform_webview| {
+            let webview = platform_webview.inner();
+            let state =
+                Rc::new(RefCell::new(gesture.map(|gesture| {
+                    (TapCounter::new(gesture.taps, TAP_WINDOW_MS), gesture)
+                })));
+            webview.add_events(
+                gdk::EventMask::BUTTON_PRESS_MASK
+                    | gdk::EventMask::TOUCH_MASK
+                    | gdk::EventMask::POINTER_MOTION_MASK
+                    | gdk::EventMask::SCROLL_MASK,
+            );
+
+            let state_button = state.clone();
+            let app_button = app.clone();
+            let webview_button = webview.clone();
+            webview.connect_button_press_event(super::observe(move |event: &gdk::EventButton| {
+                crate::idle::note_activity();
+                if event.is_pointer_emulated() || event.button() != 1 {
+                    return;
+                }
+                let (x, y) = event.position();
+                let width = webview_button.allocated_width() as f64;
+                let height = webview_button.allocated_height() as f64;
+                if let Some(gesture) = fire_if_tap(&state_button, x, y, width, height) {
+                    super::open_pin_pad(&app_button, Some(&gesture));
+                }
+            }));
+
+            let state_touch = state.clone();
+            let app_touch = app.clone();
+            let webview_touch = webview.clone();
+            webview.connect_touch_event(super::observe(move |event: &gdk::Event| {
+                crate::idle::note_activity();
+                if event.is_pointer_emulated() || event.event_type() != gdk::EventType::TouchBegin {
+                    return;
+                }
+                let Some(touch) = event.downcast_ref::<gdk::EventTouch>() else {
+                    return;
+                };
+                let (x, y) = touch.position();
+                let width = webview_touch.allocated_width() as f64;
+                let height = webview_touch.allocated_height() as f64;
+                if let Some(gesture) = fire_if_tap(&state_touch, x, y, width, height) {
+                    super::open_pin_pad(&app_touch, Some(&gesture));
+                }
+            }));
+
+            webview.connect_motion_notify_event(super::observe(|_event: &gdk::EventMotion| {
+                crate::idle::note_activity();
+            }));
+            webview.connect_scroll_event(super::observe(|_event: &gdk::EventScroll| {
+                crate::idle::note_activity();
+            }));
+
+            // PF-04: claim pinch sequences at capture phase so WebKit never turns a
+            // two-finger gesture into browser zoom/navigation.
+            let zoom = gtk::GestureZoom::new(&webview);
+            zoom.set_propagation_phase(gtk::PropagationPhase::Capture);
+            zoom.connect_scale_changed(|gesture, _scale| {
+                let _ = gesture.set_state(gtk::EventSequenceState::Claimed);
+            });
+            std::mem::forget(zoom);
+        });
+        if let Err(error) = result {
+            eprintln!("gesture: Linux GTK input observation install failed: {error}");
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(windows)]
@@ -329,6 +449,18 @@ mod windows_impl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn observe_always_proceeds_after_observing() {
+        let seen = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen_by_handler = seen.clone();
+        let handler = observe(move |value: &u8| {
+            seen_by_handler.set(*value == 7);
+        });
+        assert_eq!(handler(&(), &7), gtk::glib::Propagation::Proceed);
+        assert!(seen.get());
+    }
 
     // ---- in_region ------------------------------------------------------------
 

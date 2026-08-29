@@ -300,19 +300,27 @@ mod tests {
         );
     }
 
-    /// Non-Windows only: `credential_is_owner_only` is a stub that always returns
-    /// `Ok(true)` there (see its doc comment — no DACL to check), so the DACL gate
-    /// (FIX 4, checked before `read_to_string` now) never trips and this reaches
-    /// the read, which fails on the missing file with "cannot read" exactly as
-    /// before. On Windows this is a DIFFERENT path — see
-    /// `missing_credential_load_returns_render_safe_via_the_dacl_gate` below.
+    /// Non-Windows only (Task 3, SEC-09): `credential_is_owner_only`'s Unix arm
+    /// reads the file's mode bits via `fs::metadata`, which fails on a missing
+    /// path exactly like Windows' `GetNamedSecurityInfoW` does — so a missing
+    /// credential now hits the SAME SEC-09 gate as Windows, reported via
+    /// `credential_permissions`, not the generic "cannot read" a stub that always
+    /// returned `Ok(true)` used to reach. Mirrors
+    /// `missing_credential_load_returns_render_safe_via_the_dacl_gate` below,
+    /// which is the pre-existing Windows counterpart of this same scenario.
     #[cfg(not(windows))]
     #[test]
     fn missing_credential_load_returns_render_safe() {
         let dir = tempfile::tempdir().unwrap();
         let ini_path = dir.path().join("kiosk.ini");
         std::fs::write(&ini_path, valid_ini()).unwrap();
-        assert_render_safe(load(&ini_path, dir.path(), None), "cannot read");
+        match load(&ini_path, dir.path(), None) {
+            BootOutcome::RenderSafe { error, reason, .. } => {
+                assert_eq!(reason, Some(CREDENTIAL_PERMISSIONS_REASON));
+                assert_eq!(error, CREDENTIAL_PERMISSIONS_MESSAGE);
+            }
+            BootOutcome::Ready(_) => panic!("a missing credential must render safe"),
+        }
     }
 
     /// FIX 4 (SEC-09 final review): on Windows, `is_violation` now runs BEFORE
@@ -340,19 +348,20 @@ mod tests {
         }
     }
 
-    /// Non-Windows only: with no DACL to check, this reaches the parse and fails
-    /// with "cannot parse" exactly as before. On Windows the DACL gate must be
-    /// cleared FIRST (a fresh temp file's inherited ACL is not owner-only — see
-    /// `force_owner_only_acl`'s doc below) or this would report
-    /// `credential_permissions` instead, for the wrong reason — see
-    /// `malformed_credential_with_an_owner_only_dacl_load_returns_render_safe`.
+    /// Non-Windows only: the mode gate must be cleared FIRST (a fresh temp file's
+    /// umask-dependent mode is not owner-only — see `force_owner_only_mode`'s doc)
+    /// or this would report `credential_permissions` instead, for the wrong
+    /// reason — mirrors `malformed_credential_with_an_owner_only_dacl_load_returns_render_safe`
+    /// below, which does the same thing for Windows' DACL.
     #[cfg(not(windows))]
     #[test]
     fn malformed_credential_load_returns_render_safe() {
         let dir = tempfile::tempdir().unwrap();
         let ini_path = dir.path().join("kiosk.ini");
         std::fs::write(&ini_path, valid_ini()).unwrap();
-        std::fs::write(dir.path().join("cred.json"), "{}").unwrap();
+        let cred_path = dir.path().join("cred.json");
+        std::fs::write(&cred_path, "{}").unwrap();
+        force_owner_only_mode(&cred_path);
         assert_render_safe(load(&ini_path, dir.path(), None), "cannot parse");
     }
 
@@ -471,9 +480,23 @@ mod tests {
             .success());
     }
 
-    /// The SEC-09 boot gate must not fire on a normal, valid boot — the
-    /// non-Windows stub (`credential_is_owner_only` -> `Ok(true)`) and a real
-    /// Windows owner-only ACL both take this same `Ready` path.
+    /// Unix twin of `force_owner_only_acl`: forces `path` to mode `0o600`. A
+    /// freshly created temp file's mode depends on the process umask (this
+    /// container's is `0022`, i.e. mode `0o644` — group- and world-readable), so
+    /// tests that need a genuinely-trusted credential must force it rather than
+    /// assume it (Task 3, SEC-09 — `credential_acl::credential_is_owner_only` now
+    /// really reads the mode bits instead of stubbing `Ok(true)`).
+    #[cfg(unix)]
+    fn force_owner_only_mode(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 fixture credential");
+    }
+
+    /// The SEC-09 boot gate must not fire on a normal, valid boot — a real
+    /// owner-only mode on Unix and a real Windows owner-only ACL both take this
+    /// same `Ready` path (both forced here, since neither a fresh temp file's
+    /// umask-dependent mode nor its inherited ACL is guaranteed owner-only).
     #[test]
     fn valid_credential_load_is_ready_not_render_safe() {
         let dir = tempfile::tempdir().unwrap();
@@ -481,12 +504,14 @@ mod tests {
         std::fs::write(&ini_path, valid_ini()).unwrap();
         let cred_path = dir.path().join("cred.json");
         std::fs::write(&cred_path, valid_credential_json()).unwrap();
-        // A fresh temp file's inherited ACL is not guaranteed owner-only (see
-        // `force_owner_only_acl`'s doc) — force it so this test genuinely
-        // exercises the non-violation path, not an accident of the host's
-        // default ACL.
+        // A fresh temp file's inherited ACL/umask-dependent mode is not guaranteed
+        // owner-only on either platform (see `force_owner_only_acl`/
+        // `force_owner_only_mode`'s docs) — force it so this test genuinely
+        // exercises the non-violation path, not an accident of the host's default.
         #[cfg(windows)]
         force_owner_only_acl(&cred_path);
+        #[cfg(unix)]
+        force_owner_only_mode(&cred_path);
         match load(&ini_path, dir.path(), None) {
             BootOutcome::Ready(_) => {}
             BootOutcome::RenderSafe { error, .. } => {

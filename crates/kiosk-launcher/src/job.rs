@@ -30,7 +30,12 @@
 //! already linked into every Windows Rust binary, so this needs no new
 //! dependency (the crate has none for Win32 today and gains none here).
 
+#[cfg(unix)]
+use crate::spawn::ChildHandle;
 use std::io;
+#[cfg(unix)]
+use std::path::Path;
+#[cfg(windows)]
 use std::process::Child;
 
 /// The mutex name. `Global\` is the machine-wide namespace, so a launcher
@@ -141,8 +146,9 @@ mod win32 {
 #[cfg(windows)]
 pub struct Job(std::os::windows::io::OwnedHandle);
 
-/// Non-Windows stub (dev hosts only; the kiosk target is Windows x64). Linux
-/// supervision is P2.
+/// On Linux the service manager owns the child cgroup. Refuse to report an
+/// armed job when this process is not running inside a systemd service; the
+/// caller already has the WARNING + breadcrumb degraded path for this case.
 #[cfg(not(windows))]
 pub struct Job;
 
@@ -217,9 +223,16 @@ impl Job {
 #[cfg(not(windows))]
 impl Job {
     pub fn create() -> io::Result<Job> {
-        Ok(Job)
+        if std::env::var_os("INVOCATION_ID").is_some() {
+            Ok(Job)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "launcher is not running under a systemd service cgroup",
+            ))
+        }
     }
-    pub fn assign(&self, _child: &Child) -> io::Result<()> {
+    pub fn assign(&self, _child: &ChildHandle) -> io::Result<()> {
         Ok(())
     }
 }
@@ -232,9 +245,11 @@ impl Job {
 #[cfg(windows)]
 pub struct SingleInstance(#[allow(dead_code)] std::os::windows::io::OwnedHandle);
 
-/// Non-Windows stub (dev hosts only).
+/// Linux backstop for manual launches. The production path uses the absolute
+/// `/var/lib/kiosk` data directory so a hand-run launcher and the systemd unit
+/// contend on the same inode rather than selecting different runtime dirs.
 #[cfg(not(windows))]
-pub struct SingleInstance;
+pub struct SingleInstance(#[allow(dead_code)] std::fs::File);
 
 /// Claims the machine-wide launcher slot.
 ///
@@ -280,11 +295,52 @@ fn acquire_named(name: &str) -> io::Result<Option<SingleInstance>> {
     Ok(Some(SingleInstance(owned)))
 }
 
-/// Non-Windows stub: no supervision hardening off Windows (P2), so every
-/// process is "the one".
 #[cfg(not(windows))]
 pub fn acquire_single_instance() -> io::Result<Option<SingleInstance>> {
-    Ok(Some(SingleInstance))
+    acquire_single_instance_at(Path::new("/var/lib/kiosk"))
+}
+
+#[cfg(not(windows))]
+pub fn acquire_single_instance_at(data_dir: &Path) -> io::Result<Option<SingleInstance>> {
+    std::fs::create_dir_all(data_dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(data_dir.join("launcher.lock"))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(SingleInstance(file))),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+#[cfg(test)]
+mod unix_tests {
+    use super::*;
+
+    #[test]
+    fn job_create_reports_missing_supervision_when_invocation_id_is_absent() {
+        std::env::remove_var("INVOCATION_ID");
+        assert!(Job::create().is_err());
+    }
+
+    #[test]
+    fn a_second_launcher_does_not_acquire_the_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "kiosk-launcher-lock-{}-{}",
+            std::process::id(),
+            crate::clock::now()
+        ));
+        let first = acquire_single_instance_at(&dir).expect("first lock attempt");
+        assert!(first.is_some());
+        let second = acquire_single_instance_at(&dir).expect("second lock attempt");
+        assert!(second.is_none());
+        drop(first);
+        std::fs::remove_dir_all(dir).expect("test lock directory cleanup");
+    }
 }
 
 #[cfg(all(test, windows))]

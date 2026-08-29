@@ -1,0 +1,11 @@
+{
+  "content": {
+    "allowlist": [
+      "http://localhost:8099/*"
+    ],
+    "url": "http://localhost:8099/home.html?probe=reload"
+  },
+  "device_id": "smoke-01",
+  "revision": 1,
+  "sig": "ed25519:h2jBPAw7xVvWN02t4nMv9lXTJkrBoFW562itX3gGXZmfZRW6iMGSBzHaDl5v7vvIrWazWY4opw8xx5HhW6ZtAg=="
+}

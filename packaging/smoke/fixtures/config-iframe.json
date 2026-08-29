@@ -1,0 +1,11 @@
+{
+  "content": {
+    "allowlist": [
+      "http://localhost:8099/*"
+    ],
+    "url": "http://localhost:8099/iframe-host.html"
+  },
+  "device_id": "smoke-01",
+  "revision": 1,
+  "sig": "ed25519:rjuheDFWBEZ+gw3bEIKjiUZPuvgoEWlIdCKhnnJm+EQ7xLuRI3rHfvbKLFrxMBsaeAMZbc0uXMFHw+2bLlrQAQ=="
+}

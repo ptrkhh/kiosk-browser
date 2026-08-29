@@ -25,11 +25,8 @@ pub fn clear(window: &tauri::WebviewWindow, tx: mpsc::Sender<AppEvent>, telem: T
 }
 
 #[cfg(not(windows))]
-pub fn clear(_window: &tauri::WebviewWindow, tx: mpsc::Sender<AppEvent>, _telem: Telemetry) {
-    eprintln!("clear: only implemented on Windows; profile data will never be cleared");
-    // Never strand the kiosk on the Clearing gate, even on a platform with no real
-    // clear implementation.
-    let _ = tx.try_send(AppEvent::ProfileCleared);
+pub fn clear(window: &tauri::WebviewWindow, tx: mpsc::Sender<AppEvent>, telem: Telemetry) {
+    linux_impl::clear(window, tx, telem);
 }
 
 #[cfg(windows)]
@@ -139,6 +136,82 @@ mod windows_impl {
                 let _ = tx.try_send(AppEvent::ProfileCleared);
             }
             // else: the completion handler above owns the (exactly one) send from here.
+        });
+        if let Err(e) = result {
+            report_failure(
+                &telem_outer,
+                &format!("clear_profile: with_webview failed, profile not cleared: {e}"),
+            );
+            let _ = tx_outer.try_send(AppEvent::ProfileCleared);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod linux_impl {
+    use kiosk_core::app::state::Event as AppEvent;
+    use tokio::sync::mpsc;
+    use webkit2gtk::{
+        gio, glib, CookieManagerExt, WebContextExt, WebViewExt, WebsiteDataManagerExt,
+        WebsiteDataManagerExtManual, WebsiteDataTypes,
+    };
+
+    use crate::telemetry::Telemetry;
+
+    fn report_failure(telem: &Telemetry, reason: &str) {
+        eprintln!("clear: {reason}");
+        telem.nav_error(reason);
+    }
+
+    /// `WebviewWindow::clear_all_browsing_data()` already performs this clear; the
+    /// hand-rolled version buys ONLY the completion callback — which is the entire point,
+    /// since that callback is what releases the FSM's `Clearing` gate. Shape copied from
+    /// `wry-0.55.1/src/webkitgtk/mod.rs:809-819` with a real callback in place of wry's
+    /// `|_| {}`.
+    pub fn clear(window: &tauri::WebviewWindow, tx: mpsc::Sender<AppEvent>, telem: Telemetry) {
+        // Cloned so the outer `with_webview`-failure branch below still has its own
+        // handle after the inner closure (which needs its own `move`d copies) runs —
+        // same convention as `windows_impl::clear` above.
+        let tx_outer = tx.clone();
+        let telem_outer = telem.clone();
+        let result = window.with_webview(move |platform_webview| {
+            let webview = platform_webview.inner();
+            let Some(manager) = webview.context().and_then(|c| c.website_data_manager()) else {
+                report_failure(
+                    &telem,
+                    "clear_profile: no website data manager, profile not cleared",
+                );
+                let _ = tx.try_send(AppEvent::ProfileCleared);
+                return;
+            };
+            // Keep the explicit cookie-store operation alongside the full data
+            // clear. On WebKitGTK, an active WebProcess can retain a session
+            // cookie view until the next navigation even after `clear` completes.
+            if let Some(cookie_manager) = manager.cookie_manager() {
+                #[allow(deprecated)]
+                cookie_manager.delete_all_cookies();
+            }
+            let telem_done = telem.clone();
+            let tx_done = tx.clone();
+            // `TimeSpan::from_seconds(0)` means *all data, all time* — it is not a
+            // placeholder, do not "fix" it.
+            manager.clear(
+                WebsiteDataTypes::ALL,
+                glib::TimeSpan::from_seconds(0),
+                None::<&gio::Cancellable>,
+                move |result| {
+                    if let Err(e) = result {
+                        report_failure(
+                            &telem_done,
+                            &format!(
+                                "clear_profile: clear completed with an error, best-effort clear only: {e}"
+                            ),
+                        );
+                    }
+                    // Success OR failure: the gate must release either way.
+                    let _ = tx_done.try_send(AppEvent::ProfileCleared);
+                },
+            );
         });
         if let Err(e) = result {
             report_failure(

@@ -46,10 +46,17 @@ fn resolve_config_dir(args: impl Iterator<Item = String>) -> PathBuf {
 /// the launcher's `spool/launcher` partition and the `spool/main` partition it
 /// drains have to land in the same place.
 fn resolve_data_dir() -> PathBuf {
-    std::env::var_os("ProgramData")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("kiosk")
+    #[cfg(unix)]
+    {
+        PathBuf::from("/var/lib/kiosk")
+    }
+    #[cfg(windows)]
+    {
+        std::env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("kiosk")
+    }
 }
 
 /// The supervised binary: `kiosk-main` next to this exe.
@@ -169,19 +176,34 @@ fn main() {
     // reads it to authenticate the heartbeat client and to decide whether a
     // broken pipe is a channel fault or just a dead child's corpse.
     let child_pid = Arc::new(AtomicU32::new(0));
-    let pipe_name = pipe::instance_name();
+    let pipe_name = match pipe::instance_name(&data_dir) {
+        Ok(name) => Some(name),
+        Err(error) => {
+            // A heartbeat endpoint is a liveness enhancement, not a reason to
+            // black-screen the device. The child treats an empty variable as
+            // standalone, while the launcher still supervises it through the
+            // normal timer/exit path.
+            eprintln!(
+                "kiosk-launcher: cannot derive heartbeat endpoint ({error}); continuing without heartbeat"
+            );
+            degraded.push(("pipe", error.to_string()));
+            None
+        }
+    };
 
     timer::spawn_timer(tx.clone(), cancel.clone());
     // Clones for the pipe thread, captured now because `LauncherSink::new`
     // below moves `tx`, `child_pid`, `pipe_name`, and `data_dir` by value; the
     // thread itself isn't spawned until after that call returns (see there).
-    let pipe_thread_args = (
-        pipe_name.clone(),
-        data_dir.clone(),
-        tx.clone(),
-        cancel.clone(),
-        child_pid.clone(),
-    );
+    let pipe_thread_args = pipe_name.as_ref().map(|name| {
+        (
+            name.clone(),
+            data_dir.clone(),
+            tx.clone(),
+            cancel.clone(),
+            child_pid.clone(),
+        )
+    });
 
     // The kill-on-close job the sink assigns every child to. A failure here is
     // WARNING + continue: the launcher supervises exactly as it did before
@@ -203,7 +225,7 @@ fn main() {
         exe,
         config_dir,
         data_dir.clone(),
-        pipe_name,
+        pipe_name.unwrap_or_default(),
         tx,
         child_pid,
         bootstrap.as_ref(),
@@ -232,8 +254,7 @@ fn main() {
     // a permanent heartbeat outage. `serve` blocks its caller for its whole
     // lifetime (unlike `spawn_timer`, which spawns its own thread), so it
     // gets a thread here.
-    {
-        let (name, data, tx, cancel, pid) = pipe_thread_args;
+    if let Some((name, data, tx, cancel, pid)) = pipe_thread_args {
         if let Err(e) = std::thread::Builder::new()
             .name("kiosk-launcher-pipe".into())
             .spawn(move || pipe::serve(&name, &data, tx, cancel, pid))
@@ -256,6 +277,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kiosk_core::config::schema::RemoteConfig;
+    use kiosk_core::memory::MEM_CAP_N;
 
     fn args(items: &[&str]) -> std::vec::IntoIter<String> {
         items
@@ -263,6 +286,15 @@ mod tests {
             .map(|s| s.to_string())
             .collect::<Vec<_>>()
             .into_iter()
+    }
+
+    #[test]
+    fn mem_cap_dwell_exceeds_the_launchers_healthy_run_window() {
+        let dwell = MEM_CAP_N as u64 * RemoteConfig::default().logging.health_sample_s;
+        assert!(
+            dwell > watchdog_config(None).healthy_run_s,
+            "a memory-cap exit must land after the crash-loop window has been cleared"
+        );
     }
 
     #[test]

@@ -1893,6 +1893,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "chrono",
+ "gtk",
  "kiosk-core",
  "rand 0.8.7",
  "reqwest 0.12.28",
@@ -1905,8 +1906,17 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "webkit2gtk",
+ "webkit2gtk-sys",
  "webview2-com",
  "windows 0.61.3",
+]
+
+[[package]]
+name = "kiosk-smoke"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
