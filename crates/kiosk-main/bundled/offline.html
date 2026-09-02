@@ -30,28 +30,22 @@
       autoplay
       muted
       playsinline
-    ></video>
-    <video
-      id="offline-video-next"
-      preload="auto"
-      muted
-      playsinline
-      style="display: none"
+      loop
     ></video>
     <script>
       // arch-09 decode-failure robustness (spec §3.4): a corrupt/incompatible codec, a
       // missing platform decoder, or a missing file must degrade to the black "offline"
       // splash — this page's own black background — never a hung/frozen frame. The
-      // <video> is simply hidden; the body stays black.
+      // <video> is simply hidden; the body stays black. Native looping is intentional:
+      // WebView2 does not reliably make a display:none second video ready for a manual
+      // double-buffer handoff, which can otherwise turn a healthy first loop into black.
       (function () {
         var front = document.getElementById("offline-video");
-        var back = document.getElementById("offline-video-next");
         var degraded = false;
         var ticks = 0;
         var lastT = 0;
         var wrapAt = 0;
         var misses = 0;
-        var backReady = false;
 
         function report(kind, at, msSinceWrap) {
           try {
@@ -73,7 +67,6 @@
           if (degraded) return;
           degraded = true;
           front.style.display = "none";
-          back.style.display = "none";
           report(kind, at, msSinceWrap);
           console.error("media.error:", kind);
         }
@@ -85,52 +78,15 @@
           video.addEventListener("stalled", function () {
             fallback("stalled", video.currentTime, Date.now() - wrapAt);
           });
-          video.addEventListener("emptied", function () {
-            fallback("emptied", video.currentTime, Date.now() - wrapAt);
-          });
-          video.addEventListener("canplaythrough", function () {
-            if (video === back) backReady = true;
-          });
-          video.addEventListener("ended", advance);
           video.addEventListener("timeupdate", function () {
             if (video !== front || degraded) return;
             if (video.currentTime < lastT) wrapAt = Date.now();
             lastT = video.currentTime;
             ticks++;
-            if (
-              video.duration > 0 &&
-              video.currentTime >= video.duration - 0.25 &&
-              !backReady
-            ) {
-              fallback("stall", video.currentTime, Date.now() - wrapAt);
-            }
           });
         }
 
-        function advance() {
-          if (degraded) return;
-          if (!backReady) {
-            fallback("stall", front.currentTime, Date.now() - wrapAt);
-            return;
-          }
-          var oldFront = front;
-          front = back;
-          back = oldFront;
-          front.style.display = "block";
-          back.style.display = "none";
-          back.pause();
-          backReady = false;
-          back.load();
-          var p = front.play();
-          if (p && typeof p.catch === "function") {
-            p.catch(function () {
-              fallback("play_rejected", front.currentTime, Date.now() - wrapAt);
-            });
-          }
-        }
-
         watch(front);
-        watch(back);
         // The asset origin differs per platform (`http://kioskasset.localhost` on
         // Windows, `kioskasset://localhost` on Linux/WebKitGTK). Chosen page-locally
         // from the origin this page itself was served from — no serve-time templating.
@@ -139,8 +95,6 @@
             ? "kioskasset://localhost/kiosk-offline.mp4"
             : "http://kioskasset.localhost/kiosk-offline.mp4";
         front.src = source;
-        back.src = source;
-        back.load();
 
         // Autoplay policy is satisfied by muted+playsinline, but honor the rejection.
         var p = front.play();

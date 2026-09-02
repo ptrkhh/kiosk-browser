@@ -30,6 +30,7 @@ pub struct ChildHandle {
     pub(crate) pid: u32,
 }
 
+#[cfg(unix)]
 impl ChildHandle {
     pub(crate) fn id(&self) -> u32 {
         #[cfg(windows)]
@@ -40,6 +41,16 @@ impl ChildHandle {
         {
             self.pid
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_child_handle_tests {
+    use super::ChildHandle;
+
+    #[test]
+    fn child_handle_alias_exposes_std_child_id() {
+        let _id: fn(&ChildHandle) -> u32 = std::process::Child::id;
     }
 }
 

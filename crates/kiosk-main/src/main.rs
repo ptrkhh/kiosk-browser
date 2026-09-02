@@ -118,6 +118,31 @@ mod url_encode_tests {
     }
 }
 
+#[cfg(test)]
+mod offline_page_tests {
+    const OFFLINE_HTML: &str = include_str!("../bundled/offline.html");
+
+    #[test]
+    fn startup_empty_media_state_is_not_a_fatal_failure() {
+        assert!(
+            !OFFLINE_HTML.contains("fallback(\"emptied\""),
+            "the offline page must not hide valid media during normal startup/reset"
+        );
+    }
+
+    #[test]
+    fn offline_video_uses_native_loop_without_hidden_buffer() {
+        assert!(
+            OFFLINE_HTML.contains("loop"),
+            "the offline video must use the browser's native loop"
+        );
+        assert!(
+            !OFFLINE_HTML.contains("offline-video-next"),
+            "the offline page must not depend on a hidden second video"
+        );
+    }
+}
+
 /// SEC-09 reload gate, Critical 2 fix: `fetch::run` cannot navigate directly (it was
 /// spawned before the window existed), so it reports the violation message once over
 /// `credential_violation_rx`; this is the task that performs the actual `safe.html`
