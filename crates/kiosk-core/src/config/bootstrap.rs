@@ -27,6 +27,9 @@ pub struct BootstrapConfig {
     pub channel_grace_s: u64,
     /// Android-only, local-only. NEVER settable from remote config (spec §5.1).
     pub demo_mode: bool,
+    /// MVP-only escape hatch for devices that do not preserve the credential DACL.
+    /// Secure default: false. NEVER settable from remote config.
+    pub allow_insecure_credential_permissions: bool,
     /// `[bootstrap] url` — the home URL until/unless remote config supplies `content.url`.
     pub bootstrap_url: String,
     pub exit_gesture: Option<BootstrapExitGesture>,
@@ -135,6 +138,23 @@ impl BootstrapConfig {
             },
         };
 
+        let allow_insecure_credential_permissions =
+            match optional(get("allow_insecure_credential_permissions")) {
+                None => false,
+                Some(s) => match s.to_ascii_lowercase().as_str() {
+                    "true" | "1" | "yes" => true,
+                    "false" | "0" | "no" => false,
+                    _ => {
+                        errors.push(FieldError::new(
+                            "kiosk.allow_insecure_credential_permissions",
+                            "not a boolean",
+                            &s,
+                        ));
+                        false
+                    }
+                },
+            };
+
         let bootstrap_url = required(
             ini.section(Some("bootstrap")).and_then(|s| s.get("url")),
             "bootstrap.url",
@@ -170,6 +190,7 @@ impl BootstrapConfig {
             healthy_run_s,
             channel_grace_s,
             demo_mode,
+            allow_insecure_credential_permissions,
             bootstrap_url: bootstrap_url.expect("checked above"),
             exit_gesture,
         })
@@ -225,6 +246,22 @@ region   = top-left
         assert_eq!(g.pin_hash, "$argon2id$v=19$m=65536,t=3,p=4$c2FsdA$aGFzaA");
         assert_eq!(g.taps, 7);
         assert_eq!(g.region, "top-left");
+    }
+
+    #[test]
+    fn insecure_credential_permission_bypass_defaults_false() {
+        let c = BootstrapConfig::parse(FULL).expect("must parse");
+        assert!(!c.allow_insecure_credential_permissions);
+    }
+
+    #[test]
+    fn parses_insecure_credential_permission_bypass() {
+        let text = FULL.replace(
+            "demo_mode       = false",
+            "demo_mode       = false\nallow_insecure_credential_permissions = true",
+        );
+        let c = BootstrapConfig::parse(&text).expect("must parse");
+        assert!(c.allow_insecure_credential_permissions);
     }
 
     #[test]

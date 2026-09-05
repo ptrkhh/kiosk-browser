@@ -319,6 +319,7 @@ mod manager_tests {
             healthy_run_s: 120,
             channel_grace_s: 30,
             demo_mode: false,
+            allow_insecure_credential_permissions: false,
             bootstrap_url: "https://boot.example.com/".into(),
             exit_gesture: None,
         }

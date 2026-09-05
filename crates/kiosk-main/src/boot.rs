@@ -149,6 +149,16 @@ pub fn load(ini_path: &Path, data_dir: &Path, machine_id: Option<&str>) -> BootO
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(&booted.manager.bootstrap().credential);
+    let allow_insecure_credential_permissions = booted
+        .manager
+        .bootstrap()
+        .allow_insecure_credential_permissions;
+
+    if allow_insecure_credential_permissions {
+        eprintln!(
+            "kiosk-main: WARNING: credential ACL check bypassed by allow_insecure_credential_permissions"
+        );
+    }
 
     // SEC-09 boot gate (FIX 4, final review): check the DACL BEFORE ever reading
     // the credential's contents — never read-then-parse-then-check. Mirrors
@@ -161,8 +171,11 @@ pub fn load(ini_path: &Path, data_dir: &Path, machine_id: Option<&str>) -> BootO
     // one reboot later than necessary. `Ok(false)`/`Err` (fail closed — a
     // missing file included, since `credential_is_owner_only` itself fails to
     // read a nonexistent path's security info) is a violation; only `Ok(true)`
-    // proceeds to read and parse.
-    if credential_acl::is_violation(credential_acl::credential_is_owner_only(&credential_path)) {
+    // proceeds to read and parse unless the explicit local MVP bypass above is
+    // enabled.
+    if !allow_insecure_credential_permissions
+        && credential_acl::is_violation(credential_acl::credential_is_owner_only(&credential_path))
+    {
         return BootOutcome::RenderSafe {
             booted,
             error: CREDENTIAL_PERMISSIONS_MESSAGE.to_string(),
@@ -493,6 +506,34 @@ mod tests {
             .expect("chmod 0600 fixture credential");
     }
 
+    /// Non-Windows coverage for the MVP escape hatch: a valid credential with
+    /// group/world-readable mode is accepted only when the local config opts
+    /// into bypassing the permission check.
+    #[cfg(unix)]
+    #[test]
+    fn insecure_permission_bypass_allows_a_bad_mode_when_enabled() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ini_path = dir.path().join("kiosk.ini");
+        let ini = valid_ini().replace(
+            "credential = cred.json",
+            "credential = cred.json\nallow_insecure_credential_permissions = true",
+        );
+        std::fs::write(&ini_path, ini).unwrap();
+        let cred_path = dir.path().join("cred.json");
+        std::fs::write(&cred_path, valid_credential_json()).unwrap();
+        std::fs::set_permissions(&cred_path, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod 0644 fixture credential");
+
+        match load(&ini_path, dir.path(), None) {
+            BootOutcome::Ready(_) => {}
+            BootOutcome::RenderSafe { error, .. } => {
+                panic!("explicit permission bypass must allow a valid credential: {error:?}")
+            }
+        }
+    }
+
     /// The SEC-09 boot gate must not fire on a normal, valid boot — a real
     /// owner-only mode on Unix and a real Windows owner-only ACL both take this
     /// same `Ready` path (both forced here, since neither a fresh temp file's
@@ -556,6 +597,44 @@ mod tests {
                 assert_eq!(error, CREDENTIAL_PERMISSIONS_MESSAGE);
             }
             BootOutcome::Ready(_) => panic!("a bad credential DACL must render safe"),
+        }
+    }
+
+    /// Windows-host: the explicit local MVP bypass skips only the DACL gate;
+    /// the same widened DACL and valid JSON must continue through to `Ready`.
+    #[cfg(windows)]
+    #[test]
+    fn bad_credential_dacl_load_is_allowed_when_bypass_is_enabled() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ini_path = dir.path().join("kiosk.ini");
+        let ini = valid_ini().replace(
+            "credential = cred.json",
+            "credential = cred.json\nallow_insecure_credential_permissions = true",
+        );
+        std::fs::write(&ini_path, ini).unwrap();
+        let cred_path = dir.path().join("cred.json");
+        std::fs::write(&cred_path, valid_credential_json()).unwrap();
+        force_owner_only_acl(&cred_path);
+
+        let out = Command::new("icacls")
+            .arg(&cred_path)
+            .arg("/grant")
+            .arg("*S-1-5-32-545:(R)")
+            .output()
+            .expect("failed to spawn icacls");
+        assert!(
+            out.status.success(),
+            "icacls /grant failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        match load(&ini_path, dir.path(), None) {
+            BootOutcome::Ready(_) => {}
+            BootOutcome::RenderSafe { error, .. } => {
+                panic!("explicit permission bypass must allow a valid credential: {error:?}")
+            }
         }
     }
 }

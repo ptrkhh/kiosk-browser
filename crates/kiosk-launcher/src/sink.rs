@@ -83,8 +83,16 @@ fn build_telemetry(
     // `LauncherSink::new` already treats exactly like a missing/malformed
     // credential — `telemetry: None`, a breadcrumb, and supervision (spawn/
     // watch/restart, all in `dispatch`) is untouched because it never reads
-    // `self.telemetry` in the first place.
-    if credential_acl::is_violation(credential_acl::credential_is_owner_only(&credential_path)) {
+    // `self.telemetry` in the first place. The explicit local MVP bypass flag
+    // skips only this gate; file reading and JSON parsing still apply.
+    if bootstrap.allow_insecure_credential_permissions {
+        eprintln!(
+            "kiosk-launcher: WARNING: credential ACL check bypassed by allow_insecure_credential_permissions"
+        );
+    }
+    if !bootstrap.allow_insecure_credential_permissions
+        && credential_acl::is_violation(credential_acl::credential_is_owner_only(&credential_path))
+    {
         return Err(CREDENTIAL_PERMISSIONS_MESSAGE.into());
     }
 
@@ -946,6 +954,37 @@ mod tests {
             .success());
     }
 
+    /// Non-Windows coverage for the MVP escape hatch: a valid credential with
+    /// group/world-readable mode still builds telemetry when the local config
+    /// explicitly opts into bypassing the permission check.
+    #[cfg(unix)]
+    #[test]
+    fn insecure_permission_bypass_allows_a_bad_mode_when_enabled() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let cred_path = config_dir.join("cred.json");
+        std::fs::write(&cred_path, test_service_account_json()).unwrap();
+        std::fs::set_permissions(&cred_path, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod 0644 fixture credential");
+
+        let bootstrap = BootstrapConfig::parse(
+            "[kiosk]\nconfig_url = https://e/c.json\nsite = hq\nproject_id = p\n\
+             credential = cred.json\ndevice_id = lobby-01\n\
+             allow_insecure_credential_permissions = true\n\n[bootstrap]\n\
+             url = https://app.example.com/\n",
+        )
+        .expect("valid ini");
+
+        assert!(
+            build_telemetry(&bootstrap, &config_dir, &data_dir).is_ok(),
+            "explicit permission bypass must allow telemetry with a valid credential"
+        );
+    }
+
     /// Windows-host: SEC-09 launcher gate. A credential whose DACL grants read to
     /// `BUILTIN\Users` (a non-owner principal) must refuse before the JSON is ever
     /// read, with the distinct owner-only message — not the generic
@@ -985,6 +1024,47 @@ mod tests {
             Err(e) => assert_eq!(e.to_string(), CREDENTIAL_PERMISSIONS_MESSAGE),
             Ok(_) => panic!("a bad credential DACL must refuse to build telemetry"),
         }
+    }
+
+    /// Windows-host: the explicit local MVP bypass skips only the DACL gate;
+    /// valid credential JSON must still build the telemetry stack.
+    #[cfg(windows)]
+    #[test]
+    fn build_telemetry_allows_a_bad_credential_dacl_when_bypass_is_enabled() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let cred_path = config_dir.join("cred.json");
+        std::fs::write(&cred_path, test_service_account_json()).unwrap();
+        force_owner_only_acl(&cred_path);
+
+        let out = Command::new("icacls")
+            .arg(&cred_path)
+            .arg("/grant")
+            .arg("*S-1-5-32-545:(R)")
+            .output()
+            .expect("failed to spawn icacls");
+        assert!(
+            out.status.success(),
+            "icacls /grant failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let bootstrap = BootstrapConfig::parse(
+            "[kiosk]\nconfig_url = https://e/c.json\nsite = hq\nproject_id = p\n\
+             credential = cred.json\ndevice_id = lobby-01\n\
+             allow_insecure_credential_permissions = true\n\n[bootstrap]\n\
+             url = https://app.example.com/\n",
+        )
+        .expect("valid ini");
+
+        assert!(
+            build_telemetry(&bootstrap, &config_dir, &data_dir).is_ok(),
+            "explicit permission bypass must allow telemetry with valid credential JSON"
+        );
     }
 
     /// The same bad-DACL credential, driven through `LauncherSink::new` (not just

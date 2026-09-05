@@ -768,6 +768,7 @@ mod tests {
             healthy_run_s: 0,
             channel_grace_s: 0,
             demo_mode: false,
+            allow_insecure_credential_permissions: false,
             bootstrap_url: "https://site.test/".into(),
             exit_gesture: None,
         }
