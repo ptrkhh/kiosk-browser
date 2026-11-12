@@ -7,6 +7,12 @@ on:
         description: SEC-01 public config key baked through KIOSK_CONFIG_PUBKEY_B64
         required: true
         type: string
+  workflow_dispatch:
+    inputs:
+      pubkey_b64:
+        description: SEC-01 public config key baked through KIOSK_CONFIG_PUBKEY_B64
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
