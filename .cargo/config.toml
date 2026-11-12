@@ -1,0 +1,4 @@
+# Link the C runtime statically on Windows so kiosk-main.exe and kiosk-launcher.exe run on a
+# clean machine without the Visual C++ Redistributable (VCRUNTIME140.dll).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
