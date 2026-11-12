@@ -7,11 +7,12 @@
 //! Wired into `main.rs` (Task 6): `main` extracts the real `ConfigManager`/URL/`poll_s`
 //! from a `Booted` and spawns [`run`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use kiosk_core::app::state::Event as AppEvent;
+use kiosk_core::config::bootstrap::BootstrapConfig;
 use kiosk_core::config::ConfigManager;
 use tokio::sync::{mpsc, Notify};
 use tokio_util::sync::CancellationToken;
@@ -65,6 +66,15 @@ pub async fn fetch_bytes(url: &str) -> Result<Vec<u8>, ()> {
     Ok(bytes.to_vec())
 }
 
+/// SEC-09 reload-gate decision. `[kiosk] allow_insecure_credential_permissions` skips it,
+/// exactly as it skips the boot gate (`boot::load`) and the launcher gate — a bypass the
+/// boot gate honours but this one does not would drop the kiosk to the safe page on the
+/// first poll tick.
+fn reload_gate_violated(bootstrap: &BootstrapConfig, credential_path: &Path) -> bool {
+    !bootstrap.allow_insecure_credential_permissions
+        && credential_acl::is_violation(credential_acl::credential_is_owner_only(credential_path))
+}
+
 /// Poll every `poll_s`, or immediately when `Effect::RefetchConfig` pinged `refetch`.
 /// Emits `AppEvent::ConfigApplied{url}` AT LEVEL on every successful apply — re-sent every
 /// poll, even when the url is unchanged; the FSM handles a repeated or changed url naturally.
@@ -98,8 +108,7 @@ pub async fn run(
         // stop this task from ever applying another fetched config. `try_send`
         // (capacity 1): the receiver only ever needs the FIRST report, and this
         // loop breaks right after, so there is at most one send per process life.
-        if credential_acl::is_violation(credential_acl::credential_is_owner_only(&credential_path))
-        {
+        if reload_gate_violated(manager.bootstrap(), &credential_path) {
             telem.config_error(crate::boot::CREDENTIAL_PERMISSIONS_REASON);
             let _ = credential_violation_tx
                 .try_send(crate::boot::CREDENTIAL_PERMISSIONS_MESSAGE.to_string());
@@ -154,6 +163,24 @@ mod tests {
         crate::boot::boot(VALID_INI, tempfile::tempdir().unwrap().path())
             .unwrap()
             .manager
+    }
+
+    /// A missing credential fails the DACL read, which is a violation (fail closed) —
+    /// unless the local MVP bypass is on, matching the boot gate.
+    #[test]
+    fn the_reload_gate_honours_the_credential_permission_bypass() {
+        let missing = Path::new("/nonexistent/kiosk-credential.json");
+        let secure = manager();
+        assert!(reload_gate_violated(secure.bootstrap(), missing));
+
+        let ini = VALID_INI.replace(
+            "credential = cred.json\n",
+            "credential = cred.json\nallow_insecure_credential_permissions = true\n",
+        );
+        let bypassed = crate::boot::boot(&ini, tempfile::tempdir().unwrap().path())
+            .unwrap()
+            .manager;
+        assert!(!reload_gate_violated(bypassed.bootstrap(), missing));
     }
 
     #[test]
