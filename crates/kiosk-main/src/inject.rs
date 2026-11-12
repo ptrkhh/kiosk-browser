@@ -38,7 +38,9 @@ pub fn build_injection(
             "var style=document.createElement('style');\
              style.textContent='*{user-select:none;-webkit-user-select:none}\
              input,textarea{user-select:text;-webkit-user-select:text}';\
-             document.documentElement.appendChild(style);\n",
+             function addStyle(){document.documentElement.appendChild(style)}\
+             if(document.documentElement)addStyle();\
+             else document.addEventListener('DOMContentLoaded',addStyle);\n",
         );
     }
 
@@ -54,8 +56,9 @@ pub fn build_injection(
     if cursor_autohide_seconds > 0 {
         let ms = cursor_autohide_seconds * 1000;
         script.push_str(&format!(
-            "(function(){{var t;function hide(){{document.documentElement.style.cursor='none'}}\
-             function show(){{document.documentElement.style.cursor='';clearTimeout(t);t=setTimeout(hide,{ms})}}\
+            "(function(){{var t;function cursor(c){{var d=document.documentElement;if(d)d.style.cursor=c}}\
+             function hide(){{cursor('none')}}\
+             function show(){{cursor('');clearTimeout(t);t=setTimeout(hide,{ms})}}\
              document.addEventListener('mousemove',show,true);show();}})();\n"
         ));
     }
@@ -86,6 +89,16 @@ mod tests {
             "Object.defineProperty(window,\"print\",{value:()=>{},writable:false,configurable:false});"
         ));
         assert!(s.contains("5000"));
+    }
+
+    /// Document-start runs before the parser creates `<html>` (WebView2), so nothing may
+    /// touch `document.documentElement` unguarded: one throw aborts every later control.
+    #[test]
+    fn nothing_dereferences_the_document_element_before_it_exists() {
+        let s = build_injection(5, false, false);
+        assert!(!s.contains("document.documentElement.style"));
+        assert!(s.contains("if(document.documentElement)addStyle();"));
+        assert!(s.contains("'DOMContentLoaded',addStyle"));
     }
 
     #[test]
