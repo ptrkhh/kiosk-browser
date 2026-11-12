@@ -66,6 +66,8 @@ pub fn webview_subtree_rss_mb(procs: &HashMap<Pid, Process>, self_pid: Pid) -> u
     procs
         .iter()
         .filter(|(pid, _)| **pid != self_pid)
+        // Linux: sysinfo also lists threads, each repeating its process's whole RSS.
+        .filter(|(_, process)| process.thread_kind().is_none())
         .filter(|(_, process)| is_descendant(process, self_pid, self_start, procs))
         .map(|(_, process)| process.memory() / MB)
         .sum()
@@ -181,5 +183,25 @@ mod tests {
         sys.refresh_processes(ProcessesToUpdate::All, true);
         let pid = sysinfo::get_current_pid().expect("test process must have a pid");
         let _rss = webview_subtree_rss_mb(sys.processes(), pid);
+    }
+
+    /// On Linux sysinfo lists every thread as its own `Process`: parent = the owning
+    /// process, `memory()` = that process's whole RSS. Counting them multiplied the
+    /// reading by the thread count (41 GB reported on a 10 GB machine), which tripped
+    /// the memory cap and restarted the kiosk every five samples.
+    #[test]
+    fn threads_are_not_counted_as_descendant_processes() {
+        let threads: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(std::thread::park))
+            .collect();
+        let mut sys = System::new();
+        sys.refresh_processes(ProcessesToUpdate::All, true);
+        let pid = sysinfo::get_current_pid().expect("test process must have a pid");
+        let rss = webview_subtree_rss_mb(sys.processes(), pid);
+        for t in threads {
+            t.thread().unpark();
+            t.join().unwrap();
+        }
+        assert_eq!(rss, 0, "threads are not child processes");
     }
 }
