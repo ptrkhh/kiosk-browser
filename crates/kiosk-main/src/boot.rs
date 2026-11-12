@@ -12,7 +12,7 @@ use kiosk_core::app::state::{Event as AppEvent, MachineConfig, DEFAULT_ERROR_RET
 use kiosk_core::config::bootstrap::BootstrapConfig;
 use kiosk_core::config::schema::Content;
 use kiosk_core::config::signature::VerifyingKey;
-use kiosk_core::config::store::ConfigStore;
+use kiosk_core::config::store::{ConfigStore, LAST_GOOD_FILE};
 use kiosk_core::config::ConfigManager;
 use kiosk_core::error::ConfigError;
 use kiosk_core::logging::auth::ServiceAccount;
@@ -121,8 +121,41 @@ pub fn boot(ini_text: &str, data_dir: &Path) -> Result<Booted, ConfigError> {
     })
 }
 
+/// An install's own plain-JSON config, next to `kiosk.ini`.
+const LOCAL_CONFIG_FILE: &str = "kiosk-config.json";
+
+/// A keyless build rejects every fetched config, so `config-lastgood.json` is its whole
+/// config, and every install on the machine shares the one data dir that holds it. When
+/// this install ships its own `kiosk-config.json`, write it over last-good before boot so
+/// the exe runs with its own folder's rules however it is started. Signed builds never do
+/// this: their last-good comes only from a verified fetch and carries the anti-rollback
+/// floor.
+fn adopt_local_config(config_dir: &Path, data_dir: &Path) -> Result<(), String> {
+    let local = config_dir.join(LOCAL_CONFIG_FILE);
+    if pinned_key().is_some() || !local.exists() {
+        return Ok(());
+    }
+    // read + write, not `fs::copy`: copy carries a read-only attribute over to last-good,
+    // and the next boot's overwrite would then fail.
+    std::fs::read(&local)
+        .and_then(|bytes| {
+            std::fs::create_dir_all(data_dir)?;
+            std::fs::write(data_dir.join(LAST_GOOD_FILE), bytes)
+        })
+        .map_err(|e| format!("kiosk-main: cannot apply {} ({e})", local.display()))
+}
+
 /// Load boot config and credential without letting either fault abort the process.
 pub fn load(ini_path: &Path, data_dir: &Path, machine_id: Option<&str>) -> BootOutcome {
+    let config_dir = ini_path.parent().unwrap_or_else(|| Path::new("."));
+    // Fail closed: booting on the shared last-good would run another install's rules.
+    if let Err(error) = adopt_local_config(config_dir, data_dir) {
+        return BootOutcome::RenderSafe {
+            booted: safe_boot(data_dir, machine_id),
+            error,
+            reason: None,
+        };
+    }
     let loaded = std::fs::read_to_string(ini_path)
         .map_err(|e| format!("kiosk-main: cannot read {} ({e})", ini_path.display()))
         .and_then(|text| {
@@ -287,6 +320,33 @@ mod tests {
             AppEvent::ConfigApplied { url } => assert_eq!(url, "https://site.test/"),
             other => panic!("expected ConfigApplied, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_keyless_build_boots_on_its_own_folders_config() {
+        let install = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let ini_path = install.path().join("kiosk.ini");
+        std::fs::write(&ini_path, valid_ini()).unwrap();
+        let config = |host: &str| {
+            format!(
+                r#"{{"version":1,"revision":1,"content":{{"allowlist":["https://{host}/*"]}}}}"#
+            )
+        };
+        // Another install's config is the shared last-good, as after running that install.
+        std::fs::write(data.path().join(LAST_GOOD_FILE), config("other.test")).unwrap();
+        std::fs::write(install.path().join(LOCAL_CONFIG_FILE), config("site.test")).unwrap();
+
+        let (booted, _, _) = load(&ini_path, data.path(), None).into_parts();
+        assert_eq!(
+            booted.manager.current().content.allowlist,
+            vec!["https://site.test/*".to_string()]
+        );
+
+        // A data dir that cannot take the file fails closed instead of booting on the old one.
+        let not_a_dir = data.path().join("not-a-dir");
+        std::fs::write(&not_a_dir, "").unwrap();
+        assert_render_safe(load(&ini_path, &not_a_dir, None), "cannot apply");
     }
 
     #[test]
