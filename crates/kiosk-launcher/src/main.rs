@@ -11,6 +11,10 @@
 //! being declared here, so RT-13 can link them; this file remains the only
 //! production entry point and the only place the assembly below exists.
 
+// Release builds open no console window, same as kiosk-main: double-clicking the exe
+// would otherwise leave a console behind the kiosk, and closing it kills the kiosk.
+#![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
+
 use kiosk_launcher::{job, loop_, pipe, sink, timer};
 
 use kiosk_core::config::bootstrap::BootstrapConfig;
