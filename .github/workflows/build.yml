@@ -40,7 +40,12 @@ jobs:
           cargo build --release -p kiosk-main --example clear_probe
           cargo build --release -p kiosk-core --example kioskctl
           cargo build --release -p kiosk-smoke --bin fixture-httpd
-          cargo test --release -p kiosk-smoke --no-run
+          # Ask cargo where the test binary went: Rust 1.100 moved test executables
+          # out of target/release/deps into the build dir.
+          smoke=$(cargo test --release -p kiosk-smoke --no-run --message-format=json \
+            | jq -r 'select(.target.name == "smoke_linux") | .executable // empty')
+          test -n "$smoke"
+          cp "$smoke" target/release/
       - uses: actions/upload-artifact@v4
         with:
           name: kiosk-linux-x86_64-${{ github.sha }}
@@ -50,7 +55,7 @@ jobs:
             target/release/fixture-httpd
             target/release/examples/clear_probe
             target/release/examples/kioskctl
-            target/release/deps/smoke_linux-*
+            target/release/smoke_linux-*
           if-no-files-found: error
 
   windows:
